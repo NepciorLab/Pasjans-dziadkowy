@@ -1,0 +1,23 @@
+#include <windows.h>
+APPICON ICON "icon.ico"
+
+// Default button images (an identically named .png next to the exe still overrides them)
+IMG_NEW        RCDATA "icons/new.png"
+IMG_HINT       RCDATA "icons/hint.png"
+IMG_UNDO       RCDATA "icons/undo.png"
+IMG_REDO       RCDATA "icons/redo.png"
+IMG_STATY      RCDATA "icons/staty.png"
+IMG_USTAWIENIA RCDATA "icons/ustawienia.png"
+IMG_SAMOGRAJ   RCDATA "icons/samograj.png"
+IMG_SOLVER     RCDATA "icons/solver.png"
+
+// Default sounds, in SOUND_DEFAULTS order (an identically named .wav next to the exe still overrides them)
+SND_0 RCDATA "sounds/nowa.wav"
+SND_1 RCDATA "sounds/click.wav"
+SND_2 RCDATA "sounds/rozloz.wav"
+SND_3 RCDATA "sounds/sukces.wav"
+SND_4 RCDATA "sounds/koniec.wav"
+SND_5 RCDATA "sounds/cofnij.wav"
+SND_6 RCDATA "sounds/ponow.wav"
+SND_7 RCDATA "sounds/Podpowiedz.wav"
+SND_8 RCDATA "sounds/nono.wav"

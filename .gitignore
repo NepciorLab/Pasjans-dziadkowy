@@ -1,0 +1,10 @@
+build/
+*.dat
+*.ini
+*.log
+LostNumbers.csv
+WonNumbers.csv
+Unsolvable.csv
+SolverState.csv
+Saves/
+Solved/
