@@ -32,7 +32,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.0.0";
+static const wchar_t* APP_VERSION = L"1.0.1";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -4853,7 +4853,15 @@ static void solverUpdateUI(){
    SetWindowTextW(g_sv.lblCurrent,b);
 
    int bk=P.bestKings.load(), bp=P.bestPlaced.load(), bpl=P.bestPrefixLen.load();
-   if(bpl>0)
+   if(P.solutionFound.load()){
+      // A win exists already — bestKings==8 here isn't "still searching for
+      // the win", it's "found it, now looking for a SHORTER line" (see
+      // workerProc()'s POLISH_EXTRA_MS in solver.h). Without this message the
+      // window looks stuck at "8 z 8" with no explanation for why it keeps running.
+      ULONGLONG elapsed=now-P.solutionFoundAt.load();
+      int remainSec=(elapsed<solver::POLISH_EXTRA_MS)?(int)((solver::POLISH_EXTRA_MS-elapsed+999)/1000):0;
+      swprintf(b,320,L"Rozwiązanie znalezione! Długość: %d ruchów. Szukam krótszej wersji jeszcze przez %d s…",P.solutionLen.load(),remainSec);
+   } else if(bpl>0)
       swprintf(b,320,L"Najlepszy dotychczasowy postęp: króle na miejscu %d z 8, ułożone karty %d ze 104 (próby budują dalej na linii %d ruchów)",bk,bp,bpl);
    else
       swprintf(b,320,L"Najlepszy dotychczasowy postęp: króle na miejscu %d z 8, ułożone karty %d ze 104",bk,bp);
@@ -4961,10 +4969,16 @@ static LRESULT CALLBACK SolverProgProc(HWND h,UINT m,WPARAM w,LPARAM l){
       S.lblAttempts=solverChild(h,L"STATIC",L"",SS_LEFT,14,92,492,18,0);
       S.lblCurrent =solverChild(h,L"STATIC",L"",SS_LEFT,14,118,492,18,0);
       S.barCurrent =solverChild(h,PROGRESS_CLASSW,L"",PBS_SMOOTH,14,138,492,14,0);
-      S.lblBest    =solverChild(h,L"STATIC",L"",SS_LEFT,14,164,492,18,0);
-      S.barBest    =solverChild(h,PROGRESS_CLASSW,L"",PBS_SMOOTH,14,184,492,14,0);
-      S.lblNodes   =solverChild(h,L"STATIC",L"",SS_LEFT,14,210,492,18,0);
-      S.btnStop    =solverChild(h,L"BUTTON",L"Przerwij",BS_PUSHBUTTON|WS_TABSTOP,210,242,100,30,IDC_SV_STOP);
+      // 36px (not the usual 18px one-line height): both messages this label can
+      // show — the "(próby budują dalej...)" suffix and the "Rozwiązanie
+      // znalezione..." polish-phase message below — routinely wrap to a second
+      // line at this dialog's width, and a STATIC control with SS_LEFT word-
+      // wraps automatically but simply clips any line past its own height, so
+      // a too-short control silently ate the wrapped second line.
+      S.lblBest    =solverChild(h,L"STATIC",L"",SS_LEFT,14,164,492,36,0);
+      S.barBest    =solverChild(h,PROGRESS_CLASSW,L"",PBS_SMOOTH,14,202,492,14,0);
+      S.lblNodes   =solverChild(h,L"STATIC",L"",SS_LEFT,14,228,492,18,0);
+      S.btnStop    =solverChild(h,L"BUTTON",L"Przerwij",BS_PUSHBUTTON|WS_TABSTOP,210,260,100,30,IDC_SV_STOP);
       for(HWND bar: {S.barTime,S.barCurrent,S.barBest}) SendMessageW(bar,PBM_SETRANGE32,0,1000);
       SetTimer(h,1,250,nullptr);
       return 0;}
@@ -4985,7 +4999,7 @@ static void runSolverBatch(HWND parent,const std::vector<NumEntry>& picked){
    }
    g_sv.list=picked; g_sv.idx=0; g_sv.finished=false; g_sv.busy=false;
    g_sv.solvedCount=g_sv.unsolvableCount=g_sv.abortedCount=0; g_sv.log.clear();
-   RECT r={0,0,520,286}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,0);
+   RECT r={0,0,520,304}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,0);
    g_sv.hwnd=CreateWindowExW(0,L"PasjansSolverProg",L"Solver – szukanie rozwiązań",st,CW_USEDEFAULT,CW_USEDEFAULT,
       r.right-r.left,r.bottom-r.top,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
    if(!g_sv.hwnd) return;

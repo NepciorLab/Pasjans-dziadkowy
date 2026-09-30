@@ -55,6 +55,16 @@ struct Progress {
    std::atomic<long long> leadBudget{0};        // its node budget
    std::atomic<int>       threads{0};
    std::atomic<int>       bestPrefixLen{0};     // length of the shared "best known line" attempts are now building on (see Shared::bestPrefix)
+   // A full winning line exists, but the search keeps running a little longer
+   // to look for a shorter one (see workerProc()'s POLISH_EXTRA_MS) unless it
+   // was already GOOD_ENOUGH_LINE moves or under. Without these, the UI has
+   // no way to tell "still searching" apart from "already won, polishing" —
+   // both look identical from bestKings/bestPlaced alone (a found solution IS
+   // a position with bestKings==8, so that counter reaching 8 while the
+   // window keeps running isn't a bug, just an unexplained one).
+   std::atomic<bool>      solutionFound{false};
+   std::atomic<int>       solutionLen{0};       // moves in the best (shortest) line found so far
+   std::atomic<ULONGLONG> solutionFoundAt{0};   // GetTickCount64() of the first solution, for a countdown
 };
 
 struct Result {
@@ -718,7 +728,13 @@ inline DWORD WINAPI workerProc(LPVOID p){
       EnterCriticalSection(&S->cs);
       if(!S->haveBest.load() || cand.size()<S->best.size()){
          S->best=cand;
-         if(!S->haveBest.load()){ S->firstFound=GetTickCount64(); S->haveBest.store(true); }
+         if(!S->haveBest.load()){
+            S->firstFound=GetTickCount64();
+            S->haveBest.store(true);
+            S->P->solutionFoundAt.store(S->firstFound,std::memory_order_relaxed);
+         }
+         S->P->solutionLen.store((int)S->best.size(),std::memory_order_relaxed);
+         S->P->solutionFound.store(true,std::memory_order_relaxed);
       }
       if(S->best.size()<=GOOD_ENOUGH_LINE) S->done.store(true);
       LeaveCriticalSection(&S->cs);

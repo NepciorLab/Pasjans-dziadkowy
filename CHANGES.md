@@ -199,3 +199,26 @@ nie jest tym dotknięty, bo przechowuje rozdane karty wprost, a nie odtwarza je 
   poprawne pobranie najnowszego tagu, poprawne rozpoznanie "nowsza wersja", poprawne parsowanie numeru.
 - src/update.h ma na razie wpisane GH_OWNER/GH_REPO jako TODO — do uzupełnienia po utworzeniu
   docelowego repozytorium (do tego czasu sprawdzanie po prostu nic nie znajduje, bez błędów).
+- Repozytorium faktycznie opublikowane: github.com/NepciorLab/Pasjans-dziadkowy (publiczne, MIT),
+  GH_OWNER/GH_REPO w src/update.h uzupełnione, wydanie v1.0.0 z dołączonym PasjansD.exe — mechanizm
+  aktualizacji zweryfikowany na żywo na tym właśnie repozytorium (poprawne wykrycie własnego tagu,
+  poprawne "to nie jest nowsza wersja", poprawne wykrycie starszej wersji jako wymagającej aktualizacji).
+
+# Okno Solvera: ucięty tekst i mylące "8 z 8" (main.cpp, solver.h)
+Dwa zgłoszone problemy w oknie "Najlepszy dotychczasowy postęp":
+1. Tekst bywał wizualnie ucięty (np. kończył się na "…(próby"). Sama etykieta (SS_LEFT) zawija się
+   automatycznie, ale kontrolka miała tylko 18px wysokości (jedna linia) — dłuższy wariant komunikatu
+   (z dopiskiem o długości linii, na której budują próby) zawijał się do drugiej linii, która była po
+   prostu niewidoczna. Naprawione: kontrolka ma teraz 36px (dwie linie), reszta okna Solvera przesunięta
+   niżej, całe okno powiększone o te same 18px.
+2. "Króle na miejscu 8 z 8" bywało widoczne, mimo że solver dalej pracował — to nie błąd w liczeniu
+   (progressOf() w solver.h i checkWin() w game.h liczą identycznie), tylko brak informacji w UI: gdy
+   któryś wątek znajdzie pełne rozwiązanie, solver celowo NIE kończy od razu — szuka jeszcze przez 30 s
+   (POLISH_EXTRA_MS) krótszej wersji tej samej wygranej linii, chyba że od razu trafi na wystarczająco
+   krótką (≤400 ruchów). "8 z 8" widziane w tym oknie ZAWSZE oznaczało już znalezione rozwiązanie —
+   po prostu nic o tym nie mówiło. Dodane do solver::Progress: solutionFound/solutionLen/solutionFoundAt,
+   ustawiane przez workerProc() w chwili znalezienia (lub skrócenia) rozwiązania; okno pokazuje teraz
+   zamiast starego komunikatu: "Rozwiązanie znalezione! Długość: N ruchów. Szukam krótszej wersji
+   jeszcze przez S s…". Zweryfikowane bez GUI (osobny program testowy wołający solver::solveDeal()
+   bezpośrednio, odpytujący Progress z osobnego wątku) — solutionFound poprawnie ustawia się w locie,
+   z poprawną bieżącą długością, zgodną z ostatecznym wynikiem.
