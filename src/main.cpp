@@ -32,7 +32,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.0.1";
+static const wchar_t* APP_VERSION = L"1.0.2";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;

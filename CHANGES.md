@@ -222,3 +222,14 @@ Dwa zgłoszone problemy w oknie "Najlepszy dotychczasowy postęp":
    jeszcze przez S s…". Zweryfikowane bez GUI (osobny program testowy wołający solver::solveDeal()
    bezpośrednio, odpytujący Progress z osobnego wątku) — solutionFound poprawnie ustawia się w locie,
    z poprawną bieżącą długością, zgodną z ostatecznym wynikiem.
+
+# Auto-aktualizacja: potwierdzenie "Tak" zamykało program i nic dalej się nie działo (src/update.h)
+Przyczyna: pomocniczy plik .bat (podmieniający exe po zamknięciu programu — patrz opis mechanizmu
+aktualizacji wyżej) był zapisywany jako UTF-16 (_wfopen z "ccs=UNICODE"). cmd.exe w ogóle nie
+rozpoznawał takiego pliku jako polecenia ("'plik.bat' is not recognized...") — potwierdzone wprost:
+odtworzenie dokładnie tego samego pliku i uruchomienie go w cmd.exe dawało dokładnie ten błąd, więc
+skrypt nigdy nic nie robił. Dodatkowo tryb tekstowy fopen podwajał już i tak ręcznie wpisane "\r\n"
+na "\r\r\n" (widoczne w zrzucie hex: ...0D 00 0D 00 0A 00). Naprawa: plik .bat zapisywany teraz jako
+zwykły ANSI (fprintf na strumieniu ze zwykłego _wfopen(..., L"w")), ścieżki zamieniane na kodowanie
+systemowe (CP_ACP) przez nową funkcję toAcp(). Zweryfikowane end-to-end na prawdziwej funkcji
+launchSelfUpdate() (nie na kopii) — podmiana pliku i przekazanie sterowania dalej działa poprawnie.

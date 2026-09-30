@@ -192,6 +192,17 @@ inline ReleaseInfo checkLatest(){
    return info;
 }
 
+// ANSI/system-codepage narrowing for the two paths embedded in the helper
+// .bat below — see launchSelfUpdate()'s comment for why the file itself must
+// be plain ANSI, not UTF-16.
+inline std::string toAcp(const std::wstring& w){
+   if(w.empty()) return "";
+   int n=WideCharToMultiByte(CP_ACP,0,w.c_str(),(int)w.size(),nullptr,0,nullptr,nullptr);
+   std::string s((size_t)n,0);
+   WideCharToMultiByte(CP_ACP,0,w.c_str(),(int)w.size(),&s[0],n,nullptr,nullptr);
+   return s;
+}
+
 // Launches a detached helper .bat that waits for THIS process to exit,
 // replaces targetExePath with newExePath, relaunches it, and deletes itself.
 // Caller must already have downloaded newExePath, and must quit (e.g.
@@ -200,25 +211,34 @@ inline ReleaseInfo checkLatest(){
 inline bool launchSelfUpdate(const std::wstring& newExePath,const std::wstring& targetExePath){
    wchar_t tempDir[MAX_PATH]; GetTempPathW(MAX_PATH,tempDir);
    std::wstring batPath=std::wstring(tempDir)+L"pasjans_update.bat";
-   FILE* f=_wfopen(batPath.c_str(),L"w, ccs=UNICODE");
+   // Plain ANSI text (fopen, narrow fprintf), NOT _wfopen(..., L"w, ccs=UNICODE"):
+   // that wrote a UTF-16LE file cmd.exe couldn't even recognize as a command
+   // ("'pasjans_update.bat' is not recognized..." — confirmed by reproducing
+   // it directly) — the whole update silently did nothing past this point.
+   // Text mode's own '\n'->CRLF translation also doubled the CR in the old
+   // version's literal "\r\n" endings (FF FE ... 0D 00 0D 00 0A 00 in a hex
+   // dump), which didn't help either. Paths here are plain filesystem paths,
+   // no need for Unicode content — an ANSI file sidesteps both problems.
+   FILE* f=_wfopen(batPath.c_str(),L"w");
    if(!f) return false;
-   fwprintf(f,
-      L"@echo off\r\n"
-      L"setlocal enabledelayedexpansion\r\n"
-      L"set TARGET=%s\r\n"
-      L"set SOURCE=%s\r\n"
-      L"set TRIES=0\r\n"
-      L":wait\r\n"
-      L"ping -n 2 127.0.0.1 >nul\r\n"
-      L"move /y \"%%SOURCE%%\" \"%%TARGET%%\" >nul 2>&1\r\n"
-      L"if exist \"%%SOURCE%%\" (\r\n"
-      L"  set /a TRIES+=1\r\n"
-      L"  if !TRIES! LSS 30 goto wait\r\n"
-      L"  goto :eof\r\n"
-      L")\r\n"
-      L"start \"\" \"%%TARGET%%\"\r\n"
-      L"del \"%%~f0\"\r\n",
-      targetExePath.c_str(),newExePath.c_str());
+   std::string target=toAcp(targetExePath), source=toAcp(newExePath);
+   fprintf(f,
+      "@echo off\n"
+      "setlocal enabledelayedexpansion\n"
+      "set TARGET=%s\n"
+      "set SOURCE=%s\n"
+      "set TRIES=0\n"
+      ":wait\n"
+      "ping -n 2 127.0.0.1 >nul\n"
+      "move /y \"%%SOURCE%%\" \"%%TARGET%%\" >nul 2>&1\n"
+      "if exist \"%%SOURCE%%\" (\n"
+      "  set /a TRIES+=1\n"
+      "  if !TRIES! LSS 30 goto wait\n"
+      "  goto :eof\n"
+      ")\n"
+      "start \"\" \"%%TARGET%%\"\n"
+      "del \"%%~f0\"\n",
+      target.c_str(),source.c_str());
    fclose(f);
    STARTUPINFOW si={}; si.cb=sizeof(si);
    PROCESS_INFORMATION pi{};
