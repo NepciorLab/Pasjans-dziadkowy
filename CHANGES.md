@@ -233,3 +233,14 @@ na "\r\r\n" (widoczne w zrzucie hex: ...0D 00 0D 00 0A 00). Naprawa: plik .bat z
 zwykły ANSI (fprintf na strumieniu ze zwykłego _wfopen(..., L"w")), ścieżki zamieniane na kodowanie
 systemowe (CP_ACP) przez nową funkcję toAcp(). Zweryfikowane end-to-end na prawdziwej funkcji
 launchSelfUpdate() (nie na kopii) — podmiana pliku i przekazanie sterowania dalej działa poprawnie.
+
+# Nowe rewersy kart (res/cards_png/B1.png, B2.png, res/cards.rc, src/renderer_d2d.h)
+Rewersy wycięte z dostarczonego PNG: czerwony (talia 1) = B1, niebieski (talia 2) = B2, 300x420 z przezroczystymi
+rogami, wbudowane w exe (CARD_B1/CARD_B2). Rewers pojawia się tylko na stosie rezerwy.
+Karty (struct Card) nie niosą informacji, z której talii pochodzą, ale da się ją odtworzyć: GameState::newGame()
+buduje talię "talia 1, potem talia 2" i tasuje deterministicznym deterministicShuffle(), więc tasując równoległą
+tablicę numerów talii tym samym ziarnem dostajemy numer talii każdej karty (game.h: reserveDeckTagsForSeed()).
+Rezerwa jest zawsze sufiksem początkowej listy (rozdanie zabiera z przodu, cofnięcie oddaje z powrotem), więc
+rewers na ekranie = talia następnej karty do rozdania: czerwony dla talii 1, niebieski dla talii 2 (main.cpp:
+reserveTopDeck(), numer partii z g_currentGameNumber, zapis gry bez zmian). Sprawdzone na 2000 partiach:
+0 niezgodności z rzeczywistą rezerwą z GameState::newGame(), po ~50% kart z każdej talii.

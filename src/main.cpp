@@ -32,7 +32,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.0.2";
+static const wchar_t* APP_VERSION = L"1.0.3";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -1685,6 +1685,23 @@ static void discardD2DRT(){
    g_renderer.setRT(nullptr,nullptr);CardImagesD2D::instance().invalidate();
    if(g_d2dRT){g_d2dRT->Release();g_d2dRT=nullptr;}}
 
+// Deck (0 = red back, 1 = blue back) of the next card to be dealt from the
+// reserve — what the face-down pile on screen should show. Derived from the
+// deal's number, cached per number (see reserveDeckTagsForSeed in game.h). A
+// save with no known number (very old files) just alternates, which is only
+// cosmetic.
+static int reserveTopDeck(){
+   static long long cachedFor=-2; static std::vector<uint8_t> tags;
+   if(g_currentGameNumber!=cachedFor){
+      cachedFor=g_currentGameNumber;
+      tags.clear();
+      if(g_currentGameNumber>=0) tags=reserveDeckTagsForSeed((unsigned int)g_currentGameNumber);
+   }
+   size_t n=g_game.reserve.size();
+   if(tags.empty()||n>tags.size()||n==0) return (int)(n&1);
+   return tags[tags.size()-n];
+}
+
 static void drawScene(){
    if(!g_d2dRT)return;
    float fw=g_d2dRT->GetSize().width,fh=g_d2dRT->GetSize().height;int w=(int)fw,h=(int)fh;
@@ -1710,7 +1727,7 @@ static void drawScene(){
       if(hSrc||hDst)g_renderer.drawHighlight(fx,fy);}
    POINT rp=g_layout.reservePos();float rx=(float)rp.x,ry=(float)rp.y-OY;
    bool hRes=(g_hintActive||(g_hintBlinking&&g_hintShowSrc))&&g_hint.valid&&g_hint.fromIdx==-1&&!g_game.reserve.empty();
-   if(!g_game.reserve.empty()){g_renderer.drawBack(rx,ry);g_renderer.drawReserveCount(rx,ry,(float)g_layout.cardW,(float)g_layout.cardH,std::to_wstring(g_game.reserve.size()));}
+   if(!g_game.reserve.empty()){g_renderer.drawBack(rx,ry,reserveTopDeck());g_renderer.drawReserveCount(rx,ry,(float)g_layout.cardW,(float)g_layout.cardH,std::to_wstring(g_game.reserve.size()));}
    if(hRes)g_renderer.drawHighlight(rx,ry);
    // White-pulse hint overlay on reserve card
    if(g_reservePulsing && g_reservePulseAlpha>0.f && !g_game.reserve.empty())

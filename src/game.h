@@ -69,6 +69,23 @@ struct Card {
 };
 
 static const int NUM_COLS=10, NUM_FOUND=8;
+
+// Which physical deck (0 or 1) each card of the INITIAL reserve came from, for
+// a deal made from `seed` — only used to pick the matching card-back colour on
+// the reserve pile (the one place a back is ever drawn). Cards don't carry deck
+// identity (see Card::typeId), but it's fully recoverable: GameState::newGame()
+// builds the deck deck-1-then-deck-2 and shuffles it with deterministicShuffle(),
+// so shuffling a parallel array of deck numbers with the same seed moves each
+// tag to exactly where its card lands. The reserve only ever shrinks from the
+// front (a deal) and grows back by undoing one, so it is always a suffix of this
+// list: the next card to be dealt is tags[tags.size()-reserve.size()].
+inline std::vector<uint8_t> reserveDeckTagsForSeed(unsigned int seed){
+   std::vector<uint8_t> tags(104);
+   for(int i=0;i<104;i++) tags[i]=(uint8_t)(i/52);
+   std::mt19937 gen(seed);
+   deterministicShuffle(tags,gen);
+   return std::vector<uint8_t>(tags.begin()+NUM_COLS*(NUM_COLS+1)/2,tags.end());
+}
 enum LocType { LOC_COLUMN, LOC_FOUNDATION };
 
 struct MoveHint {

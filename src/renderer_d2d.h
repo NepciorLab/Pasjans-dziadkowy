@@ -47,18 +47,10 @@ public:
    }
 
    // ── card back ─────────────────────────────────────────────────────────────
-   void drawBack(float x,float y) const {
+   // deck 0 = red back, deck 1 = blue back (see reserveDeckTagsForSeed in game.h)
+   void drawBack(float x,float y,int deck) const {
       if(!m_rt) return;
-      float cw=(float)m_lay->cardW, ch=(float)m_lay->cardH;
-      drawShadow(x,y);
-      ID2D1Bitmap* bmp=GetCardD2D("B1",m_rt);
-      if(bmp){
-         m_rt->DrawBitmap(bmp,D2D1::RectF(x,y,x+cw,y+ch));
-      } else {
-         auto rr=RRectD2D(x,y,cw,ch,(float)m_lay->cornerR);
-         m_rt->FillRoundedRectangle(rr,m_brBlue);
-         m_rt->DrawRoundedRectangle(rr,m_brGray,0.8f);
-      }
+      drawBackOne(x,y,deck==1?"B2":"B1");
    }
 
    // ── empty slot ───────────────────────────────────────────────────────────
@@ -383,6 +375,19 @@ private:
       mk(m_brStatusWin,    D2D1::ColorF(1,0.86f,0.20f,1));
       mk(m_brStatusNomoves,D2D1::ColorF(1,0.43f,0.43f,1));
       mk(m_brThinking,     D2D1::ColorF(1,1,1,0.f));
+   }
+
+   void drawBackOne(float x,float y,const char* key) const {
+      float cw=(float)m_lay->cardW, ch=(float)m_lay->cardH;
+      drawShadow(x,y);
+      ID2D1Bitmap* bmp=GetCardD2D(key,m_rt);
+      if(bmp){
+         m_rt->DrawBitmap(bmp,D2D1::RectF(x,y,x+cw,y+ch));
+      } else {
+         auto rr=RRectD2D(x,y,cw,ch,(float)m_lay->cornerR);
+         m_rt->FillRoundedRectangle(rr,m_brBlue);
+         m_rt->DrawRoundedRectangle(rr,m_brGray,0.8f);
+      }
    }
 
    void drawShadow(float x,float y) const {

@@ -1,6 +1,7 @@
 #include <windows.h>
 
 CARD_B1  RCDATA "cards_png/B1.png"
+CARD_B2  RCDATA "cards_png/B2.png"
 
 CARD_AH  RCDATA "cards_png/AH.png"
 CARD_AD  RCDATA "cards_png/AD.png"
