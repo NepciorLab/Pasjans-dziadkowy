@@ -260,3 +260,50 @@ reserveTopDeck(), numer partii z g_currentGameNumber, zapis gry bez zmian). Spra
   CardAnim::ease() dla reverse) — karta powoli odrywa się od stołu, kończy obrót po przebyciu ok. 6% drogi
   (t=0.4), w połowie czasu jest dopiero w 13% drogi, a do rezerwy dolatuje szybko. Zweryfikowane offline: klatki animacji wyrenderowane
   tym samym rendererem do PNG (t=0..1, obie talie) — rewers → krawędź → awers, skala 100→120→100%.
+
+# Podpowiedź: ruch na puste miejsce pokazywany animacją jak każdy inny (main.cpp, performHintNow())
+Gdy najlepszym ruchem było przeniesienie karty na pustą kolumnę, podpowiedź zamiast animacji lotu karty pulsowała
+wszystkimi pustymi kolumnami (g_emptyColPulsing). Gałąź z pulsowaniem usunięta — ruch na pustą kolumnę trafia teraz do
+tej samej ścieżki co pozostałe: karta lecąca do slotu docelowego (kod animacji już obsługiwał kolumnę docelową
+o długości 0). Dodatkowo lista podpowiedzi po takim ruchu nie urywa się już ("break"): pierwszy ruch na pustą kolumnę
+jest wpisywany, kolejne ruchy na (inne) puste kolumny są pomijane jako ten sam ruch, a skanowanie trwa dalej — kolejne
+naciśnięcia Podpowiedzi pokazują dalsze sensowne ruchy, tak jak w pozostałych przypadkach. Pulsowanie rezerwy
+(podpowiedź rozdania) bez zmian. Wersja 1.0.5.
+
+# Wersja 1.0.6: rozwiązania użytkownika, ustawienia etapu Solvera, cofanie rozdania (main.cpp, solver.h)
+- Cofanie rozdania: obrót kończy się w 70% lotu (było 40%).
+- Pasjans rozwiązany ręcznie przez użytkownika (nie przez Samograj) zapisuje się jak rozwiązanie solvera, jako
+  Solved\SolvedUser<numer>.dat: rozdanie początkowe + każdy ruch jako krok "Ponów". Linię wygranej bierze się ze stosu
+  cofania (stan przed każdym ruchem), więc plik powstaje tylko wtedy, gdy historia sięga do samego rozdania (nie ucięta
+  przez MAX_UNDO_HISTORY, numer rozdania znany). Jeśli to rozdanie było już rozwiązane ręcznie, zostaje krótsza linia
+  (plik powtórki rośnie z każdym ruchem, więc porównywany jest rozmiar). Wspólny zapis w writeReplayFile() — używa go
+  też solver (saveSolvedFile); saveUserSolvedFile() wołane z onStateChanged() przy pierwszej wygranej.
+- Okno Solvera: suwak "Sprawdź po upływie" (1–10 min, co minutę, domyślnie 5) i pole "Po upływie czasu przejdź do
+  następnego". Po upływie etapu bez rozwiązania: pole zaznaczone → rozdanie trafia do Unsolvable.csv (postęp
+  zapamiętany) i startuje następne; niezaznaczone → ten sam pasjans dostaje kolejny etap. Okno z pytaniem "Czy
+  kontynuować poszukiwania?" (odliczanie 10 s) usunięte — decyduje pole. Suwak działa od razu także dla etapu w toku
+  (solver::Progress::deadline, odczytywany przez wątki przy każdym sprawdzeniu; sprawdzone osobnym testem: etap 60 s
+  skrócony w trakcie do ~2 s kończy się timedOut). Ustawienia zapamiętane w pasjans.ini ([Solver] StageMinutes, AutoNext).
+  Limit 2 godzin na rozdanie bez zmian.
+
+# Wersja 1.0.7: suwak i pole także w oknie wyboru, bez ikony w oknach Solvera, nowe czasy lotu kart (main.cpp)
+- Suwak "Sprawdź po upływie" (1–10 min) i pole "Po upływie czasu przejdź do następnego" są teraz także w oknie
+  WYBORU rozdań (wcześniej tylko w oknie postępu, które pojawia się dopiero po "Rozwiąż wybrane"). Oba okna edytują te
+  same ustawienia (g_solverStageMin / g_solverAutoNext, wspólne kontrolki: solverMakeStageControls()).
+- Okna Solvera (wybór, postęp) i "Zagraj nieudany" bez ikony w pasku tytułu: styl WS_EX_DLGMODALFRAME (także w
+  AdjustWindowRectEx, żeby obszar roboczy miał właściwy rozmiar). Sprawdzone zrzutami prawdziwych okien (test:
+  testwindows.cpp włącza main.cpp do jednego programu i robi PrintWindow okien wyboru i postępu).
+- Rozdawanie z rezerwy i jego cofnięcie: karty lecą z mniej więcej tą samą PRĘDKOŚCIĄ, więc karta z najdłuższą drogą
+  leci najdłużej i ląduje ostatnia (wcześniej wszystkie leciały tyle samo, więc najdalsze były najszybsze). Najdalsza
+  karta leci DEAL_MAX_FLIGHT_MS = 440 + 200 = 640 ms (przed mnożnikiem prędkości animacji); bliższe proporcjonalnie
+  krócej, ale nie mniej niż DEAL_MIN_FLIGHT_FRAC = 35% tego czasu (inaczej unoszenie i obrót byłyby rozmazane).
+  Wszystkie karty startują naraz (dawny odstęp 40 ms między kartami usunięty — przy nim kolejność lądowania
+  wynikałaby z kolejności kolumn, a nie z odległości). retimeDealFlights() ustawia czasy po zbudowaniu animacji;
+  obie stałe są na górze tej funkcji, do eksperymentów.
+
+# Wersja 1.0.8: przywrócone okno "Czy kontynuować poszukiwania?" (main.cpp)
+W 1.0.6 okno z pytaniem (odliczanie 10 s) zostało usunięte, a o wszystkim decydowało samo pole — przy niezaznaczonym
+polu solver nie miał jak przejść do następnego pasjansa przed upływem limitu 2 godzin. Teraz po upływie etapu bez
+rozwiązania: pole zaznaczone -> od razu następny pasjans (Unsolvable.csv, postęp zapamiętany); pole niezaznaczone ->
+okno z pytaniem (10 s, brak odpowiedzi = szukaj dalej; "Nie, następne" = jak zaznaczone pole). Treść pytania podaje
+aktualną długość etapu z suwaka (zamiast na sztywno "5 minut"); okno bez ikony jak pozostałe okna Solvera.

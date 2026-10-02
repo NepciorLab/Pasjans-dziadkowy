@@ -32,7 +32,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.0.4";
+static const wchar_t* APP_VERSION = L"1.0.8";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -1820,8 +1820,8 @@ static void drawScene(){
          if(a.reverse){
             // Undo of a deal (card flying back to the reserve): it first lifts off the
             // table face-up, starts turning at 15% of the flight and is fully face-down
-            // from 40% on (the rest of the flight it just travels to the pile).
-            flip=1.f-std::max(0.f,std::min(1.f,(t-0.15f)/(0.40f-0.15f)));
+            // from 70% on (the rest of the flight it just travels to the pile).
+            flip=1.f-std::max(0.f,std::min(1.f,(t-0.15f)/(0.70f-0.15f)));
          } else {
             flip=std::min(1.f,t/0.9f); // deal: fully face-up for the last 10%
          }
@@ -2044,6 +2044,87 @@ static void drawStatusText(Graphics& g, int w){
 
 
 // ============================================================================
+// Solution replay files (Solved<n>.dat from the solver, SolvedUser<n>.dat from
+// the player): start position + every move as a Redo step, loadable with
+// "Wczytaj grę" and walked through with "Ponów".
+// ============================================================================
+// `snaps[i]` is the position after move i (its reserve = what is still undealt,
+// isDealBoundary = that move was a reserve deal); `first` is the position
+// right after the deal.
+static bool writeReplayFile(const std::wstring& path,const Snapshot& first,const std::vector<Snapshot>& snaps,long long num,bool freeMode){
+   FILE* f=nullptr; _wfopen_s(&f,path.c_str(),L"wb");
+   if(!f) return false;
+   fwrite("PASJ",1,4,f);
+   BYTE ver=12; fwrite(&ver,1,1,f);
+   auto writeVec=[&](const std::vector<Card>& v){
+      BYTE n=(BYTE)std::min((int)v.size(),255); fwrite(&n,1,1,f);
+      for(int i=0;i<n;i++){ BYTE s=(BYTE)v[i].suit, r=(BYTE)v[i].rank; fwrite(&s,1,1,f); fwrite(&r,1,1,f); }
+   };
+   for(int i=0;i<NUM_COLS;i++)  writeVec(first.cols[i]);
+   for(int i=0;i<NUM_FOUND;i++) writeVec(first.found[i]);
+   writeVec(first.reserve);
+   DWORD zero=0; BYTE b0=0, b1=1;
+   fwrite(&zero,4,1,f);                        // move count
+   BYTE fm=(BYTE)(freeMode?1:0); fwrite(&fm,1,1,f);
+   fwrite(&b0,1,1,f);                          // winCounted
+   fwrite(&b0,1,1,f);                          // noMovesReached
+   fwrite(&b0,1,1,f);                          // noMovesDialogShown
+   fwrite(&b1,1,1,f);                          // statsExcluded: replaying a solution is practice, not a new game
+   fwrite(&fm,1,1,f);                          // outcome mode
+   fwrite(&zero,4,1,f); fwrite(&zero,4,1,f);   // outcome moves / seconds
+   writeSnapshot(f,first);                     // initialDeal
+   DWORD n32=(DWORD)num; fwrite(&n32,4,1,f);   // game number
+   fwrite(&zero,4,1,f);                        // elapsed seconds
+   WORD un=0; fwrite(&un,2,1,f);               // undo stack: empty
+   WORD rn=(WORD)std::min((size_t)65535,snaps.size()); fwrite(&rn,2,1,f);
+   // redoStack.back() is the NEXT step, so the file lists the last step first
+   for(int i=(int)rn-1;i>=0;i--) writeSnapshot(f,snaps[(size_t)i]);
+   bool ok=(ferror(f)==0);
+   fclose(f);
+   return ok;
+}
+
+// The player has just solved the current deal by hand: keep the winning line as
+// Solved\SolvedUser<number>.dat, exactly like a solver solution. The undo stack
+// IS the line (the position before each move), so it is only usable if it still
+// reaches back to the very deal (not cut off by MAX_UNDO_HISTORY, not a save that
+// never had its history). If that deal was already solved by hand before, the
+// shorter of the two lines is kept.
+static void saveUserSolvedFile(){
+   if(g_currentGameNumber<0) return;
+   const std::deque<Snapshot>& us=g_game.undoStack;
+   if(us.empty()||(int)us.size()>=GameState::MAX_UNDO_HISTORY) return;
+   const Snapshot& d=g_game.initialDeal;
+   bool same=(us.front().reserve==d.reserve);
+   for(int i=0;same&&i<NUM_COLS;i++)  same=(us.front().cols[i]==d.cols[i]);
+   for(int i=0;same&&i<NUM_FOUND;i++) same=us.front().found[i].empty();
+   if(!same) return;
+
+   std::vector<Snapshot> snaps; snaps.reserve(us.size());
+   for(size_t k=0;k<us.size();k++){
+      Snapshot s;
+      if(k+1<us.size()) s=us[k+1];            // position after move k = position before move k+1
+      else{                                   // after the last move: the board as it is now
+         for(int i=0;i<NUM_COLS;i++)  s.cols[i]=g_game.cols[i];
+         for(int i=0;i<NUM_FOUND;i++) s.found[i]=g_game.found[i];
+         s.reserve=g_game.reserve;
+      }
+      s.isDealBoundary=us[k].isDealBoundary;  // move k was a reserve deal
+      snaps.push_back(std::move(s));
+   }
+   std::wstring path=exeDirSubfolder(L"Solved")+L"SolvedUser"+std::to_wstring(g_currentGameNumber)+L".dat";
+   std::wstring tmp=path+L".tmp";
+   if(!writeReplayFile(tmp,d,snaps,g_currentGameNumber,g_freeColMode)){ DeleteFileW(tmp.c_str()); return; }
+   WIN32_FILE_ATTRIBUTE_DATA oldA,newA;
+   bool haveOld=GetFileAttributesExW(path.c_str(),GetFileExInfoStandard,&oldA)!=0;
+   bool haveNew=GetFileAttributesExW(tmp.c_str(),GetFileExInfoStandard,&newA)!=0;
+   // a replay file grows with every move, so file size orders solutions by length
+   bool keepNew=haveNew&&(!haveOld||(((ULONGLONG)newA.nFileSizeHigh<<32|newA.nFileSizeLow)<((ULONGLONG)oldA.nFileSizeHigh<<32|oldA.nFileSizeLow)));
+   if(keepNew) MoveFileExW(tmp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING);
+   else        DeleteFileW(tmp.c_str());
+}
+
+// ============================================================================
 // State changed
 // ============================================================================
 void onStateChanged(){
@@ -2065,6 +2146,8 @@ void onStateChanged(){
             removeNumberEntry(getLostNumbersPath(),g_currentGameNumber);
             removeNumberEntry(getUnsolvablePath(),g_currentGameNumber);
          }
+         // Solved by the player (not by Samograj / the marathon): keep the line, like a solver solution.
+         if(!g_samogranoActive) saveUserSolvedFile();
          int m=(int)g_freeColMode;
          // Capture the outcome now — actually crediting stats/records happens
          // later, when a new deal starts (see newGame()). This way, undoing
@@ -2455,6 +2538,29 @@ bool doClickMove(int col, int ci){
    return false;
 }
 
+// Reserve deal / its undo: the cards fly at roughly the same SPEED, so the card
+// with the longest way takes the longest and lands last (they used to all fly
+// for the same time, which made the farthest ones the fastest). The farthest
+// card of a deal flies DEAL_MAX_FLIGHT_MS (the old 440 ms + 200 ms); a nearer
+// one takes proportionally less, but never less than DEAL_MIN_FLIGHT_FRAC of
+// that — a few dozen pixels in a tenth of a second would turn the lift and the
+// turn-over into a blur. All cards leave together, so landing order = distance.
+static const DWORD DEAL_MAX_FLIGHT_MS   = CARD_ANIM_MS*2+200;
+static const float DEAL_MIN_FLIGHT_FRAC = 0.35f;
+static void retimeDealFlights(size_t first,DWORD now){
+   float maxD=1.f;
+   for(size_t i=first;i<g_cardAnims.size();i++){
+      const CardAnim& a=g_cardAnims[i];
+      maxD=std::max(maxD,hypotf(a.ex-a.sx,a.ey-a.sy));
+   }
+   for(size_t i=first;i<g_cardAnims.size();i++){
+      CardAnim& a=g_cardAnims[i];
+      float f=hypotf(a.ex-a.sx,a.ey-a.sy)/maxD;
+      a.dur=(DWORD)((float)DEAL_MAX_FLIGHT_MS*(DEAL_MIN_FLIGHT_FRAC+(1.f-DEAL_MIN_FLIGHT_FRAC)*f));
+      a.startTime=now;
+   }
+}
+
 void doDeal(){
    if(g_game.reserve.empty()){
       g_status=L"Rezerwa jest pusta!";
@@ -2483,11 +2589,10 @@ void doDeal(){
    float srcX=(float)rp.x;
    float srcY=(float)rp.y;
 
-   const DWORD DEAL_DUR = CARD_ANIM_MS*2; // 2× slower = 440ms
-   const DWORD STAGGER  = 40;             // ms between card launches
    const float ARC_H    = 60.f;           // arc peak height in px
 
    DWORD now=timeGetTime();
+   size_t firstAnim=g_cardAnims.size();
    for(int i=0;i<(int)placed.size();i++){
       int tc=placed[i].first;
       Card card=placed[i].second;
@@ -2502,8 +2607,8 @@ void doDeal(){
       a.ex=dstX; a.ey=dstY;
       a.srcOv=0.f; a.dstOv=dstOv;
       a.arcH    =ARC_H;
-      a.dur     =DEAL_DUR;
-      a.startTime=now+(DWORD)(i*STAGGER);
+      a.dur     =0;               // set per card by retimeDealFlights()
+      a.startTime=now;
       a.toFound =false;
       a.isPreview=false;
       a.phase   =0;
@@ -2512,6 +2617,7 @@ void doDeal(){
       g_cardAnims.push_back(a);
       g_animating=true;
    }
+   retimeDealFlights(firstAnim,now);
    markDirty();
 }
 
@@ -2527,9 +2633,8 @@ static void animateStateDiff(const Snapshot& before, const Snapshot& after){
          // Likely a deal: find which columns gained a card
          POINT rp=g_layout.reservePos();
          float srcX=(float)rp.x, srcY=(float)rp.y;
-         const DWORD DEAL_DUR=CARD_ANIM_MS*2;
-         const DWORD STAGGER=40;
          DWORD now=timeGetTime();
+         size_t firstAnim=g_cardAnims.size();
          int idx=0;
          for(int tc=0;tc<NUM_COLS;tc++){
             int gained=(int)after.cols[tc].size()-(int)before.cols[tc].size();
@@ -2543,14 +2648,14 @@ static void animateStateDiff(const Snapshot& before, const Snapshot& after){
             g_hideDealCol[tc]=dstIdx;
             CardAnim a;
             a.cards={card}; a.sx=srcX; a.sy=srcY; a.ex=dstX; a.ey=dstY;
-            a.srcOv=0.f; a.dstOv=dstOv; a.arcH=60.f; a.dur=DEAL_DUR;
-            a.startTime=now+(DWORD)(idx*STAGGER);
+            a.srcOv=0.f; a.dstOv=dstOv; a.arcH=60.f; a.dur=0;
+            a.startTime=now;
             a.toFound=false; a.isPreview=false; a.phase=0;
             a.dealFlip=true; a.deck=reserveDeckAt(before.reserve.size(),(size_t)idx);
             g_cardAnims.push_back(a); g_animating=true;
             idx++;
          }
-         if(idx>0){ markDirty(); return; }
+         if(idx>0){ retimeDealFlights(firstAnim,now); markDirty(); return; }
       }
    }
    // Detect undo of deal: reserve grew, multiple cols lost one card each (reverse flight)
@@ -2561,9 +2666,8 @@ static void animateStateDiff(const Snapshot& before, const Snapshot& after){
          for(int _i=0;_i<NUM_COLS;_i++) g_hideDealCol[_i]=-1;
          POINT rp=g_layout.reservePos();
          float dstX=(float)rp.x, dstY=(float)rp.y;
-         const DWORD DEAL_DUR=CARD_ANIM_MS*2;
-         const DWORD STAGGER=40;
          DWORD now=timeGetTime();
+         size_t firstAnim=g_cardAnims.size();
          int idx=0;
          for(int tc=0;tc<NUM_COLS;tc++){
             int lost=(int)before.cols[tc].size()-(int)after.cols[tc].size();
@@ -2580,8 +2684,8 @@ static void animateStateDiff(const Snapshot& before, const Snapshot& after){
             float srcY=(float)(g_layout.tableY+srcIdx*g_colDispOv[tc]);
             CardAnim a;
             a.cards={card}; a.sx=srcX; a.sy=srcY; a.ex=dstX; a.ey=dstY;
-            a.srcOv=0.f; a.dstOv=0.f; a.arcH=60.f; a.dur=DEAL_DUR;
-            a.startTime=now+(DWORD)(idx*STAGGER);
+            a.srcOv=0.f; a.dstOv=0.f; a.arcH=60.f; a.dur=0;
+            a.startTime=now;
             a.toFound=false; a.isPreview=false; a.phase=0;
             // The card returns to the reserve face-up, turns over in flight and
             // arrives face-down (its deck's back).
@@ -2589,7 +2693,7 @@ static void animateStateDiff(const Snapshot& before, const Snapshot& after){
             g_cardAnims.push_back(a); g_animating=true;
             idx++;
          }
-         if(idx>0){ markDirty(); return; }
+         if(idx>0){ retimeDealFlights(firstAnim,now); markDirty(); return; }
       }
    }
 
@@ -4506,11 +4610,28 @@ static bool tickCardAnims(){
 // progress window runs solver.h on every picked deal in turn, in memory only
 // (no animation, the table is not touched). A solved deal is written to
 // Solved<number>.dat (start position + every move as a Redo step), moved from
-// LostNumbers.csv to WonNumbers.csv; a deal that resists 5-minute stages until
-// the player declines to continue (or does not answer within 10 s) is moved to
-// Unsolvable.csv.
-static const ULONGLONG SOLVER_STAGE_MS = 5ULL*60ULL*1000ULL; // time limit of one search stage
-static const int       SOLVER_ASK_SECONDS = 10;              // countdown of the "continue?" question
+// LostNumbers.csv to WonNumbers.csv. A search runs in stages (length set with
+// the slider, 1-10 min, default 5). When a stage ends without a solution the
+// "Po upływie czasu przejdź do następnego" checkbox decides: ticked, the deal
+// is moved to Unsolvable.csv and the next picked deal starts at once; unticked,
+// the player is asked whether to keep searching it (10 s countdown, no answer =
+// keep searching) — "Nie, następne" does the same as the ticked checkbox.
+static const int SOLVER_ASK_SECONDS = 10;  // countdown of the "continue?" question
+static int  g_solverStageMin=5;      // stage length in minutes (slider), remembered in pasjans.ini
+static bool g_solverAutoNext=false;  // checkbox: at the end of a stage go on to the next deal without asking
+static ULONGLONG solverStageMs(){ return (ULONGLONG)g_solverStageMin*60ULL*1000ULL; }
+static void loadSolverUiSettings(){
+   std::wstring ini=getIniPath();
+   g_solverStageMin=(int)GetPrivateProfileIntW(L"Solver",L"StageMinutes",5,ini.c_str());
+   if(g_solverStageMin<1||g_solverStageMin>10) g_solverStageMin=5;
+   g_solverAutoNext=(GetPrivateProfileIntW(L"Solver",L"AutoNext",0,ini.c_str())!=0);
+}
+static void saveSolverUiSettings(){
+   std::wstring ini=getIniPath(); wchar_t b[16];
+   wsprintfW(b,L"%d",g_solverStageMin);
+   WritePrivateProfileStringW(L"Solver",L"StageMinutes",b,ini.c_str());
+   WritePrivateProfileStringW(L"Solver",L"AutoNext",g_solverAutoNext?L"1":L"0",ini.c_str());
+}
 // Absolute safety cap on one deal, summed across every stage AND every resume
 // (see g_sv.gameStart) — the search itself never runs out of moves to try on
 // its own (a full 104-card deal's search space is far too big to ever
@@ -4518,8 +4639,8 @@ static const int       SOLVER_ASK_SECONDS = 10;              // countdown of the
 // never because it ran out of things to attempt), and the default answer to
 // "keep searching?" is "yes" (see SolverAsk), so without this cap an
 // unattended deal — nobody there to click "Nie, następne" — would search
-// forever, one 5-minute stage after another. At the cap it is given up on
-// automatically, exactly like an explicit "no": moved to Unsolvable.csv, its
+// forever, one stage after another. At the cap it is given up on
+// automatically, like a ticked checkbox: moved to Unsolvable.csv, its
 // SolverState.csv progress kept (so a deliberate later retry still resumes
 // past this point rather than restarting), and the batch moves on to the
 // next picked deal — with a distinct log line so it reads differently from a
@@ -4566,11 +4687,49 @@ static HWND solverChild(HWND parent,const wchar_t* cls,const wchar_t* text,DWORD
    return c;
 }
 
+// ── stage length slider + "go on to the next deal" checkbox ──────────────────
+// Shown both in the picker (so they can be set before starting) and in the
+// progress window (to change them while searching); both edit the same
+// g_solverStageMin / g_solverAutoNext, remembered in pasjans.ini.
+static const int IDC_SV_SLIDER=3102, IDC_SV_NEXT=3103;
+struct SolverStageUi { HWND slider=nullptr, val=nullptr, chk=nullptr; };
+// Three rows: label + slider + value at `y`, the checkbox 40 px below; x0/w = content span.
+static void solverMakeStageControls(HWND h,int x0,int y,int w,SolverStageUi& u){
+   INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_BAR_CLASSES}; InitCommonControlsEx(&icc);
+   solverChild(h,L"STATIC",L"Sprawdź po upływie:",SS_LEFT,x0,y+8,146,18,0);
+   u.slider=solverChild(h,TRACKBAR_CLASSW,L"",TBS_HORZ|TBS_AUTOTICKS|WS_TABSTOP,x0+146,y,w-146-60,32,IDC_SV_SLIDER);
+   SendMessageW(u.slider,TBM_SETRANGE,TRUE,MAKELPARAM(1,10));
+   SendMessageW(u.slider,TBM_SETPAGESIZE,0,1);
+   SendMessageW(u.slider,TBM_SETPOS,TRUE,g_solverStageMin);
+   u.val=solverChild(h,L"STATIC",L"",SS_LEFT,x0+w-52,y+8,52,18,0);
+   { wchar_t v[16]; swprintf(v,16,L"%d min",g_solverStageMin); SetWindowTextW(u.val,v); }
+   u.chk=solverChild(h,L"BUTTON",L"Po upływie czasu przejdź do następnego",BS_AUTOCHECKBOX|WS_TABSTOP,x0,y+40,w,22,IDC_SV_NEXT);
+   SendMessageW(u.chk,BM_SETCHECK,g_solverAutoNext?BST_CHECKED:BST_UNCHECKED,0);
+}
+// WM_HSCROLL: true if `ctl` is this slider (the setting is updated and remembered).
+static bool solverStageHScroll(const SolverStageUi& u,HWND ctl){
+   if(!u.slider||ctl!=u.slider) return false;
+   int pos=(int)SendMessageW(u.slider,TBM_GETPOS,0,0);
+   if(pos<1) pos=1;
+   if(pos>10) pos=10;
+   g_solverStageMin=pos;
+   wchar_t v[16]; swprintf(v,16,L"%d min",pos); SetWindowTextW(u.val,v);
+   saveSolverUiSettings();
+   return true;
+}
+// WM_COMMAND: true if it was a click on this checkbox.
+static bool solverStageCommand(const SolverStageUi& u,int id){
+   if(id!=IDC_SV_NEXT||!u.chk) return false;
+   g_solverAutoNext=(SendMessageW(u.chk,BM_GETCHECK,0,0)==BST_CHECKED);
+   saveSolverUiSettings();
+   return true;
+}
+
 // ── 1. picking deals ─────────────────────────────────────────────────────────
 // The list shows the deals of LostNumbers.csv and, in red, those already moved to
 // Unsolvable.csv; a seed can also be typed in by hand.
 static const int IDC_PICK_LIST=3001, IDC_PICK_ALL=3002, IDC_PICK_SEED=3003, IDC_PICK_MODE=3004, IDC_PICK_ADD=3005;
-struct SolverPick { std::vector<NumEntry> all; std::vector<int> kind; /* 0 lost, 1 unsolvable, 2 typed in */ std::vector<NumEntry> chosen; bool ok=false; HWND list=nullptr, edit=nullptr, combo=nullptr; };
+struct SolverPick { std::vector<NumEntry> all; std::vector<int> kind; /* 0 lost, 1 unsolvable, 2 typed in */ std::vector<NumEntry> chosen; bool ok=false; HWND list=nullptr, edit=nullptr, combo=nullptr; SolverStageUi stage; };
 static SolverPick g_pick;
 
 static std::wstring solverPickText(const NumEntry& e,int kind){
@@ -4629,10 +4788,14 @@ static LRESULT CALLBACK SolverPickProc(HWND h,UINT m,WPARAM w,LPARAM l){
       SendMessageW(g_pick.combo,CB_ADDSTRING,0,(LPARAM)L"Dowolna karta");
       SendMessageW(g_pick.combo,CB_SETCURSEL,g_freeColMode?1:0,0);
       solverChild(h,L"BUTTON",L"Dodaj do listy",BS_PUSHBUTTON|WS_TABSTOP,364,308,84,26,IDC_PICK_ADD);
-      solverChild(h,L"BUTTON",L"Rozwiąż wybrane",BS_DEFPUSHBUTTON|WS_TABSTOP,12,350,160,30,IDOK);
-      solverChild(h,L"BUTTON",L"Zaznacz wszystkie",BS_PUSHBUTTON|WS_TABSTOP,180,350,140,30,IDC_PICK_ALL);
-      solverChild(h,L"BUTTON",L"Anuluj",BS_PUSHBUTTON|WS_TABSTOP,328,350,120,30,IDCANCEL);
+      solverMakeStageControls(h,12,346,436,g_pick.stage);
+      solverChild(h,L"BUTTON",L"Rozwiąż wybrane",BS_DEFPUSHBUTTON|WS_TABSTOP,12,420,160,30,IDOK);
+      solverChild(h,L"BUTTON",L"Zaznacz wszystkie",BS_PUSHBUTTON|WS_TABSTOP,180,420,140,30,IDC_PICK_ALL);
+      solverChild(h,L"BUTTON",L"Anuluj",BS_PUSHBUTTON|WS_TABSTOP,328,420,120,30,IDCANCEL);
       return 0;}
+   case WM_HSCROLL:
+      if(solverStageHScroll(g_pick.stage,(HWND)l)) return 0;
+      break;
    case WM_MEASUREITEM:{
       MEASUREITEMSTRUCT* mi=(MEASUREITEMSTRUCT*)l;
       if(mi->CtlID==(UINT)IDC_PICK_LIST){ mi->itemHeight=20; return TRUE; }
@@ -4655,6 +4818,7 @@ static LRESULT CALLBACK SolverPickProc(HWND h,UINT m,WPARAM w,LPARAM l){
       SelectObject(di->hDC,old);
       return TRUE;}
    case WM_COMMAND:
+      if(solverStageCommand(g_pick.stage,LOWORD(w))) return 0;
       switch(LOWORD(w)){
       case IDOK:
          if(GetFocus()==g_pick.edit){ solverPickAddTyped(h); return 0; } // Enter in the seed box adds it
@@ -4682,8 +4846,10 @@ static bool pickSolverGames(HWND parent,const std::vector<NumEntry>& lost,const 
       bool dup=false; for(auto& x: g_pick.all) if(x.num==e.num){ dup=true; break; }
       if(!dup){ g_pick.all.push_back(e); g_pick.kind.push_back(1); }
    }
-   RECT r={0,0,460,392}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,0);
-   HWND dlg=CreateWindowExW(0,L"PasjansSolverPick",L"Solver – wybór rozdań",st,CW_USEDEFAULT,CW_USEDEFAULT,
+   loadSolverUiSettings();
+   // WS_EX_DLGMODALFRAME: no icon in the title bar
+   RECT r={0,0,460,464}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_DLGMODALFRAME);
+   HWND dlg=CreateWindowExW(WS_EX_DLGMODALFRAME,L"PasjansSolverPick",L"Solver – wybór rozdań",st,CW_USEDEFAULT,CW_USEDEFAULT,
       r.right-r.left,r.bottom-r.top,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
    if(!dlg) return false;
    solverCenterOn(dlg,parent);
@@ -4693,6 +4859,7 @@ static bool pickSolverGames(HWND parent,const std::vector<NumEntry>& lost,const 
 }
 
 // ── 2. "keep searching?" question with a 10 s countdown ──────────────────────
+// Asked when a stage ends and the "przejdź do następnego" checkbox is not ticked.
 // No answer means: keep searching (the default button is "Tak").
 struct SolverAsk { int secs=0; bool yes=true; HWND lbl=nullptr; long long seed=0; };
 static SolverAsk g_ask;
@@ -4704,7 +4871,7 @@ static LRESULT CALLBACK SolverAskProc(HWND h,UINT m,WPARAM w,LPARAM l){
    switch(m){
    case WM_CREATE:{
       wchar_t b[256];
-      swprintf(b,256,L"Nie znalazłem rozwiązania rozdania nr %lld w ciągu 5 minut. Czy kontynuować poszukiwania?",g_ask.seed);
+      swprintf(b,256,L"Nie znalazłem rozwiązania rozdania nr %lld w ciągu %d min. Czy kontynuować poszukiwania?",g_ask.seed,g_solverStageMin);
       solverChild(h,L"STATIC",b,SS_LEFT,14,14,492,44,0,true);   // wraps by itself, two lines fit
       g_ask.lbl=solverChild(h,L"STATIC",L"",SS_LEFT,14,66,492,20,0);
       solverAskLabel();
@@ -4733,8 +4900,9 @@ static bool solverAskContinue(HWND parent,long long seed){
       wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1); RegisterClassExW(&wc); reg=true;
    }
    g_ask=SolverAsk(); g_ask.secs=SOLVER_ASK_SECONDS; g_ask.seed=seed;
-   RECT r={0,0,520,144}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,0);
-   HWND dlg=CreateWindowExW(WS_EX_TOPMOST,L"PasjansSolverAsk",L"Solver",st,CW_USEDEFAULT,CW_USEDEFAULT,
+   // WS_EX_DLGMODALFRAME: no icon in the title bar, like the other Solver windows
+   RECT r={0,0,520,144}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_TOPMOST|WS_EX_DLGMODALFRAME);
+   HWND dlg=CreateWindowExW(WS_EX_TOPMOST|WS_EX_DLGMODALFRAME,L"PasjansSolverAsk",L"Solver",st,CW_USEDEFAULT,CW_USEDEFAULT,
       r.right-r.left,r.bottom-r.top,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
    if(!dlg) return true;
    solverCenterOn(dlg,parent);
@@ -4810,36 +4978,8 @@ static bool saveSolvedFile(const NumEntry& e,const GameState& start,const std::v
    first.reserve=start.reserve;
 
    outPath=exeDirSubfolder(L"Solved")+L"Solved"+std::to_wstring(e.num)+L".dat";
-   FILE* f=nullptr; _wfopen_s(&f,outPath.c_str(),L"wb");
-   if(!f) return false;
-   fwrite("PASJ",1,4,f);
-   BYTE ver=12; fwrite(&ver,1,1,f);
-   auto writeVec=[&](const std::vector<Card>& v){
-      BYTE n=(BYTE)std::min((int)v.size(),255); fwrite(&n,1,1,f);
-      for(int i=0;i<n;i++){ BYTE s=(BYTE)v[i].suit, r=(BYTE)v[i].rank; fwrite(&s,1,1,f); fwrite(&r,1,1,f); }
-   };
-   for(int i=0;i<NUM_COLS;i++)  writeVec(start.cols[i]);
-   for(int i=0;i<NUM_FOUND;i++) writeVec(start.found[i]);
-   writeVec(start.reserve);
-   DWORD zero=0; BYTE b0=0, b1=1;
-   fwrite(&zero,4,1,f);                        // move count
-   BYTE fm=(BYTE)(e.mode!=0?1:0); fwrite(&fm,1,1,f);
-   fwrite(&b0,1,1,f);                          // winCounted
-   fwrite(&b0,1,1,f);                          // noMovesReached
-   fwrite(&b0,1,1,f);                          // noMovesDialogShown
-   fwrite(&b1,1,1,f);                          // statsExcluded: replaying a solution is practice, not a new game
-   fwrite(&fm,1,1,f);                          // outcome mode
-   fwrite(&zero,4,1,f); fwrite(&zero,4,1,f);   // outcome moves / seconds
-   writeSnapshot(f,first);                     // initialDeal
-   DWORD num=(DWORD)e.num; fwrite(&num,4,1,f); // game number
-   fwrite(&zero,4,1,f);                        // elapsed seconds
-   WORD un=0; fwrite(&un,2,1,f);               // undo stack: empty
-   WORD rn=(WORD)std::min((size_t)65535,snaps.size()); fwrite(&rn,2,1,f);
-   // redoStack.back() is the NEXT step, so the file lists the last step first
-   for(int i=(int)rn-1;i>=0;i--) writeSnapshot(f,snaps[(size_t)i]);
-   bool ok=(ferror(f)==0);
-   fclose(f);
-   return ok;
+   for(int i=0;i<NUM_FOUND;i++) first.found[i]=start.found[i];
+   return writeReplayFile(outPath,first,snaps,e.num,e.mode!=0);
 }
 
 // ── 4. the progress window and the batch driver ──────────────────────────────
@@ -4847,6 +4987,7 @@ struct SolverRun {
    std::vector<NumEntry> list; size_t idx=0;
    HWND hwnd=nullptr, lblTitle=nullptr, lblTime=nullptr, lblAttempts=nullptr, lblCurrent=nullptr, lblBest=nullptr, lblNodes=nullptr;
    HWND barTime=nullptr, barCurrent=nullptr, barBest=nullptr, btnStop=nullptr;
+   SolverStageUi stageUi;
    std::unique_ptr<solver::Progress> P;
    std::atomic<bool> cancel{false};
    std::atomic<bool> threadDone{false};
@@ -4889,7 +5030,7 @@ static void solverStartCurrent(){
       g_sv.P->bestKings.store(sv.bestKings); g_sv.P->bestPlaced.store(sv.bestPlaced);
       g_sv.gameStart-=(ULONGLONG)sv.elapsedMs;
    }
-   g_sv.deadline=g_sv.stageStart+SOLVER_STAGE_MS; g_sv.stage=1;
+   g_sv.deadline=g_sv.stageStart+solverStageMs(); g_sv.stage=1;
    g_sv.lastTick=g_sv.stageStart; g_sv.lastNodes=0; g_sv.speed=0;
    if(g_sv.btnStop) EnableWindow(g_sv.btnStop,TRUE);
    solverLaunchThread();
@@ -4904,11 +5045,11 @@ static void solverUpdateUI(){
    SetWindowTextW(g_sv.lblTitle,b);
 
    ULONGLONG st=now-g_sv.stageStart, tot=now-g_sv.gameStart;
-   if(st>SOLVER_STAGE_MS) st=SOLVER_STAGE_MS;
-   swprintf(b,320,L"Czas etapu %d: %d:%02d z 5:00     (łącznie dla tego rozdania %d:%02d)",g_sv.stage,
-      (int)(st/60000),(int)((st/1000)%60),(int)(tot/60000),(int)((tot/1000)%60));
+   if(st>solverStageMs()) st=solverStageMs();
+   swprintf(b,320,L"Czas etapu %d: %d:%02d z %d:00     (łącznie dla tego rozdania %d:%02d)",g_sv.stage,
+      (int)(st/60000),(int)((st/1000)%60),g_solverStageMin,(int)(tot/60000),(int)((tot/1000)%60));
    SetWindowTextW(g_sv.lblTime,b);
-   SendMessageW(g_sv.barTime,PBM_SETPOS,(WPARAM)(st*1000/SOLVER_STAGE_MS),0);
+   SendMessageW(g_sv.barTime,PBM_SETPOS,(WPARAM)(st*1000/solverStageMs()),0);
 
    if(g_sv.resumedAttempts>0)
       swprintf(b,320,L"Próby: rozpoczęto %d, zakończono %d   (równolegle: %d wątków; wznowione po %d próbach)",P.attemptsStarted.load(),P.attemptsFinished.load(),P.threads.load(),g_sv.resumedAttempts);
@@ -5008,14 +5149,15 @@ static void solverHandleResult(){
       swprintf(b,256,L"#%lld: przekroczono limit 2 godzin łącznego szukania  →  Unsolvable.csv (postęp zapamiętany)",e.num); solverLog(b);
       solverNext();
    } else {
-      // 5-minute stage over without a solution
+      // Stage over without a solution: with the checkbox ticked go on to the next
+      // deal at once, otherwise ask whether to keep searching this one
       solverUpdateUI();
       solverSaveProgress();
-      bool again=solverAskContinue(g_sv.hwnd,e.num);
+      bool again=!g_solverAutoNext && solverAskContinue(g_sv.hwnd,e.num);
       if(again){
          g_sv.stage++;
          g_sv.stageStart=GetTickCount64();
-         g_sv.deadline=g_sv.stageStart+SOLVER_STAGE_MS;
+         g_sv.deadline=g_sv.stageStart+solverStageMs();
          solverLaunchThread();
       } else {
          removeNumberEntry(getLostNumbersPath(),e.num);
@@ -5036,7 +5178,7 @@ static void solverPoll(){
 static LRESULT CALLBACK SolverProgProc(HWND h,UINT m,WPARAM w,LPARAM l){
    switch(m){
    case WM_CREATE:{
-      INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_PROGRESS_CLASS}; InitCommonControlsEx(&icc);
+      INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_PROGRESS_CLASS|ICC_BAR_CLASSES}; InitCommonControlsEx(&icc);
       SolverRun& S=g_sv;
       S.lblTitle   =solverChild(h,L"STATIC",L"",SS_LEFT,14,12,492,22,0,true);
       S.lblTime    =solverChild(h,L"STATIC",L"",SS_LEFT,14,44,492,18,0);
@@ -5053,12 +5195,23 @@ static LRESULT CALLBACK SolverProgProc(HWND h,UINT m,WPARAM w,LPARAM l){
       S.lblBest    =solverChild(h,L"STATIC",L"",SS_LEFT,14,164,492,36,0);
       S.barBest    =solverChild(h,PROGRESS_CLASSW,L"",PBS_SMOOTH,14,202,492,14,0);
       S.lblNodes   =solverChild(h,L"STATIC",L"",SS_LEFT,14,228,492,18,0);
-      S.btnStop    =solverChild(h,L"BUTTON",L"Przerwij",BS_PUSHBUTTON|WS_TABSTOP,210,260,100,30,IDC_SV_STOP);
+      // Stage length (1-10 min, whole minutes) and what to do when a stage ends.
+      solverMakeStageControls(h,14,256,492,S.stageUi);
+      S.btnStop    =solverChild(h,L"BUTTON",L"Przerwij",BS_PUSHBUTTON|WS_TABSTOP,210,332,100,30,IDC_SV_STOP);
       for(HWND bar: {S.barTime,S.barCurrent,S.barBest}) SendMessageW(bar,PBM_SETRANGE32,0,1000);
       SetTimer(h,1,250,nullptr);
       return 0;}
    case WM_TIMER: if(w==1) solverPoll(); return 0;
+   case WM_HSCROLL:
+      if(solverStageHScroll(g_sv.stageUi,(HWND)l)){
+         // takes effect at once, also for the stage already running (the search re-reads its deadline)
+         g_sv.deadline=g_sv.stageStart+solverStageMs();
+         if(g_sv.P) g_sv.P->deadline.store(g_sv.deadline);
+         return 0;
+      }
+      break;
    case WM_COMMAND:
+      if(solverStageCommand(g_sv.stageUi,LOWORD(w))) return 0;
       if(LOWORD(w)==IDC_SV_STOP || LOWORD(w)==IDCANCEL){ g_sv.cancel.store(true); EnableWindow(g_sv.btnStop,FALSE); return 0; }
       break;
    case WM_CLOSE: g_sv.cancel.store(true); EnableWindow(g_sv.btnStop,FALSE); return 0; // the worker ends, solverPoll() then closes the window
@@ -5074,8 +5227,9 @@ static void runSolverBatch(HWND parent,const std::vector<NumEntry>& picked){
    }
    g_sv.list=picked; g_sv.idx=0; g_sv.finished=false; g_sv.busy=false;
    g_sv.solvedCount=g_sv.unsolvableCount=g_sv.abortedCount=0; g_sv.log.clear();
-   RECT r={0,0,520,304}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,0);
-   g_sv.hwnd=CreateWindowExW(0,L"PasjansSolverProg",L"Solver – szukanie rozwiązań",st,CW_USEDEFAULT,CW_USEDEFAULT,
+   loadSolverUiSettings();
+   RECT r={0,0,520,376}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_DLGMODALFRAME);
+   g_sv.hwnd=CreateWindowExW(WS_EX_DLGMODALFRAME,L"PasjansSolverProg",L"Solver – szukanie rozwiązań",st,CW_USEDEFAULT,CW_USEDEFAULT,
       r.right-r.left,r.bottom-r.top,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
    if(!g_sv.hwnd) return;
    solverCenterOn(g_sv.hwnd,parent);
@@ -5202,8 +5356,8 @@ static void showPlayFailedDialog(HWND hwnd){
       wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1); RegisterClassExW(&wc); reg=true;
    }
    g_pf=PlayFailedPick(); g_pf.all=lost;
-   RECT r={0,0,410,364}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,0);
-   HWND dlg=CreateWindowExW(0,L"PasjansPlayFailedPick",L"Zagraj nieudany",st,CW_USEDEFAULT,CW_USEDEFAULT,
+   RECT r={0,0,410,364}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_DLGMODALFRAME);
+   HWND dlg=CreateWindowExW(WS_EX_DLGMODALFRAME,L"PasjansPlayFailedPick",L"Zagraj nieudany",st,CW_USEDEFAULT,CW_USEDEFAULT,
       r.right-r.left,r.bottom-r.top,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
    if(!dlg) return;
    solverCenterOn(dlg,hwnd);
@@ -5684,6 +5838,7 @@ static void performHintNow(){
       // any other move.
       auto buildHintList=[&](const std::vector<RankedMove>& ranked)->bool{
          bool mandatoryDeal = isTrivialBoard(g_game);
+         bool haveEmptyColHint=false;
          for(auto& rm : ranked){
             const MoveHint& h = rm.move;
             if(h.fromIdx==-1){
@@ -5694,10 +5849,11 @@ static void performHintNow(){
             }
             // Per spec: the hint cycle shows only "sensible" moves — score>0.
             if(rm.score<=0) continue;
-            // If hint is col→empty, don't add more empty-col hints — one pulse covers all
+            // Moving onto any of several empty columns is the same move: list only the
+            // best-ranked one, then carry on scanning for other moves as usual.
             if(h.toType==LOC_COLUMN && h.toIdx>=0 && g_game.cols[h.toIdx].empty()){
-               g_hintList.push_back(h);
-               break; // one empty-col hint is enough, we'll pulse all empty cols
+               if(haveEmptyColHint) continue;
+               haveEmptyColHint=true;
             }
             g_hintList.push_back(h);
          }
@@ -5744,15 +5900,10 @@ static void performHintNow(){
          g_reservePulseStep=0;
          g_reservePulseAlpha=0.f;
          SetTimer(g_hwnd,TIMER_PULSE,50,nullptr);
-      // P3 hint (col→empty column): pulse all empty columns
-      } else if(h.toType==LOC_COLUMN && h.toIdx>=0
-                && g_game.cols[h.toIdx].empty()){
-         g_emptyColPulsing=true;
-         g_reservePulseStep=0;
-         g_emptyColPulseAlpha=0.f;
-         SetTimer(g_hwnd,TIMER_PULSE,50,nullptr);
       } else {
-         // Animate card flying to destination and back
+         // Animate card flying to destination and back. A move onto an empty
+         // column is shown exactly like every other move (the card flies to
+         // that column's slot) — it used to pulse all empty columns instead.
          std::vector<Card> moving;
          float sx,sy,ex,ey,ov;
          bool toFound=(h.toType==LOC_FOUNDATION);

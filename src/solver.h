@@ -62,6 +62,10 @@ struct Progress {
    // both look identical from bestKings/bestPlaced alone (a found solution IS
    // a position with bestKings==8, so that counter reaching 8 while the
    // window keeps running isn't a bug, just an unexplained one).
+   // End of the current search stage (GetTickCount64() value). solveDeal() starts
+   // it at its `deadline` argument; the UI may move it while the search runs (the
+   // stage-length slider), and the workers re-read it every time they poll.
+   std::atomic<ULONGLONG> deadline{0};
    std::atomic<bool>      solutionFound{false};
    std::atomic<int>       solutionLen{0};       // moves in the best (shortest) line found so far
    std::atomic<ULONGLONG> solutionFoundAt{0};   // GetTickCount64() of the first solution, for a countdown
@@ -680,7 +684,7 @@ inline DWORD WINAPI workerProc(LPVOID p){
       if(S->done.load(std::memory_order_relaxed) || S->cancel->load(std::memory_order_relaxed)) return true;
       ULONGLONG now=GetTickCount64();
       if(S->haveBest.load(std::memory_order_relaxed)) return now>S->firstFound+POLISH_EXTRA_MS;
-      return now>S->deadline;
+      return now>S->P->deadline.load(std::memory_order_relaxed);
    };
    while(!stop()){
       int k=S->P->attemptsStarted.fetch_add(1);
@@ -763,6 +767,7 @@ inline Result solveDeal(const GameState& start, bool freeMode, Progress& P,
                         const std::vector<Mv>* resumePrefix=nullptr){
    Result res;
    Shared S; S.start=&start; S.freeMode=freeMode; S.P=&P; S.cancel=&cancel; S.deadline=deadline;
+   P.deadline.store(deadline);
    InitializeCriticalSection(&S.cs);
    if(resumePrefix && !resumePrefix->empty()){
       S.bestPrefix=*resumePrefix;
@@ -782,7 +787,7 @@ inline Result solveDeal(const GameState& start, bool freeMode, Progress& P,
       res.solved=validateLine(start,freeMode,res.moves,nullptr);
    } else {
       res.cancelled=cancel.load();
-      res.timedOut=!res.cancelled && GetTickCount64()>=deadline;
+      res.timedOut=!res.cancelled && GetTickCount64()>=P.deadline.load();
    }
    res.bestEffort=S.bestPrefix;
    res.bestPotential=S.bestPotential;
