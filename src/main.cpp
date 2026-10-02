@@ -32,7 +32,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.0.3";
+static const wchar_t* APP_VERSION = L"1.0.4";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -152,6 +152,13 @@ struct CardAnim {
    DWORD dur;      // custom duration in ms; 0 = use default
    bool  toFound, isPreview;
    int   phase;
+   // Reserve-deal flight: the card leaves the reserve face-down (its deck's
+   // back, 0 = red / 1 = blue), lifts to ~130% size mid-flight and turns over,
+   // lying fully face-up for the last 10% of the movement (see drawScene()).
+   // reverse = undo of a deal: card flies back face-up and turns face-down on the way
+   // (own timing, see drawScene()).
+   bool  dealFlip=false, reverse=false;
+   int   deck=0;
 
    DWORD duration() const {
       DWORD base = dur>0 ? dur : (isPreview ? CARD_ANIM_PREVIEW_MS : CARD_ANIM_MS);
@@ -166,6 +173,10 @@ struct CardAnim {
    }
    float ease() const {
       float tt=t();
+      // Undo of a deal accelerates instead (slow lift-off, fast arrival): the card
+      // has to finish turning over while it's still well away from the reserve,
+      // which an ease-out (fast start, crawling end) made it do right above the pile.
+      if(reverse) return tt*tt*tt;
       return 1.f-(1.f-tt)*(1.f-tt)*(1.f-tt);
    }
    float renderOv() const {
@@ -1690,16 +1701,23 @@ static void discardD2DRT(){
 // deal's number, cached per number (see reserveDeckTagsForSeed in game.h). A
 // save with no known number (very old files) just alternates, which is only
 // cosmetic.
-static int reserveTopDeck(){
+// Deck of the i-th card (0 = next to be dealt) of a reserve that holds
+// `sizeThen` cards — lets the deal animation colour each flying card's back
+// from the reserve as it was BEFORE the deal took its cards out.
+static int reserveDeckAt(size_t sizeThen,size_t i){
    static long long cachedFor=-2; static std::vector<uint8_t> tags;
    if(g_currentGameNumber!=cachedFor){
       cachedFor=g_currentGameNumber;
       tags.clear();
       if(g_currentGameNumber>=0) tags=reserveDeckTagsForSeed((unsigned int)g_currentGameNumber);
    }
+   if(i>=sizeThen) return 0;
+   if(tags.empty()||sizeThen>tags.size()) return (int)((sizeThen-i)&1);
+   return tags[tags.size()-sizeThen+i];
+}
+static int reserveTopDeck(){
    size_t n=g_game.reserve.size();
-   if(tags.empty()||n>tags.size()||n==0) return (int)(n&1);
-   return tags[tags.size()-n];
+   return n? reserveDeckAt(n,0) : 0;
 }
 
 static void drawScene(){
@@ -1792,7 +1810,24 @@ static void drawScene(){
    }
    if(g_dealing){const PopIn* cur=g_deal.current();if(cur){int cx=g_layout.colPos(cur->col).x,cy=colCardY(cur->col,cur->cardIdx);float sc=cur->scale(),cw=(float)g_layout.cardW*sc,ch=(float)g_layout.cardH*sc;ID2D1Bitmap* bmp=GetCardD2D(cur->card.imgKey(),g_d2dRT);if(bmp)g_d2dRT->DrawBitmap(bmp,D2D1::RectF((float)cx+(g_layout.cardW-cw)/2.f,(float)cy+(g_layout.cardH-ch)/2.f-OY,(float)cx+(g_layout.cardW+cw)/2.f,(float)cy+(g_layout.cardH+ch)/2.f-OY));}}
    if(g_drag.active&&!g_drag.cards.empty()){int bx=g_drag.mx-g_drag.offX,by=g_drag.my-g_drag.offY;float dov=(g_drag.fromCol>=0)?g_colDispOv[g_drag.fromCol]:g_colDispOv[0];for(int i=0;i<(int)g_drag.cards.size();i++)g_renderer.drawCard((float)bx,(float)by+i*dov-OY,g_drag.cards[i],true,false);}
-   for(auto& a:g_cardAnims){if(a.done())continue;float cx=a.cx(),cy=a.cy()-OY,ov=a.renderOv();for(int i=0;i<(int)a.cards.size();i++)g_renderer.drawCard(cx,cy+i*ov,a.cards[i],false,false);}
+   for(auto& a:g_cardAnims){if(a.done())continue;float cx=a.cx(),cy=a.cy()-OY,ov=a.renderOv();
+      if(a.dealFlip&&a.cards.size()==1){
+         // Lift (+30% at mid-flight, back to 100% on landing) and turn over: face-down
+         // at the start, fully face-up from 90% of the flight to the end.
+         float t=a.t();
+         float scale=1.f+0.3f*sinf(3.14159265f*t); // +30% at mid-flight
+         float flip;
+         if(a.reverse){
+            // Undo of a deal (card flying back to the reserve): it first lifts off the
+            // table face-up, starts turning at 15% of the flight and is fully face-down
+            // from 40% on (the rest of the flight it just travels to the pile).
+            flip=1.f-std::max(0.f,std::min(1.f,(t-0.15f)/(0.40f-0.15f)));
+         } else {
+            flip=std::min(1.f,t/0.9f); // deal: fully face-up for the last 10%
+         }
+         g_renderer.drawCardFlip(cx,cy,a.cards[0],a.deck,scale,flip);
+         continue;}
+      for(int i=0;i<(int)a.cards.size();i++)g_renderer.drawCard(cx,cy+i*ov,a.cards[i],false,false);}
    // ── Fireworks ─────────────────────────────────────────────────────────────
    for(auto& fwk:g_fw.fireworks()){
       if(!fwk.exploded){
@@ -2472,6 +2507,8 @@ void doDeal(){
       a.toFound =false;
       a.isPreview=false;
       a.phase   =0;
+      a.dealFlip=true;
+      a.deck    =reserveDeckAt(g_game.reserve.size()+placed.size(),(size_t)i); // reserve as it was before this deal
       g_cardAnims.push_back(a);
       g_animating=true;
    }
@@ -2509,6 +2546,7 @@ static void animateStateDiff(const Snapshot& before, const Snapshot& after){
             a.srcOv=0.f; a.dstOv=dstOv; a.arcH=60.f; a.dur=DEAL_DUR;
             a.startTime=now+(DWORD)(idx*STAGGER);
             a.toFound=false; a.isPreview=false; a.phase=0;
+            a.dealFlip=true; a.deck=reserveDeckAt(before.reserve.size(),(size_t)idx);
             g_cardAnims.push_back(a); g_animating=true;
             idx++;
          }
@@ -2545,6 +2583,9 @@ static void animateStateDiff(const Snapshot& before, const Snapshot& after){
             a.srcOv=0.f; a.dstOv=0.f; a.arcH=60.f; a.dur=DEAL_DUR;
             a.startTime=now+(DWORD)(idx*STAGGER);
             a.toFound=false; a.isPreview=false; a.phase=0;
+            // The card returns to the reserve face-up, turns over in flight and
+            // arrives face-down (its deck's back).
+            a.dealFlip=true; a.reverse=true; a.deck=reserveDeckAt(after.reserve.size(),(size_t)idx);
             g_cardAnims.push_back(a); g_animating=true;
             idx++;
          }
@@ -3226,9 +3267,26 @@ static void showStats(HWND parent){
 }
 
 
+// Date this exe was compiled (main.cpp is the single translation unit, so it
+// changes with every build), as dd.mm.yyyy from the compiler's "Mmm dd yyyy".
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdate-time" // Zig's clang turns __DATE__ into an error by default; a build date is the whole point here
+#endif
+static std::wstring buildDateText(){
+   const char* d=__DATE__;
+   static const char* M="JanFebMarAprMayJunJulAugSepOctNovDec";
+   int mon=1; for(int i=0;i<12;i++) if(strncmp(d,M+i*3,3)==0){ mon=i+1; break; }
+   wchar_t b[32]; swprintf(b,32,L"%02d.%02d.%04d",atoi(d+4),mon,atoi(d+7));
+   return b;
+}
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+
 static void showHelp(HWND parent){
-   const wchar_t* text =
-      L"PASJANS DZIADKOWY\n"
+   std::wstring text = std::wstring(L"PASJANS DZIADKOWY\n")
+      + L"Wersja " + APP_VERSION + L"   (zbudowana " + buildDateText() + L")\n" +
       L"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
       L"CEL GRY\n"
       L"Umie\u015b\u0107 wszystkich 8 kr\u00f3l\u00f3w na kolumnach (z prawidłowymi sekwensami)\n"
@@ -3262,7 +3320,7 @@ static void showHelp(HWND parent){
       L"D\u017bWI\u0118KI\n"
       L"  Pliki .wav w katalogu gry (click, nono, sukces, nowa, rozloz, koniec)\n";
 
-   MessageBoxW(parent, text, L"Pomoc – Pasjans Dziadkowy", MB_OK|MB_ICONINFORMATION);
+   MessageBoxW(parent, text.c_str(), L"Pomoc – Pasjans Dziadkowy", MB_OK|MB_ICONINFORMATION);
 }
 
 // ============================================================================

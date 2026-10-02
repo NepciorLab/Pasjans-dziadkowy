@@ -244,3 +244,19 @@ Rezerwa jest zawsze sufiksem początkowej listy (rozdanie zabiera z przodu, cofn
 rewers na ekranie = talia następnej karty do rozdania: czerwony dla talii 1, niebieski dla talii 2 (main.cpp:
 reserveTopDeck(), numer partii z g_currentGameNumber, zapis gry bez zmian). Sprawdzone na 2000 partiach:
 0 niezgodności z rzeczywistą rezerwą z GameState::newGame(), po ~50% kart z każdej talii.
+
+# Pomoc: wersja i data budowy; nowa animacja rozdawania z rezerwy (main.cpp, renderer_d2d.h)
+- Pomoc (H) pokazuje pod tytułem "Wersja X.Y.Z (zbudowana dd.mm.rrrr)": numer z APP_VERSION, data z __DATE__ z
+  kompilacji main.cpp (buildDateText(); Zig/clang traktuje __DATE__ jako błąd, stąd lokalny pragma -Wdate-time).
+- Rozdawanie z rezerwy: karty startują zakryte (rewers swojej talii, czerwony/niebieski), w locie unoszą się do
+  ~120% rozmiaru (1 + 0.2*sin(pi*t), z powrotem 100% przy lądowaniu) i obracają się na drugą stronę (szerokość
+  ~|cos|, awers bez odbicia lustrzanego), a w ostatnich 10% lotu leżą już w pełni odkryte (flip = min(1, t/0.9)).
+  t liczone liniowo w czasie lotu. CardAnim::dealFlip/deck, RendererD2D::drawCardFlip(); dotyczy rozdania oraz
+  ponowienia rozdania (Ponów), cofnięcie rozdania (CardAnim::reverse) ma własny przebieg: karta unosi się odkryta, zaczyna obracać po 15% lotu,
+  od 40% jest już w pełni zakryta (w rewersie swojej talii) i resztę lotu pokonuje zakryta; skala 100→130→100%
+  (powiększenie 30% w obu animacjach: rozdawania i cofania).
+  Prędkość ruchu przy cofaniu jest odwrócona względem rozdawania: zamiast wyhamowania na końcu (ease-out, karta była
+  w połowie czasu już blisko rezerwy i obracała się tuż nad stosem) jest przyspieszanie (ease-in, s = t^3, w
+  CardAnim::ease() dla reverse) — karta powoli odrywa się od stołu, kończy obrót po przebyciu ok. 6% drogi
+  (t=0.4), w połowie czasu jest dopiero w 13% drogi, a do rezerwy dolatuje szybko. Zweryfikowane offline: klatki animacji wyrenderowane
+  tym samym rendererem do PNG (t=0..1, obie talie) — rewers → krawędź → awers, skala 100→120→100%.

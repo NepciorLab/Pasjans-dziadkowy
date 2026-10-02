@@ -47,6 +47,22 @@ public:
    }
 
    // ── card back ─────────────────────────────────────────────────────────────
+   // A card mid-turn about its vertical axis, scaled uniformly about its centre
+   // (x,y = the card's top-left at normal size). flip: 0 = back fully showing,
+   // 0.5 = edge-on, 1 = face fully showing; the face is drawn unmirrored once
+   // past edge-on, exactly as a real half-turn would show the other side.
+   void drawCardFlip(float x,float y,const Card& card,int deck,float scale,float flip) const {
+      if(!m_rt) return;
+      float cw=(float)m_lay->cardW, ch=(float)m_lay->cardH;
+      float wf=std::max(0.03f,fabsf(cosf(flip*3.14159265f)));
+      D2D1::Matrix3x2F old; m_rt->GetTransform(&old);
+      m_rt->SetTransform(D2D1::Matrix3x2F::Scale(D2D1::SizeF(scale*wf,scale),
+         D2D1::Point2F(x+cw/2.f,y+ch/2.f))*old);
+      if(flip>=0.5f) drawCard(x,y,card,false,false);
+      else           drawBackOne(x,y,deck==1?"B2":"B1");
+      m_rt->SetTransform(old);
+   }
+
    // deck 0 = red back, deck 1 = blue back (see reserveDeckTagsForSeed in game.h)
    void drawBack(float x,float y,int deck) const {
       if(!m_rt) return;
