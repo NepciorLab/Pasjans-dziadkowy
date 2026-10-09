@@ -377,3 +377,9 @@ tryb Tylko król, seed 4): 2 wątki 1,30 -> 12 wątków 6,20 -> 3 wątki 1,91 ->
   losową prędkością, koziołkuje (obrót wokół osi pionowej i w płaszczyźnie stołu) - aż wszystkie leżą rewersem do góry
   w jednej kupce na środku; kupka przesuwa się na miejsce rezerwy i zaczyna się rozdanie. Nowa partia kliknięta w
   trakcie animacji przerywa ją i od razu rozdaje.
+
+# Wersja 1.1.2: animacja nowej partii dopracowana, sztuczne ognie (src/main.cpp, fireworks2.h)
+- Zbieranie kart przy nowej partii: karta zaczyna wirować w tej samej chwili, w której zaczyna się unosić (bez czekania na
+  pozostałe); kupka przesuwa się na rezerwę ruchem z przyspieszeniem i opóźnieniem (wygładzenie czwartego stopnia).
+- Fajerwerki: wybuch "pierścień" jest teraz kołem (był spłaszczoną elipsą); mniej więcej co trzeci fajerwerk gaśnie z
+  rozbłyskiem - każda iskra w końcówce życia na chwilę wybłyskuje na biało i dopiero gaśnie.

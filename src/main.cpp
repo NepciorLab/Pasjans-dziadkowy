@@ -33,7 +33,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.1.1";
+static const wchar_t* APP_VERSION = L"1.1.2";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -1832,7 +1832,8 @@ static bool ngSnapshot(){
    for(const Raw& r:raw){
       NgCard k; k.c=r.c; k.back=r.back; k.deck=r.back?r.deck:(int)(rng()&1); k.x=r.x; k.y=r.y; k.depth=r.depth;
       k.liftAt=0.55f*(r.depth/maxDepth)+0.03f*rnd();
-      k.s0=0.9f+0.35f*rnd(); k.s1=NG_HOLD_S-0.3f*rnd();
+      k.s0=k.liftAt;   // a card is drawn into the whirl the moment it starts to lift, without waiting for the others
+      k.s1=NG_HOLD_S-0.3f*rnd();
       k.dir=1.f; k.turns=1.2f+1.6f*rnd();
       k.bump=minWH*(0.06f+0.14f*rnd());
       k.tumbleN=(float)(3+2*(int)(rng()%3));            // odd number of half-turns: ends back up
@@ -1859,6 +1860,7 @@ static void ngDrawGather(float W,float H){
       const POINT rp=g_layout.reservePos();
       const float rx=(float)rp.x, ry=(float)rp.y-(float)Layout::TOOLBAR_H;
       float s=ngSmooth((t-NG_SLIDE_S)/(NG_GATHER_MS/1000.f-NG_SLIDE_S));
+      s=s<0.5f? 8.f*s*s*s*s : 1.f-8.f*(1.f-s)*(1.f-s)*(1.f-s)*(1.f-s);   // slow start, fast middle, slow stop (quartic ease-in-out)
       float px=cx-cw/2+(rx-(cx-cw/2))*s, py=cy-ch/2+(ry-(cy-ch/2))*s;
       g_renderer.drawBack(px,py,topDeck);
       return;

@@ -61,18 +61,20 @@ public:
          float tw=1.f; if(p.glitter) tw=0.35f+0.65f*(0.5f+0.5f*std::sin(m_time*(18.f+p.tw*20.f)+p.tw*40.f));
          else tw=0.88f+0.12f*std::sin(m_time*40.f+p.tw*30.f);
          float inten=fade*tw*p.bright;
+         // dying out with a flash: at its own moment the spark pops white and bright, then goes out
+         float fl=0.f; if(u>=p.flareAt){ fl=1.f-(u-p.flareAt)/std::max(0.02f,1.f-p.flareAt); fl*=fl; inten=std::max(inten,fl*(0.9f+0.7f*p.bright)); }
          if(inten<0.01f) continue;
          // head colour: white-hot at first, then the particle's own colour
-         float hot=std::max(0.f,1.f-u*3.2f);
+         float hot=std::max(std::max(0.f,1.f-u*3.2f),fl);
          float hr=p.r+(1.f-p.r)*hot, hg=p.g+(1.f-p.g)*hot, hb=p.b+(1.f-p.b)*hot;
-         if(p.hn<2){ splat(p.x*sx,p.y*sy,p.glitter?1.3f:1.8f,hr*inten,hg*inten,hb*inten); continue; }
+         if(p.hn<2){ splat(p.x*sx,p.y*sy,(p.glitter?1.3f:1.8f)+2.2f*fl,hr*inten,hg*inten,hb*inten); continue; }
          for(int i=0;i+1<p.hn;i++){
             float a=1.f-(float)i/(float)p.hn; a=a*a;                       // the tail fades quickly
             float cr=hr*a+p.r*(1.f-a)*0.55f, cg=hg*a+p.g*(1.f-a)*0.55f, cb=hb*a+p.b*(1.f-a)*0.55f;
             float w=inten*(0.15f+0.85*a);
             line(p.hx[i]*sx,p.hy[i]*sy,p.hx[i+1]*sx,p.hy[i+1]*sy,cr*w,cg*w,cb*w);
          }
-         splat(p.x*sx,p.y*sy,1.6f,hr*inten,hg*inten,hb*inten);              // the bright head
+         splat(p.x*sx,p.y*sy,1.6f+2.2f*fl,hr*inten,hg*inten,hb*inten);              // the bright head
       }
       bloom(bw,bh);
       // tone mapping: soft shoulder, so overlapping streaks go white instead of clipping; dithered, so the soft glow has no bands
@@ -89,13 +91,17 @@ public:
 
 private:
    static constexpr float STEP=1.f/60.f;
-   struct Part{ float x,y,vx,vy,life,maxLife,r,g,b,drag,grav,bright,tw; bool glitter; float hx[14],hy[14]; int hn,hmax; };
+   struct Part{ float x,y,vx,vy,life,maxLife,r,g,b,drag,grav,bright,tw,flareAt; bool glitter; float hx[14],hy[14]; int hn,hmax; };
    struct Rocket{ float x,y,vx,vy,ay,ty; float hx[20],hy[20]; int hn; float t,T; };
    struct Flash{ float x,y,t,maxT,r,g,b; };
    std::vector<Part> m_parts; std::vector<Rocket> m_rockets; std::vector<Flash> m_flashes; std::vector<Event> m_events;
    bool m_active=false, m_spawn=true; int m_w=800,m_h=600,m_bw=0,m_bh=0; float m_time=0,m_acc=0,m_next=0;
    std::vector<float> m_acc3, m_b1, m_b2; std::vector<float> m_lut; int m_pal=0, m_burstNo=0; std::vector<float> m_hues;
    std::mt19937 m_rng{std::random_device{}()};
+   float m_finaleP=0.35f;                                                // chance that a burst dies out with a flash
+public:
+   void setFinaleChance(float p){ m_finaleP=p; }
+private:
    float rnd(){ return (float)(m_rng()%100000)/100000.f; }
    float scale() const { return std::min((float)m_w,(float)m_h*1.25f)/1000.f; }       // design: ~1000 px wide
 
@@ -176,9 +182,10 @@ private:
       float hue=m_hues.back(); m_hues.pop_back(); float var=0.03f+0.12f*rnd();
       float fr,fg,fb; hsv(hue,0.55f+0.4f*rnd(),1.f,fr,fg,fb); 
       m_flashes.push_back({x,y,0.f,0.45f,fr*0.6f+0.4f,fg*0.6f+0.4f,fb*0.6f+0.4f});
+      const bool finale=rnd()<m_finaleP;                                                                    // this one dies out with a flash
       int N=(type==1)?420:(type==3?520:600+(int)(rnd()*300));
       for(int i=0;i<N;i++){
-         Part p; p.x=x; p.y=y; p.glitter=false; p.tw=rnd(); p.hn=0; p.hmax=11;
+         Part p; p.x=x; p.y=y; p.glitter=false; p.tw=rnd(); p.hn=0; p.hmax=11; p.flareAt=finale?0.72f+0.22f*rnd():2.f;
          float a=rnd()*6.2831853f, v;
          p.maxLife=1.6f+rnd()*1.7f; p.drag=0.955f+0.012f*rnd(); p.grav=(60.f+40.f*rnd())*k; p.bright=0.55f+0.45f*rnd();
          float h=hue+(rnd()-0.5f)*var*2.f; float sat=0.55f+0.45f*rnd(); if(rnd()<0.10f) sat*=0.25f;                // a few nearly white
@@ -190,9 +197,9 @@ private:
          } else if(type==1){                                                                                       // willow: gold, slow, droops, long life
             v=(20.f+430.f*std::pow(rnd(),0.7f))*k; p.vx=std::cos(a)*v; p.vy=std::sin(a)*v-40.f*k;
             hsv(0.10f+0.04f*rnd(),0.55f+0.3f*rnd(),1.f,p.r,p.g,p.b); p.maxLife=2.6f+rnd()*1.6f; p.drag=0.975f+0.008f*rnd(); p.grav=(170.f+60.f*rnd())*k; p.hmax=13;
-         } else if(type==2){                                                                                       // ring (a tilted circle) plus a core
+         } else if(type==2){                                                                                       // ring (a circle) plus a core
             bool ring=i<N*0.7f; v=(ring?560.f:(100.f+260.f*rnd()))*k*(ring?(0.96f+0.08f*rnd()):1.f);
-            p.vx=std::cos(a)*v; p.vy=std::sin(a)*v*0.55f; if(!ring) p.vy=std::sin(a)*v;
+            p.vx=std::cos(a)*v; p.vy=std::sin(a)*v;
             if(ring){ hsv(hue,0.8f,1.f,p.r,p.g,p.b); } else { hsv(hue+0.5f,0.5f,1.f,p.r,p.g,p.b); }
          } else {                                                                                                  // two shells, inner one in the opposite colour
             bool inner=i<N*0.45f; v=(inner?(120.f+210.f*rnd()):(280.f+380.f*rnd()))*k; p.vx=std::cos(a)*v; p.vy=std::sin(a)*v;
@@ -204,7 +211,7 @@ private:
       m_events.push_back({1,0.f,x/(float)std::max(1,m_w),(float)N});
       int G=120+(int)(rnd()*120);
       for(int i=0;i<G;i++){
-         Part p; p.x=x; p.y=y; p.glitter=true; p.tw=rnd(); p.hn=0; p.hmax=1;
+         Part p; p.x=x; p.y=y; p.glitter=true; p.tw=rnd(); p.hn=0; p.hmax=1; p.flareAt=finale?0.72f+0.22f*rnd():2.f;
          float a=rnd()*6.2831853f, v=(60.f+300.f*rnd())*k; p.vx=std::cos(a)*v; p.vy=std::sin(a)*v; p.maxLife=2.6f+rnd()*2.4f;
          p.drag=0.93f+0.02f*rnd(); p.grav=(25.f+25.f*rnd())*k; p.bright=0.5f+0.5f*rnd(); hsv(hue+(rnd()-0.5f)*0.2f,0.25f+0.4f*rnd(),1.f,p.r,p.g,p.b);
          m_parts.push_back(p);
