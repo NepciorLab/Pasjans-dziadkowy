@@ -11,7 +11,8 @@
 #include <algorithm>
 #include <cmath>
 
-// Sound slot keys — 9 configurable actions
+// Sound slot keys — 0..8 are the 9 actions the player can give an own sound (Settings → Dźwięki);
+// 9..18 are the rocket whistles and the bangs of the fireworks (fixed, not shown in the settings)
 static const char* SOUND_KEYS[] = {
    "nowa",    // 0 Nowa gra
    "click",   // 1 Przełożenie karty
@@ -22,8 +23,12 @@ static const char* SOUND_KEYS[] = {
    "ponow",   // 6 Ponowienie
    "podp",    // 7 Podpowiedź
    "nono",    // 8 Brak możliwego ruchu
+   "swist1", "swist2", "swist3", "swist4", "swist5",        // 9..13   whistles of the rockets
+   "wybuch1", "wybuch2", "wybuch3", "wybuch4", "wybuch5",   // 14..18  bangs of the bursts
 };
-static const int SOUND_COUNT = 9;
+static const int SOUND_UI_COUNT = 9;     // slots shown in the settings window
+static const int SOUND_COUNT = 19;
+static const int SOUND_WHISTLE0 = 9, SOUND_BANG0 = 14, SOUND_VARIANTS = 5;
 static const wchar_t* SOUND_LABELS[] = {
    L"Nowa gra",
    L"Przełożenie karty",
@@ -34,6 +39,7 @@ static const wchar_t* SOUND_LABELS[] = {
    L"Ponowienie",
    L"Podpowiedź",
    L"Ruch niemożliwy",
+   L"", L"", L"", L"", L"", L"", L"", L"", L"", L"",
 };
 static const wchar_t* SOUND_DEFAULTS[] = {
    L"nowa.wav",
@@ -45,6 +51,8 @@ static const wchar_t* SOUND_DEFAULTS[] = {
    L"ponow.wav",
    L"podpowiedz.wav",
    L"nono.wav",
+   L"swist1.wav", L"swist2.wav", L"swist3.wav", L"swist4.wav", L"swist5.wav",
+   L"wybuch1.wav", L"wybuch2.wav", L"wybuch3.wav", L"wybuch4.wav", L"wybuch5.wav",
 };
 
 // WAV file header parsing
@@ -168,7 +176,8 @@ public:
          if(strcmp(SOUND_KEYS[i], key) == 0) { playIdx(i, volume); return; }
    }
 
-   void playIdx(int idx, float volume = 1.0f) {
+   // pan: -1 (left) .. 1 (right)
+   void playIdx(int idx, float volume = 1.0f, float pan = 0.f) {
       if(idx < 0 || idx >= SOUND_COUNT || volume < 0.01f) return;
       SoundSlot& s = m_slots[idx];
       if(s.muted) return; // user chose "no sound" for this event
@@ -181,6 +190,7 @@ public:
          }
          LONG dsVol = volFracToDs(volume);
          dup->SetVolume(dsVol);
+         dup->SetPan((LONG)(std::max(-1.f, std::min(1.f, pan)) * 2500.f));
          dup->SetCurrentPosition(0);
          dup->Play(0, 0, 0);
          m_dups.push_back(dup);

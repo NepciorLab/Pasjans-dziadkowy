@@ -307,3 +307,37 @@ polu solver nie miał jak przejść do następnego pasjansa przed upływem limit
 rozwiązania: pole zaznaczone -> od razu następny pasjans (Unsolvable.csv, postęp zapamiętany); pole niezaznaczone ->
 okno z pytaniem (10 s, brak odpowiedzi = szukaj dalej; "Nie, następne" = jak zaznaczone pole). Treść pytania podaje
 aktualną długość etapu z suwaka (zamiast na sztywno "5 minut"); okno bez ikony jak pozostałe okna Solvera.
+
+# Rozdawanie z rezerwy i cofanie: lot o 30% wolniejszy (main.cpp)
+DEAL_MAX_FLIGHT_MS (czas lotu najdalszej karty) = (440 + 200) * 1.3 = 832 ms; bliższe karty proporcjonalnie krócej
+(minimum 35% tego czasu), reszta bez zmian. Pozostałe animacje (ruchy kart, podpowiedź, rozdanie początkowe) nie
+tknięte. Numer wersji w exe zmienia się dopiero przy publikacji wydania.
+
+# Solver: wybór liczby wątków (main.cpp, solver.h)
+- Wiersz "Liczba wątków" ze spin buttonem (edit + UpDown) w oknie wyboru rozdań i w oknie postępu. Zakres 1 do
+  (procesory logiczne − 2), bez dawnego limitu 8 (solver::maxThreads(); np. i9-12900 = 24 procesory logiczne -> maks. 22).
+  Wartość domyślna bez zapisanego wyboru: solver::defaultThreads() = min(8, maks.), czyli jak dotąd. Zapamiętywana w
+  pasjans.ini ([Solver] Threads). W oknie postępu zmiana działa od następnego etapu (wątki powstają przy starcie etapu);
+  opis przy polu to mówi. Każdy wątek trzyma tablicę odwiedzonych pozycji do ok. 35 MB, więc 22 wątki to rzędu 0,8 GB.
+- Okna powiększone o ten wiersz (wybór 496 px, postęp 408 px wysokości obszaru roboczego). Sprawdzone zrzutami prawdziwych
+  okien (testwindows.cpp).
+
+# Solver: liczba wątków zmieniana w trakcie etapu (solver.h, main.cpp)
+Wcześniej wątki powstawały przy starcie etapu, więc zmiana liczby działała dopiero od następnego. Teraz solveDeal()
+od razu uruchamia pulę (maks. 62 pomocnicze wątki, normalnie procesory logiczne − 2), a Progress::threads jest
+"żywą" liczbą aktywnych: wątek o indeksie >= threads czeka (Sleep 50 ms) i porzuca bieżącą próbę, wątek poniżej
+progu zaczyna szukać. Spin button w oknie postępu zapisuje do Progress::threads, zmiana jest widoczna po ułamku
+sekundy; opis "od następnego etapu" usunięty. Sprawdzone na prawdziwym solverze (testthreads.cpp, jeden etap,
+tryb Tylko król, seed 4): 2 wątki 1,30 -> 12 wątków 6,20 -> 3 wątki 1,91 -> 1 wątek 0,77 mln węzłów/s.
+
+# Fajerwerki i dźwięki jak w Garibaldce (src/fireworks2.h, sound.h, main.cpp, res/sounds)
+- Silnik fajerwerków zastąpiony tym z Garibaldki (src/fireworks2.h): setki cienkich smug z białą głową i kolorową
+  smugą, opór powietrza i grawitacja, migoczące iskry, silna poświata (bloom), cztery rodzaje wybuchów (kula, wierzba,
+  pierścień, dwie powłoki). Cały obraz liczony na CPU i kładziony na stół jednym obrazem addytywnym (alfa 0 = światło
+  dodawane do tła; drawFireworks()). Stary system (anim.h: Particle/Firework/FireworkSystem) usunięty.
+- Dźwięki podążają za animacją (fireworksSounds()): wystrzelona rakieta świszcze (jeden z 5 świstów, który mieści się
+  w jej locie, tak ustawiony, by kończył się w chwili wybuchu), każdy wybuch huczy (jeden z 5 huków, głośniej przy
+  większym wybuchu), z panoramą zależną od miejsca na ekranie. Pliki res/sounds/swist1-5.wav i wybuch1-5.wav z nagrania
+  prawdziwego pokazu, wbudowane jako SND_9..SND_18; w oknie ustawień niewidoczne (SOUND_UI_COUNT = 9 slotów).
+- Domyślny odgłos zwycięstwa (sukces.wav) z Garibaldki; własny plik z Ustawień nadal go zastępuje.
+- SoundSystem::playIdx(idx, głośność, panorama).

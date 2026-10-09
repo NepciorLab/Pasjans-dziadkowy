@@ -23,6 +23,7 @@
 #include "layout.h"
 #include "card_images_d2d.h"
 #include "anim.h"
+#include "fireworks2.h"
 #include "renderer_d2d.h"
 #include "sound.h"
 #include "keybindings.h"
@@ -32,7 +33,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.0.8";
+static const wchar_t* APP_VERSION = L"1.1.0";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -362,7 +363,11 @@ static bool g_samogranoActive = false;
 static void cancelSamograj();
 
 static DealAnimator   g_deal;
-static FireworkSystem g_fw;
+static Fireworks2     g_fw;                  // the fireworks of a won game (fireworks2.h): drawn as one additive image
+static std::vector<uint32_t> g_fwImg;
+static ID2D1Bitmap*   g_fwBmp=nullptr;
+static int            g_fwBw=0, g_fwBh=0;
+static double         g_fwLast=0;            // seconds (timeGetTime) of the last g_fw.update()
 static MoveHint       g_hint;
 static bool           g_hintActive  = false;
 static bool           g_hintBlinking= false;   // true during blink animation
@@ -1038,7 +1043,7 @@ static void saveSettings(){
       WritePrivateProfileStringW(L"Settings",L"MoveLabelPos",L"",ini.c_str());
    }
    // Save custom sound paths / mute flags
-   for(int i=0;i<SOUND_COUNT;i++){
+   for(int i=0;i<SOUND_UI_COUNT;i++){
       const std::wstring& p=SoundSystem::instance().customPath(i);
       std::wstring key=std::wstring(L"Sound_")+std::to_wstring(i);
       WritePrivateProfileStringW(L"Sounds",key.c_str(),p.c_str(),ini.c_str());
@@ -1088,7 +1093,7 @@ static void loadSettings(){
       }
    }
    // Load custom sound paths / mute flags
-   for(int i=0;i<SOUND_COUNT;i++){
+   for(int i=0;i<SOUND_UI_COUNT;i++){
       std::wstring key=std::wstring(L"Sound_")+std::to_wstring(i);
       wchar_t spath[MAX_PATH]={};
       GetPrivateProfileStringW(L"Sounds",key.c_str(),L"",spath,MAX_PATH,ini.c_str());
@@ -1694,6 +1699,7 @@ static bool ensureD2DRT(HWND hwnd){
    g_renderer.setRT(g_d2dRT,g_dwFactory);CardImagesD2D::instance().invalidate();return true;}
 static void discardD2DRT(){
    g_renderer.setRT(nullptr,nullptr);CardImagesD2D::instance().invalidate();
+   if(g_fwBmp){g_fwBmp->Release();g_fwBmp=nullptr;g_fwBw=0;}   // belongs to the render target being dropped
    if(g_d2dRT){g_d2dRT->Release();g_d2dRT=nullptr;}}
 
 // Deck (0 = red back, 1 = blue back) of the next card to be dealt from the
@@ -1701,6 +1707,52 @@ static void discardD2DRT(){
 // deal's number, cached per number (see reserveDeckTagsForSeed in game.h). A
 // save with no known number (very old files) just alternates, which is only
 // cosmetic.
+// ── Fireworks of a won game ────────────────────────────────────────────────
+// The engine (fireworks2.h, the same as in Garibaldka) draws everything into one additive
+// image; the sounds follow the animation: a launched rocket whistles — one of five whistles
+// that fits into its flight is chosen and started so that it ends at the burst — and every
+// burst bangs (one of five bangs), panned to where it is.
+struct SndAt{ double at; int idx; float vol, pan; };
+static std::vector<SndAt> g_sndQ;
+static const double WHISTLE_LEN[SOUND_VARIANTS]={0.86,0.96,1.07,1.23,1.39};   // seconds (res/sounds/swist1..5.wav)
+static void fireworksSounds(double now){
+   static std::mt19937 rng{std::random_device{}()};
+   for(const Fireworks2::Event& e:g_fw.takeEvents()){
+      const float pan=(e.x-0.5f)*1.6f;
+      if(e.kind==0){
+         int cand[SOUND_VARIANTS], n=0; for(int i=0;i<SOUND_VARIANTS;i++) if(WHISTLE_LEN[i]<=e.flight+0.03) cand[n++]=i;
+         const int v= n>0 ? cand[rng()%n] : 0;
+         g_sndQ.push_back({now+std::max(0.0,e.flight-WHISTLE_LEN[v]),SOUND_WHISTLE0+v,0.55f,pan});
+      } else {
+         g_sndQ.push_back({now,SOUND_BANG0+(int)(rng()%SOUND_VARIANTS),0.62f+0.38f*std::min(1.f,e.size/850.f),pan});
+      }
+   }
+   if(!g_fw.active()) g_sndQ.clear();
+   for(size_t i=0;i<g_sndQ.size();){
+      if(now>=g_sndQ[i].at){ SoundSystem::instance().playIdx(g_sndQ[i].idx,g_sndQ[i].vol*g_volume,g_sndQ[i].pan); g_sndQ.erase(g_sndQ.begin()+i); }
+      else i++;
+   }
+}
+static void stopFireworks(){
+   g_fw.stop(); g_sndQ.clear(); KillTimer(g_hwnd,TIMER_FW);
+}
+// Lays the fireworks image over the table (alpha 0: the light is added to what is behind it).
+static void drawFireworks(float W,float H){
+   if(!g_fw.active()||!g_d2dRT) return;
+   const float rs=0.6f;                                                    // the image is drawn at 60% size and stretched (it is soft anyway)
+   const int bw=std::max(16,(int)(W*rs)), bh=std::max(16,(int)(H*rs));
+   if(bw!=g_fwBw||bh!=g_fwBh){ g_fwBw=bw; g_fwBh=bh; g_fwImg.assign((size_t)bw*bh,0u); if(g_fwBmp){ g_fwBmp->Release(); g_fwBmp=nullptr; } }
+   g_fw.render(g_fwImg.data(),bw,bh);
+   if(!g_fwBmp){
+      D2D1_BITMAP_PROPERTIES bp=D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
+      g_d2dRT->CreateBitmap(D2D1::SizeU((UINT32)bw,(UINT32)bh),nullptr,0,bp,&g_fwBmp);
+   }
+   if(g_fwBmp){
+      g_fwBmp->CopyFromMemory(nullptr,g_fwImg.data(),(UINT32)bw*4);
+      g_d2dRT->DrawBitmap(g_fwBmp,D2D1::RectF(0.f,0.f,W,H),1.f,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+   }
+}
+
 // Deck of the i-th card (0 = next to be dealt) of a reserve that holds
 // `sizeThen` cards — lets the deal animation colour each flying card's back
 // from the reserve as it was BEFORE the deal took its cards out.
@@ -1828,67 +1880,7 @@ static void drawScene(){
          g_renderer.drawCardFlip(cx,cy,a.cards[0],a.deck,scale,flip);
          continue;}
       for(int i=0;i<(int)a.cards.size();i++)g_renderer.drawCard(cx,cy+i*ov,a.cards[i],false,false);}
-   // ── Fireworks ─────────────────────────────────────────────────────────────
-   for(auto& fwk:g_fw.fireworks()){
-      if(!fwk.exploded){
-         // Rocket trail line
-         g_renderer.drawLine(fwk.px,fwk.py-OY,fwk.x,fwk.y-OY,
-            1.8f,fwk.cr,fwk.cg,fwk.cb,120);
-         // Bright tip
-         g_renderer.drawEllipse(fwk.x,fwk.y-OY,2.5f,255,255,220,220);
-      } else {
-         // Bloom flash: radial gradient — white centre fading to transparent edge
-         if(fwk.flashLife>0){
-            float bf=(float)fwk.flashLife/7.f;  // 1→0
-            float radius=70.f*bf+30.f;           // shrinks as it fades
-            // Build radial gradient: centre=white opaque, edge=white transparent
-            ID2D1GradientStopCollection* stops=nullptr;
-            D2D1_GRADIENT_STOP gs[3];
-            gs[0].position=0.0f; gs[0].color=D2D1::ColorF(1,1,1, bf*0.9f);
-            gs[1].position=0.4f; gs[1].color=D2D1::ColorF(1,0.95f,0.8f, bf*0.55f);
-            gs[2].position=1.0f; gs[2].color=D2D1::ColorF(1,0.8f,0.4f, 0.f);
-            if(SUCCEEDED(g_d2dRT->CreateGradientStopCollection(gs,3,&stops))){
-               ID2D1RadialGradientBrush* br=nullptr;
-               D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES rp=
-                  D2D1::RadialGradientBrushProperties(
-                     D2D1::Point2F(fwk.x,fwk.y-OY),
-                     D2D1::Point2F(0,0), radius, radius);
-               if(SUCCEEDED(g_d2dRT->CreateRadialGradientBrush(rp,stops,&br))){
-                  g_d2dRT->FillEllipse(
-                     D2D1::Ellipse(D2D1::Point2F(fwk.x,fwk.y-OY),radius,radius),br);
-                  br->Release();
-               }
-               stops->Release();
-            }
-         }
-         // Particles
-         for(auto& p:fwk.parts){
-            float t=(float)p.life/(float)p.maxLife; // 0=new,1=dying
-            float af=1.f-t*t;                        // quadratic fade
-            BYTE al=(BYTE)(af*255.f);
-            if(al<5) continue;
-            // Strobe: skip every other tick
-            if(p.strobe && (p.life%2)==1) continue;
-            // Colour lerp from start to ember
-            BYTE r=(BYTE)(p.r*(1.f-t)+p.er*t);
-            BYTE g=(BYTE)(p.g*(1.f-t)+p.eg*t);
-            BYTE b=(BYTE)(p.b*(1.f-t)+p.eb*t);
-            // Trail line (skip for sparks and sub-particles — they're tiny)
-            if(!p.spark && !p.sub){
-               float dx=p.x-p.px,dy=p.y-p.py;
-               float tlen=sqrtf(dx*dx+dy*dy);
-               if(tlen>0.4f){
-                  float lw=std::max(0.6f,p.size*0.55f*(1.f-t*0.5f));
-                  g_renderer.drawLine(p.px,p.py-OY,p.x,p.y-OY,lw,r,g,b,
-                     BYTE(al*0.5f));
-               }
-            }
-            // Head dot
-            float sz=p.size*(1.f-t*0.55f);
-            if(sz>0.25f) g_renderer.drawEllipse(p.x,p.y-OY,sz,r,g,b,al);
-         }
-      }
-   }
+   drawFireworks(fw,fh);   // the fireworks of a won game (no-op while there are none)
    // Compute move label position
    // Default: horizontally centred between rightmost foundation and reserve,
    // vertically aligned with top of foundations (foundY - OY)
@@ -2173,7 +2165,8 @@ void onStateChanged(){
             if(g_gameHwnd) GetClientRect(g_gameHwnd,&rc);
             else { GetClientRect(g_hwnd,&rc); rc.top=Layout::TOOLBAR_H; }
             g_fw.start(rc.right,rc.bottom-(rc.top>0?rc.top:0));
-            SetTimer(g_hwnd,TIMER_FW,28,nullptr);
+            g_fwLast=timeGetTime()/1000.0;
+            SetTimer(g_hwnd,TIMER_FW,16,nullptr);
             // Show record-breaking congratulations after a short delay
             if(newMoves || newTime){
                // Build message
@@ -2307,7 +2300,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
    g_statsExcluded=sameDeal; // "try again" replays are not counted as a separate game
    clearAutoHistory();
    SoundSystem::instance().fadeOutAll(); // fade out win sound if playing
-   g_fw.stop(); KillTimer(g_hwnd,TIMER_FW);
+   stopFireworks();
    KillTimer(g_hwnd,TIMER_DEAL);
    g_drag.active=false; g_drag.cards.clear();
    g_deal.clear();
@@ -2541,11 +2534,12 @@ bool doClickMove(int col, int ci){
 // Reserve deal / its undo: the cards fly at roughly the same SPEED, so the card
 // with the longest way takes the longest and lands last (they used to all fly
 // for the same time, which made the farthest ones the fastest). The farthest
-// card of a deal flies DEAL_MAX_FLIGHT_MS (the old 440 ms + 200 ms); a nearer
+// card of a deal flies DEAL_MAX_FLIGHT_MS ((the old 440 ms + 200 ms) * 1.3, i.e.
+// 30% slower than first set); a nearer
 // one takes proportionally less, but never less than DEAL_MIN_FLIGHT_FRAC of
 // that — a few dozen pixels in a tenth of a second would turn the lift and the
 // turn-over into a blur. All cards leave together, so landing order = distance.
-static const DWORD DEAL_MAX_FLIGHT_MS   = CARD_ANIM_MS*2+200;
+static const DWORD DEAL_MAX_FLIGHT_MS   = (CARD_ANIM_MS*2+200)*13/10;
 static const float DEAL_MIN_FLIGHT_FRAC = 0.35f;
 static void retimeDealFlights(size_t first,DWORD now){
    float maxD=1.f;
@@ -2773,7 +2767,7 @@ void doUndo(){
    if(g_game.undo()){
       if(!g_winCounted) g_moveCount++;
       KillTimer(g_hwnd,TIMER_NOMOVES);
-      g_fw.stop(); KillTimer(g_hwnd,TIMER_FW);
+      stopFireworks();
       g_won=g_noMoves=false; g_status=L"Cofnięto ruch";
       // The board just changed under it, so any cached hint list (built for
       // the pre-undo board) is stale — its (fromIdx,fromCard,toIdx) indices
@@ -2826,7 +2820,7 @@ void doUndoDeal(){
    if(g_dealing || g_animating) return;
    if(g_game.undoToDeal()){
       KillTimer(g_hwnd,TIMER_NOMOVES);
-      g_fw.stop(); KillTimer(g_hwnd,TIMER_FW);
+      stopFireworks();
       g_won=g_noMoves=false; g_status=L"Cofnięto do poprzedniego rozdania";
       g_hintActive=false; g_hintBlinking=false; g_hintList.clear(); g_hintIndex=0;
       invalidateBestMoveCache();
@@ -3684,7 +3678,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND dlg,UINT msg,WPARAM wp,LPARAM lp){
          for(int i=0;i<KA_COUNT;i++) g_keys[i]=s_st.tmpKeys[i];
          saveKeyBindings(getIniPath());
          // Apply sound paths / mute state
-         for(int i=0;i<SOUND_COUNT;i++){
+         for(int i=0;i<SOUND_UI_COUNT;i++){
             SoundSystem::instance().setMuted(i,s_st.tmpMuted[i]);
             if(!s_st.tmpMuted[i]){
                wchar_t buf[MAX_PATH]={};
@@ -3808,7 +3802,7 @@ static void showSettings(HWND parent){
    s_st.tmpFreeCol=g_freeColMode; s_st.accepted=false;
    s_st.tmpDepthFree=g_searchDepthFree; s_st.tmpDepthKing=g_searchDepthKing;
    s_st.captureAction=-1; s_st.captureSlot=-1;
-   for(int i=0;i<SOUND_COUNT;i++)
+   for(int i=0;i<SOUND_UI_COUNT;i++)
       s_st.tmpPaths[i]=SoundSystem::instance().customPath(i);
 
    // Dialog size: wide enough for sound paths, tall enough for all rows + buttons
@@ -3938,7 +3932,7 @@ static void showSettings(HWND parent){
    mks(L"STATIC",L"Akcja",SS_LEFT,5,36,125,16,0);
    mks(L"STATIC",L"Plik d\u017awi\u0119kowy",SS_LEFT,135,36,200,16,0);
 
-   for(int i=0;i<SOUND_COUNT;i++){
+   for(int i=0;i<SOUND_UI_COUNT;i++){
       int row=56+i*29;
       s_st.tmpMuted[i]=SoundSystem::instance().isMuted(i);
       mks(L"STATIC",SOUND_LABELS[i],SS_LEFT|SS_ENDELLIPSIS,5,row+5,129,16,0);
@@ -3964,7 +3958,7 @@ static void showSettings(HWND parent){
       static UINT_PTR relayId=9000;
       SetWindowSubclass(ctrl,TipRelaySubclassProc,relayId++,(DWORD_PTR)s_st.hTooltip);
    };
-   for(int i=0;i<SOUND_COUNT;i++){
+   for(int i=0;i<SOUND_UI_COUNT;i++){
       addTip(s_st.hSoundBrowse[i],L"Wybierz w\u0142asny plik d\u017awi\u0119kowy (WAV lub MP3)");
       addTip(s_st.hSoundPlay[i],  L"Odtw\u00f3rz pr\u00f3bk\u0119 tego d\u017awi\u0119ku");
       addTip(s_st.hSoundMute[i],  L"Usu\u0144 d\u017awi\u0119k dla tego zdarzenia");
@@ -4619,9 +4613,13 @@ static bool tickCardAnims(){
 static const int SOLVER_ASK_SECONDS = 10;  // countdown of the "continue?" question
 static int  g_solverStageMin=5;      // stage length in minutes (slider), remembered in pasjans.ini
 static bool g_solverAutoNext=false;  // checkbox: at the end of a stage go on to the next deal without asking
+static int  g_solverThreads=8;       // worker threads (spin button), 1..solver::maxThreads(), remembered in pasjans.ini
 static ULONGLONG solverStageMs(){ return (ULONGLONG)g_solverStageMin*60ULL*1000ULL; }
 static void loadSolverUiSettings(){
    std::wstring ini=getIniPath();
+   g_solverThreads=(int)GetPrivateProfileIntW(L"Solver",L"Threads",solver::defaultThreads(),ini.c_str());
+   if(g_solverThreads<1) g_solverThreads=1;
+   if(g_solverThreads>solver::maxThreads()) g_solverThreads=solver::maxThreads();
    g_solverStageMin=(int)GetPrivateProfileIntW(L"Solver",L"StageMinutes",5,ini.c_str());
    if(g_solverStageMin<1||g_solverStageMin>10) g_solverStageMin=5;
    g_solverAutoNext=(GetPrivateProfileIntW(L"Solver",L"AutoNext",0,ini.c_str())!=0);
@@ -4631,6 +4629,8 @@ static void saveSolverUiSettings(){
    wsprintfW(b,L"%d",g_solverStageMin);
    WritePrivateProfileStringW(L"Solver",L"StageMinutes",b,ini.c_str());
    WritePrivateProfileStringW(L"Solver",L"AutoNext",g_solverAutoNext?L"1":L"0",ini.c_str());
+   wsprintfW(b,L"%d",g_solverThreads);
+   WritePrivateProfileStringW(L"Solver",L"Threads",b,ini.c_str());
 }
 // Absolute safety cap on one deal, summed across every stage AND every resume
 // (see g_sv.gameStart) — the search itself never runs out of moves to try on
@@ -4687,15 +4687,16 @@ static HWND solverChild(HWND parent,const wchar_t* cls,const wchar_t* text,DWORD
    return c;
 }
 
-// ── stage length slider + "go on to the next deal" checkbox ──────────────────
+// ── stage length slider, "go on to the next deal" checkbox, thread count ─────
 // Shown both in the picker (so they can be set before starting) and in the
 // progress window (to change them while searching); both edit the same
-// g_solverStageMin / g_solverAutoNext, remembered in pasjans.ini.
-static const int IDC_SV_SLIDER=3102, IDC_SV_NEXT=3103;
-struct SolverStageUi { HWND slider=nullptr, val=nullptr, chk=nullptr; };
-// Three rows: label + slider + value at `y`, the checkbox 40 px below; x0/w = content span.
+// g_solverStageMin / g_solverAutoNext / g_solverThreads, remembered in pasjans.ini.
+static const int IDC_SV_SLIDER=3102, IDC_SV_NEXT=3103, IDC_SV_THREADS=3104, IDC_SV_THREADS_SPIN=3105;
+struct SolverStageUi { HWND slider=nullptr, val=nullptr, chk=nullptr, thr=nullptr, thrSpin=nullptr; };
+// Rows: label + slider + value at `y`, the checkbox 40 px below, the thread count
+// 70 px below (≈96 px in all); x0/w = content span.
 static void solverMakeStageControls(HWND h,int x0,int y,int w,SolverStageUi& u){
-   INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_BAR_CLASSES}; InitCommonControlsEx(&icc);
+   INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_BAR_CLASSES|ICC_UPDOWN_CLASS}; InitCommonControlsEx(&icc);
    solverChild(h,L"STATIC",L"Sprawdź po upływie:",SS_LEFT,x0,y+8,146,18,0);
    u.slider=solverChild(h,TRACKBAR_CLASSW,L"",TBS_HORZ|TBS_AUTOTICKS|WS_TABSTOP,x0+146,y,w-146-60,32,IDC_SV_SLIDER);
    SendMessageW(u.slider,TBM_SETRANGE,TRUE,MAKELPARAM(1,10));
@@ -4705,6 +4706,37 @@ static void solverMakeStageControls(HWND h,int x0,int y,int w,SolverStageUi& u){
    { wchar_t v[16]; swprintf(v,16,L"%d min",g_solverStageMin); SetWindowTextW(u.val,v); }
    u.chk=solverChild(h,L"BUTTON",L"Po upływie czasu przejdź do następnego",BS_AUTOCHECKBOX|WS_TABSTOP,x0,y+40,w,22,IDC_SV_NEXT);
    SendMessageW(u.chk,BM_SETCHECK,g_solverAutoNext?BST_CHECKED:BST_UNCHECKED,0);
+
+   // Worker threads: 1 .. (logical processors - 2), spin button on an edit box.
+   const int maxThr=solver::maxThreads();
+   solverChild(h,L"STATIC",L"Liczba wątków:",SS_LEFT,x0,y+72,146,18,0);
+   u.thr=solverChild(h,L"EDIT",L"",WS_BORDER|ES_NUMBER|ES_AUTOHSCROLL|WS_TABSTOP,x0+146,y+68,64,24,IDC_SV_THREADS);
+   SendMessageW(u.thr,EM_SETLIMITTEXT,3,0);
+   u.thrSpin=CreateWindowExW(0,UPDOWN_CLASSW,L"",WS_CHILD|WS_VISIBLE|UDS_SETBUDDYINT|UDS_ALIGNRIGHT|UDS_ARROWKEYS|UDS_NOTHOUSANDS,
+      0,0,0,0,h,(HMENU)(INT_PTR)IDC_SV_THREADS_SPIN,GetModuleHandleW(nullptr),nullptr);
+   SendMessageW(u.thrSpin,UDM_SETBUDDY,(WPARAM)u.thr,0);
+   SendMessageW(u.thrSpin,UDM_SETRANGE32,1,maxThr);
+   SendMessageW(u.thrSpin,UDM_SETPOS32,0,g_solverThreads);
+   wchar_t info[96];
+   swprintf(info,96,L"z %d możliwych",maxThr);
+   solverChild(h,L"STATIC",info,SS_LEFT,x0+146+74,y+72,w-146-74,18,0);
+}
+// WM_COMMAND from the thread-count edit box: remember a valid number; once the
+// box loses focus rewrite whatever is in it as the (clamped) value in use.
+static bool solverThreadsCommand(const SolverStageUi& u,WPARAM wp){
+   if(LOWORD(wp)!=IDC_SV_THREADS||!u.thr) return false;
+   const int maxThr=solver::maxThreads();
+   if(HIWORD(wp)==EN_CHANGE){
+      wchar_t t[8]={}; GetWindowTextW(u.thr,t,8);
+      int v=_wtoi(t);
+      if(t[0]&&v>=1){
+         if(v>maxThr) v=maxThr;
+         if(v!=g_solverThreads){ g_solverThreads=v; saveSolverUiSettings(); }
+      }
+   } else if(HIWORD(wp)==EN_KILLFOCUS){
+      SendMessageW(u.thrSpin,UDM_SETPOS32,0,g_solverThreads);
+   }
+   return true;
 }
 // WM_HSCROLL: true if `ctl` is this slider (the setting is updated and remembered).
 static bool solverStageHScroll(const SolverStageUi& u,HWND ctl){
@@ -4789,9 +4821,9 @@ static LRESULT CALLBACK SolverPickProc(HWND h,UINT m,WPARAM w,LPARAM l){
       SendMessageW(g_pick.combo,CB_SETCURSEL,g_freeColMode?1:0,0);
       solverChild(h,L"BUTTON",L"Dodaj do listy",BS_PUSHBUTTON|WS_TABSTOP,364,308,84,26,IDC_PICK_ADD);
       solverMakeStageControls(h,12,346,436,g_pick.stage);
-      solverChild(h,L"BUTTON",L"Rozwiąż wybrane",BS_DEFPUSHBUTTON|WS_TABSTOP,12,420,160,30,IDOK);
-      solverChild(h,L"BUTTON",L"Zaznacz wszystkie",BS_PUSHBUTTON|WS_TABSTOP,180,420,140,30,IDC_PICK_ALL);
-      solverChild(h,L"BUTTON",L"Anuluj",BS_PUSHBUTTON|WS_TABSTOP,328,420,120,30,IDCANCEL);
+      solverChild(h,L"BUTTON",L"Rozwiąż wybrane",BS_DEFPUSHBUTTON|WS_TABSTOP,12,452,160,30,IDOK);
+      solverChild(h,L"BUTTON",L"Zaznacz wszystkie",BS_PUSHBUTTON|WS_TABSTOP,180,452,140,30,IDC_PICK_ALL);
+      solverChild(h,L"BUTTON",L"Anuluj",BS_PUSHBUTTON|WS_TABSTOP,328,452,120,30,IDCANCEL);
       return 0;}
    case WM_HSCROLL:
       if(solverStageHScroll(g_pick.stage,(HWND)l)) return 0;
@@ -4819,6 +4851,7 @@ static LRESULT CALLBACK SolverPickProc(HWND h,UINT m,WPARAM w,LPARAM l){
       return TRUE;}
    case WM_COMMAND:
       if(solverStageCommand(g_pick.stage,LOWORD(w))) return 0;
+      if(solverThreadsCommand(g_pick.stage,w)) return 0;
       switch(LOWORD(w)){
       case IDOK:
          if(GetFocus()==g_pick.edit){ solverPickAddTyped(h); return 0; } // Enter in the seed box adds it
@@ -4848,7 +4881,7 @@ static bool pickSolverGames(HWND parent,const std::vector<NumEntry>& lost,const 
    }
    loadSolverUiSettings();
    // WS_EX_DLGMODALFRAME: no icon in the title bar
-   RECT r={0,0,460,464}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_DLGMODALFRAME);
+   RECT r={0,0,460,496}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_DLGMODALFRAME);
    HWND dlg=CreateWindowExW(WS_EX_DLGMODALFRAME,L"PasjansSolverPick",L"Solver – wybór rozdań",st,CW_USEDEFAULT,CW_USEDEFAULT,
       r.right-r.left,r.bottom-r.top,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
    if(!dlg) return false;
@@ -5005,7 +5038,8 @@ static SolverRun g_sv;
 static const int IDC_SV_STOP=3101;
 
 static DWORD WINAPI solverCtlProc(LPVOID){
-   g_sv.result=solver::solveDeal(g_sv.start,g_sv.freeMode,*g_sv.P,g_sv.cancel,g_sv.deadline,solver::defaultThreads());
+   g_sv.result=solver::solveDeal(g_sv.start,g_sv.freeMode,*g_sv.P,g_sv.cancel,g_sv.deadline,
+      std::max(1,std::min(g_solverThreads,solver::maxThreads())));   // read at the start of every stage
    g_sv.threadDone.store(true);
    return 0;
 }
@@ -5197,7 +5231,7 @@ static LRESULT CALLBACK SolverProgProc(HWND h,UINT m,WPARAM w,LPARAM l){
       S.lblNodes   =solverChild(h,L"STATIC",L"",SS_LEFT,14,228,492,18,0);
       // Stage length (1-10 min, whole minutes) and what to do when a stage ends.
       solverMakeStageControls(h,14,256,492,S.stageUi);
-      S.btnStop    =solverChild(h,L"BUTTON",L"Przerwij",BS_PUSHBUTTON|WS_TABSTOP,210,332,100,30,IDC_SV_STOP);
+      S.btnStop    =solverChild(h,L"BUTTON",L"Przerwij",BS_PUSHBUTTON|WS_TABSTOP,210,364,100,30,IDC_SV_STOP);
       for(HWND bar: {S.barTime,S.barCurrent,S.barBest}) SendMessageW(bar,PBM_SETRANGE32,0,1000);
       SetTimer(h,1,250,nullptr);
       return 0;}
@@ -5212,6 +5246,11 @@ static LRESULT CALLBACK SolverProgProc(HWND h,UINT m,WPARAM w,LPARAM l){
       break;
    case WM_COMMAND:
       if(solverStageCommand(g_sv.stageUi,LOWORD(w))) return 0;
+      if(solverThreadsCommand(g_sv.stageUi,w)){
+         // applies to the stage already running: the workers re-read the live count within ~50 ms
+         if(g_sv.P) g_sv.P->threads.store(std::max(1,std::min(g_solverThreads,solver::maxThreads())));
+         return 0;
+      }
       if(LOWORD(w)==IDC_SV_STOP || LOWORD(w)==IDCANCEL){ g_sv.cancel.store(true); EnableWindow(g_sv.btnStop,FALSE); return 0; }
       break;
    case WM_CLOSE: g_sv.cancel.store(true); EnableWindow(g_sv.btnStop,FALSE); return 0; // the worker ends, solverPoll() then closes the window
@@ -5228,7 +5267,7 @@ static void runSolverBatch(HWND parent,const std::vector<NumEntry>& picked){
    g_sv.list=picked; g_sv.idx=0; g_sv.finished=false; g_sv.busy=false;
    g_sv.solvedCount=g_sv.unsolvableCount=g_sv.abortedCount=0; g_sv.log.clear();
    loadSolverUiSettings();
-   RECT r={0,0,520,376}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_DLGMODALFRAME);
+   RECT r={0,0,520,408}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_DLGMODALFRAME);
    g_sv.hwnd=CreateWindowExW(WS_EX_DLGMODALFRAME,L"PasjansSolverProg",L"Solver – szukanie rozwiązań",st,CW_USEDEFAULT,CW_USEDEFAULT,
       r.right-r.left,r.bottom-r.top,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
    if(!g_sv.hwnd) return;
@@ -5668,7 +5707,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
          RECT rc;
          if(g_gameHwnd) GetClientRect(g_gameHwnd,&rc);
          else { GetClientRect(hwnd,&rc); rc.bottom-=Layout::TOOLBAR_H; }
-         g_fw.tick(rc.right,rc.bottom);
+         double now=timeGetTime()/1000.0;
+         g_fw.update((float)(now-g_fwLast),rc.right,rc.bottom); g_fwLast=now;
+         fireworksSounds(now);
          invalidateGame();
       } else if(wp==TIMER_SMOOTH){
          // Legacy path — now driven by PeekMessage loop; keep as no-op safety net

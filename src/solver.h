@@ -677,8 +677,10 @@ struct Shared {
 static const size_t GOOD_ENOUGH_LINE = 400;          // a line this short ends the search at once
 static const ULONGLONG POLISH_EXTRA_MS = 30000;      // otherwise keep looking for a shorter one for this long
 
+struct WorkerArg { Shared* S; int idx; };
+
 inline DWORD WINAPI workerProc(LPVOID p){
-   Shared* S=(Shared*)p;
+   WorkerArg* W=(WorkerArg*)p; Shared* S=W->S; const int idx=W->idx;
    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
    auto stop=[&]{
       if(S->done.load(std::memory_order_relaxed) || S->cancel->load(std::memory_order_relaxed)) return true;
@@ -686,7 +688,13 @@ inline DWORD WINAPI workerProc(LPVOID p){
       if(S->haveBest.load(std::memory_order_relaxed)) return now>S->firstFound+POLISH_EXTRA_MS;
       return now>S->P->deadline.load(std::memory_order_relaxed);
    };
+   // solveDeal() starts a whole pool of workers; only the first Progress::threads
+   // of them (a number the UI may change at any moment) actually search, the rest
+   // sit parked. A worker that gets parked drops the attempt it is in the middle of.
+   auto parked=[&]{ return idx>0 && idx>=S->P->threads.load(std::memory_order_relaxed); };
+   auto stopAttempt=[&]{ return stop() || parked(); };
    while(!stop()){
+      if(parked()){ Sleep(50); continue; }
       int k=S->P->attemptsStarted.fetch_add(1);
       // Build on the best progress found so far (by ANY attempt, win or not)
       // instead of starting fresh every time — but not for every attempt: a
@@ -708,7 +716,7 @@ inline DWORD WINAPI workerProc(LPVOID p){
             seedPtr=&seedCopy;
          }
       }
-      AttemptOutcome out=runAttempt(*S->start,S->freeMode,k,budgetForAttempt(k),*S->P,stop,seedPtr,seedLen);
+      AttemptOutcome out=runAttempt(*S->start,S->freeMode,k,budgetForAttempt(k),*S->P,stopAttempt,seedPtr,seedLen);
       S->P->attemptsFinished.fetch_add(1);
       if(!out.solved){
          if(out.lastPot>=0 && !out.lastPath.empty()){
@@ -746,9 +754,15 @@ inline DWORD WINAPI workerProc(LPVOID p){
    return 0;
 }
 
-inline int defaultThreads(){
+// Most worker threads worth using: every logical processor except two, left to
+// Windows and the rest of the program.
+inline int maxThreads(){
    SYSTEM_INFO si; GetSystemInfo(&si); int c=(int)si.dwNumberOfProcessors;
-   return std::max(1,std::min(8,c-2));
+   return std::max(1,c-2);
+}
+// Default when the player has not chosen a number: the old cap of 8.
+inline int defaultThreads(){
+   return std::min(8,maxThreads());
 }
 
 // Searches `start` (the table right after the deal, reserve complete) until a
@@ -777,10 +791,15 @@ inline Result solveDeal(const GameState& start, bool freeMode, Progress& P,
       P.bestPrefixLen.store((int)S.bestPrefix.size(),std::memory_order_relaxed);
    }
    if(threads<1) threads=1;
-   P.threads.store(threads);
+   P.threads.store(threads);    // the live thread count: the UI may change it while this runs
+   // A pool large enough for any count the UI can ask for (at most 62 helper
+   // threads: WaitForMultipleObjects takes 64 handles); idle ones are parked.
+   const int pool=std::max(1,std::min(63,std::max(threads,maxThreads())));
+   std::vector<WorkerArg> args((size_t)pool);
+   for(int t=0;t<pool;t++){ args[(size_t)t].S=&S; args[(size_t)t].idx=t; }
    std::vector<HANDLE> hs;
-   for(int t=1;t<threads;t++){ HANDLE h=CreateThread(nullptr,0,workerProc,&S,0,nullptr); if(h) hs.push_back(h); }
-   workerProc(&S);                       // this thread works too
+   for(int t=1;t<pool;t++){ HANDLE h=CreateThread(nullptr,0,workerProc,&args[(size_t)t],0,nullptr); if(h) hs.push_back(h); }
+   workerProc(&args[0]);                 // this thread works too
    if(!hs.empty()){ WaitForMultipleObjects((DWORD)hs.size(),hs.data(),TRUE,INFINITE); for(HANDLE h:hs) CloseHandle(h); }
    if(S.haveBest.load()){
       res.moves=S.best;
