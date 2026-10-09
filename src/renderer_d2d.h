@@ -63,6 +63,23 @@ public:
       m_rt->SetTransform(old);
    }
 
+   // A card tumbling in the air: turned by `ang` radians about its vertical axis (0 = face
+   // showing, pi = back showing, in between it is seen edge-on), then rotated by `rotDeg`
+   // in the plane of the table and scaled about its centre. x,y = top-left at normal size.
+   void drawCardTumble(float x,float y,const Card& card,int deck,float scale,float ang,float rotDeg) const {
+      if(!m_rt) return;
+      float cw=(float)m_lay->cardW, ch=(float)m_lay->cardH;
+      float c=cosf(ang);
+      float wf=std::max(0.03f,fabsf(c));
+      D2D1::Matrix3x2F old; m_rt->GetTransform(&old);
+      D2D1_POINT_2F mid=D2D1::Point2F(x+cw/2.f,y+ch/2.f);
+      m_rt->SetTransform(D2D1::Matrix3x2F::Scale(D2D1::SizeF(scale*wf,scale),mid)
+         *D2D1::Matrix3x2F::Rotation(rotDeg,mid)*old);
+      if(c>=0.f) drawCard(x,y,card,false,false);
+      else       drawBackOne(x,y,deck==1?"B2":"B1");
+      m_rt->SetTransform(old);
+   }
+
    // deck 0 = red back, deck 1 = blue back (see reserveDeckTagsForSeed in game.h)
    void drawBack(float x,float y,int deck) const {
       if(!m_rt) return;

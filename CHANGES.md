@@ -341,3 +341,39 @@ tryb Tylko król, seed 4): 2 wątki 1,30 -> 12 wątków 6,20 -> 3 wątki 1,91 ->
   prawdziwego pokazu, wbudowane jako SND_9..SND_18; w oknie ustawień niewidoczne (SOUND_UI_COUNT = 9 slotów).
 - Domyślny odgłos zwycięstwa (sukces.wav) z Garibaldki; własny plik z Ustawień nadal go zastępuje.
 - SoundSystem::playIdx(idx, głośność, panorama).
+
+# Wygląd jak w Garibaldce: pasek przycisków i nakładki Ustawienia / Statystyki / Pomoc (src/overlay.h, main.cpp, layout.h)
+- Pasek przycisków: ciemniejszy pas w kolorze stołu, na nim przezroczyste zaokrąglone płytki (białe 14%, jaśniejsze pod
+  myszą, cienki jasny obrys; Samograj "włączony" ma złoty obrys), tylko ikony — podpisy pod przyciskami usunięte, więc
+  pasek jest niższy (Layout::TOOLBAR_H 94 -> 72). Tło gry bez zmian: jednolity kolor wybrany w Ustawieniach (zmiana koloru
+  przemalowuje też pasek: toolbarRefresh()).
+- Ustawienia, Statystyki i Pomoc nie są już osobnymi oknami Windows, tylko nakładkami rysowanymi wewnątrz okna gry
+  (Direct2D, tryb natychmiastowy: kontrolki zgłaszają obszary kliknięć przy rysowaniu): przyciemniony stół, ciemnoniebieski
+  panel ze złotą ramką, złote nagłówki, przezroczyste zaokrąglone przyciski. Panele są NIEBIESKIE (w Garibaldce zielone).
+  Stary kod okien (ok. 770 linii) usunięty.
+  * Ustawienia (3 grupy): Ogólne (kolor tła, tryb wolnego miejsca, zaznaczanie sekwencji, głębokość SI przyciskami -/+,
+    prędkość animacji, aktualizacje), Dźwięki (głośność suwakiem, własne dźwięki: Wybierz / odtwórz / wycisz / domyślny),
+    Klawisze (dwa skróty na akcję, przechwytywanie klawisza z Shiftem, czyszczenie, "Przywróć domyślne"). Zmiany działają
+    od razu i zapisują się w pasjans.ini (wcześniej było OK/Anuluj). Zmiana trybu wolnego miejsca w trakcie partii pyta o
+    potwierdzenie, bo zaczyna nową grę.
+  * Statystyki: jedna tabela, kolumny "Tylko król" / "Dowolna karta"; "Wyzeruj statystyki" pyta o potwierdzenie.
+  * Pomoc: przewijana (kółko, strzałki, PgUp/PgDn, Home/End, pasek), z wersją i datą budowy; treść przepisana pod
+    obecną grę.
+  Klik poza panelem lub Esc zamyka nakładkę; podczas otwartej nakładki mysz i klawiatura należą do niej.
+- Sprawdzone na prawdziwym oknie gry (testoverlays.cpp włącza main.cpp do jednego programu, tworzy okno, otwiera każdą
+  nakładkę i robi zrzut oraz symuluje kliknięcia): 23/23 sprawdzeń interakcji (kolory, krokowanie głębokości, pole
+  aktualizacji, suwaki, przechwytywanie klawisza, wyciszanie dźwięków, przewijanie pomocy, zamykanie, przyciski paska).
+- Bez zmian zostały okna Solvera, pytania "Brak ruchów", "Zagraj numer", okna komunikatów i pasek menu Akcje.
+
+
+# Fajerwerki 20 s, animacja nowej partii (src/main.cpp, renderer_d2d.h, fireworks2.h)
+- Fajerwerki: gdy są widoczne, stół jest przyciemniony o połowę (płynnie wchodzi i schodzi); po 20 s same się wyłączają
+  (przez ostatnie 2,5 s nie startują już nowe rakiety, ostatnie sekundy przyciemnienie gaśnie).
+- Nowa partia: karty są rozdawane z rezerwy na stół wierszami (wiersz po wierszu, każda karta leci z uniesieniem
+  i obrotem jak przy rozdaniu z rezerwy, bliższe lądują wcześniej), licznik rezerwy maleje w trakcie. Zegar partii
+  rusza, gdy karty leżą na stole.
+- Jeśli na stole są już karty (nie przy starcie programu i nie w "Samograj bez końca"): najpierw 4-sekundowa animacja
+  zbierania. Karty unoszą się kolejno (od tych na wierzchu), po czym wciąga je wir - każda krąży po spirali z własną,
+  losową prędkością, koziołkuje (obrót wokół osi pionowej i w płaszczyźnie stołu) - aż wszystkie leżą rewersem do góry
+  w jednej kupce na środku; kupka przesuwa się na miejsce rezerwy i zaczyna się rozdanie. Nowa partia kliknięta w
+  trakcie animacji przerywa ją i od razu rozdaje.

@@ -14,9 +14,10 @@
 
 class Fireworks2{
 public:
-   void start(int w,int h){ m_active=true; m_w=w; m_h=h; m_rockets.clear(); m_parts.clear(); m_flashes.clear(); m_events.clear(); m_time=0; m_acc=0; m_next=0.05f; }
+   void start(int w,int h){ m_active=true; m_spawn=true; m_w=w; m_h=h; m_rockets.clear(); m_parts.clear(); m_flashes.clear(); m_events.clear(); m_time=0; m_acc=0; m_next=0.05f; }
    void stop(){ m_active=false; m_rockets.clear(); m_parts.clear(); m_flashes.clear(); m_events.clear(); }
    bool active() const { return m_active; }
+   void stopLaunching(){ m_spawn=false; }          // no new rockets; the ones in the air still burst
    size_t particles() const { return m_parts.size(); }
    // What the ears have to know: a rocket was launched (kind 0: it flies `flight` seconds, then bursts; x = 0..1 across the
    // window) and a burst happened (kind 1; size = how many sparks). The game plays the whistles and the bangs at those moments.
@@ -92,7 +93,7 @@ private:
    struct Rocket{ float x,y,vx,vy,ay,ty; float hx[20],hy[20]; int hn; float t,T; };
    struct Flash{ float x,y,t,maxT,r,g,b; };
    std::vector<Part> m_parts; std::vector<Rocket> m_rockets; std::vector<Flash> m_flashes; std::vector<Event> m_events;
-   bool m_active=false; int m_w=800,m_h=600,m_bw=0,m_bh=0; float m_time=0,m_acc=0,m_next=0;
+   bool m_active=false, m_spawn=true; int m_w=800,m_h=600,m_bw=0,m_bh=0; float m_time=0,m_acc=0,m_next=0;
    std::vector<float> m_acc3, m_b1, m_b2; std::vector<float> m_lut; int m_pal=0, m_burstNo=0; std::vector<float> m_hues;
    std::mt19937 m_rng{std::random_device{}()};
    float rnd(){ return (float)(m_rng()%100000)/100000.f; }
@@ -211,7 +212,7 @@ private:
    }
    void step(){
       m_time+=STEP;
-      if(m_active){ m_next-=STEP; if(m_next<=0.f && m_rockets.size()<3){ spawnRocket(); m_next=0.45f+0.9f*rnd(); } }
+      if(m_active&&m_spawn){ m_next-=STEP; if(m_next<=0.f && m_rockets.size()<3){ spawnRocket(); m_next=0.45f+0.9f*rnd(); } }
       for(Rocket& r:m_rockets){
          r.t+=STEP; r.vy+=r.ay*STEP; r.x+=r.vx*STEP; r.y+=r.vy*STEP;
          if(r.hn<19) r.hn++; for(int i=r.hn-1;i>0;i--){ r.hx[i]=r.hx[i-1]; r.hy[i]=r.hy[i-1]; } r.hx[0]=r.x; r.hy[0]=r.y;

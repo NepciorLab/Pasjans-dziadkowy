@@ -33,7 +33,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.1.0";
+static const wchar_t* APP_VERSION = L"1.1.1";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -211,6 +211,23 @@ static int  g_hideDstFound=-1;                    // hide top card of this found
 // Per-column: hide cards from this index onward during deal animation
 // -1 = no hiding for that column
 static int  g_hideDealCol[NUM_COLS];              // initialized in WM_CREATE / newGame
+// New-game animation state (see ngSnapshot() / ngTick())
+struct NgCard{
+   Card c; bool back; int deck;
+   float x,y;                       // top-left where the card lay (game-window coordinates)
+   float depth;                     // 0 = on top of everything; used for the draw order
+   float liftAt;                    // seconds: when the card leaves the table
+   float s0,s1;                     // seconds: the whirl starts / the card has reached the pile
+   float a0,r0,dir,turns,bump;      // polar start (about the middle), sense and number of turns, sideways swing
+   float tumbleN,rotK,wobPh,wobAmp,rise,ang0;
+};
+static std::vector<NgCard> g_ngCards;
+static int   g_ngPhase=0;           // 0 = off, 1 = old cards gathering, 2 = dealing out
+static DWORD g_ngT0=0, g_ngNextRowAt=0;
+static int   g_ngRow=0, g_ngNotLaunched=0;
+static DWORD g_ngLand[NUM_COLS][NUM_COLS];   // phase 2: when card `row` of column `col` has landed (0xFFFFFFFF = not launched yet)
+static const DWORD NG_GATHER_MS=4000;
+static const float NG_HOLD_S=2.9f, NG_SLIDE_S=3.3f;   // all cards in the pile from here / the pile starts to slide to the reserve
 static const int  DRAG_THR=5;
 
 // ============================================================================
@@ -367,7 +384,9 @@ static Fireworks2     g_fw;                  // the fireworks of a won game (fir
 static std::vector<uint32_t> g_fwImg;
 static ID2D1Bitmap*   g_fwBmp=nullptr;
 static int            g_fwBw=0, g_fwBh=0;
-static double         g_fwLast=0;            // seconds (timeGetTime) of the last g_fw.update()
+static double         g_fwLast=0;
+static DWORD          g_fwStart=0;           // timeGetTime() when the fireworks began
+static const float    FW_TOTAL_S=20.f;       // the fireworks are switched off after this long (no new rockets from FW_TOTAL_S-2.5)            // seconds (timeGetTime) of the last g_fw.update()
 static MoveHint       g_hint;
 static bool           g_hintActive  = false;
 static bool           g_hintBlinking= false;   // true during blink animation
@@ -1477,7 +1496,7 @@ static void loadGameFrom(HWND hwnd){
    // Apply loaded state
    g_cardAnims.clear(); g_animating=false; g_previewAnimating=false;
    g_hideCol=-1; g_hideFromIdx=-1; g_hideDstCol=-1; g_hideDstFromIdx=-1; g_hideDstFound=-1; for(int _ci=0;_ci<NUM_COLS;_ci++) g_hideDealCol[_ci]=-1;
-   g_dealing=false; g_status.clear();
+   g_dealing=false; g_ngPhase=0; g_ngCards.clear(); g_status.clear();
    // Reflect a finished save's true state (won / stuck) so the table shows it
    // correctly — but WITHOUT onStateChanged()'s fanfare (fireworks, "nowy
    // rekord" popup, the "brak ruchów" dialog timer): those are for a win/loss
@@ -1772,6 +1791,101 @@ static int reserveTopDeck(){
    return n? reserveDeckAt(n,0) : 0;
 }
 
+// ── New-game animation ─────────────────────────────────────────────────────────
+// Phase 1 (only when a game is already on the table): the cards of the old game lift off one
+// after another (the topmost first), get drawn into a whirlwind - each one tumbling with a bit
+// of its own random motion - end up face-down in one pile in the middle of the table, and the
+// pile slides to the reserve's place. All of it takes NG_GATHER_MS.
+// Phase 2: the new deal is dealt out of the reserve row by row, like a reserve deal (ngLaunchRow).
+static float ngSmooth(float u){ u=std::max(0.f,std::min(1.f,u)); return u*u*(3.f-2.f*u); }
+void onStateChanged();
+
+// Remembers where the cards of the game on the table lie (called by newGame() BEFORE the old game
+// is replaced). false = nothing to gather.
+static bool ngSnapshot(){
+   g_ngCards.clear();
+   if(!g_gameReady||g_samogranoMarathon||g_ngPhase!=0||g_layout.cardW<=0) return false;
+   static std::mt19937 rng{std::random_device{}()};
+   auto rnd=[&](){ return (rng()&0xFFFFFF)/16777216.f; };
+   const float OY=(float)Layout::TOOLBAR_H;
+   const int avH=g_layout.panelH-g_layout.tableY-Layout::MARGIN_BOT;
+   struct Raw{ Card c; bool back; int deck; float x,y,depth; };
+   std::vector<Raw> raw;
+   for(int col=0;col<NUM_COLS;col++){
+      int n=(int)g_game.cols[col].size(); if(!n) continue;
+      ColOverlapInfo oi=calcColOverlap(col,avH);
+      POINT cp=g_layout.colPos(col); float y=(float)g_layout.tableY-OY;
+      for(int ci=0;ci<n;ci++){
+         raw.push_back({g_game.cols[col][ci],false,0,(float)cp.x,y,(float)(n-1-ci)});
+         if(ci+1<n) y+=std::max(12.f,(ci+1)>=oi.seqStart?oi.seqOv:oi.topOv);
+      }
+   }
+   for(int f=0;f<NUM_FOUND;f++){
+      int n=(int)g_game.found[f].size(); POINT fp=g_layout.foundPos(f);
+      for(int k=0;k<std::min(n,2);k++) raw.push_back({g_game.found[f][n-1-k],false,0,(float)fp.x,(float)fp.y-OY,(float)k});
+   }
+   { int n=(int)g_game.reserve.size(); POINT rp=g_layout.reservePos();
+     for(int k=0;k<std::min(n,8);k++){ Raw r{g_game.reserve[0],true,reserveDeckAt((size_t)n,(size_t)k),(float)rp.x,(float)rp.y-OY,(float)k*0.4f}; raw.push_back(r); } }
+   if(raw.empty()) return false;
+   float maxDepth=1.f; for(const Raw& r:raw) maxDepth=std::max(maxDepth,r.depth);
+   const float minWH=(float)g_layout.cardH*5.f;
+   for(const Raw& r:raw){
+      NgCard k; k.c=r.c; k.back=r.back; k.deck=r.back?r.deck:(int)(rng()&1); k.x=r.x; k.y=r.y; k.depth=r.depth;
+      k.liftAt=0.55f*(r.depth/maxDepth)+0.03f*rnd();
+      k.s0=0.9f+0.35f*rnd(); k.s1=NG_HOLD_S-0.3f*rnd();
+      k.dir=1.f; k.turns=1.2f+1.6f*rnd();
+      k.bump=minWH*(0.06f+0.14f*rnd());
+      k.tumbleN=(float)(3+2*(int)(rng()%3));            // odd number of half-turns: ends back up
+      k.rotK=(float)((rng()&1?1:-1)*(1+(int)(rng()%2))); // whole turns in the plane
+      k.wobPh=6.2831853f*rnd(); k.wobAmp=minWH*(0.01f+0.03f*rnd()); k.rise=minWH*(0.02f+0.10f*rnd());
+      k.ang0=r.back?3.14159265f:0.f; k.a0=k.r0=0.f;
+      g_ngCards.push_back(k);
+   }
+   // drawn from the deepest card to the topmost, so the cards still on the table overlap properly
+   std::sort(g_ngCards.begin(),g_ngCards.end(),[](const NgCard& a,const NgCard& b){return a.depth>b.depth;});
+   return true;
+}
+
+// Draws the gathering phase (nothing when it's not running). t = seconds since the phase began.
+static void ngDrawGather(float W,float H){
+   if(g_ngPhase!=1) return;
+   const float t=(float)(timeGetTime()-g_ngT0)/1000.f;
+   const float cw=(float)g_layout.cardW, ch=(float)g_layout.cardH;
+   const float cx=W*0.5f, cy=H*0.5f;                       // the pile
+   const float PI=3.14159265f;
+   const int topDeck=reserveTopDeck();
+   if(t>=NG_HOLD_S){
+      // all cards lie in one pile: a single back stands for it; later it slides to the reserve
+      const POINT rp=g_layout.reservePos();
+      const float rx=(float)rp.x, ry=(float)rp.y-(float)Layout::TOOLBAR_H;
+      float s=ngSmooth((t-NG_SLIDE_S)/(NG_GATHER_MS/1000.f-NG_SLIDE_S));
+      float px=cx-cw/2+(rx-(cx-cw/2))*s, py=cy-ch/2+(ry-(cy-ch/2))*s;
+      g_renderer.drawBack(px,py,topDeck);
+      return;
+   }
+   const size_t N=g_ngCards.size();
+   size_t last=0; for(size_t i=1;i<N;i++) if(g_ngCards[i].s1>g_ngCards[last].s1) last=i;   // the last to arrive shows the reserve's back
+   for(size_t i=0;i<N;i++){
+      const NgCard& k=g_ngCards[i];
+      float lift=ngSmooth((t-k.liftAt)/0.4f);
+      float u=ngSmooth((t-k.s0)/(k.s1-k.s0));
+      float x0=k.x+cw/2-cx, y0=k.y+ch/2-cy;               // from the middle of the table to the card's centre
+      float r0=hypotf(x0,y0), a0=atan2f(y0,x0);
+      float r=r0*powf(1.f-u,1.4f)+k.bump*sinf(PI*u)*sqrtf(1.f-u);
+      float a=a0+k.dir*k.turns*2.f*PI*powf(u,0.85f);
+      float sq=1.f-0.4f*sinf(PI*u);                        // seen a bit from above: the funnel is an ellipse
+      float px=cx+cosf(a)*r+k.wobAmp*sinf(k.wobPh+u*9.f)*sinf(PI*u);
+      float py=cy+sinf(a)*r*sq-k.rise*sinf(PI*u)-10.f*lift*(1.f-u);
+      float sc=1.f+0.22f*lift*(1.f-u*u)+0.08f*sinf(PI*u);
+      float ang=k.ang0+(k.tumbleN*PI-k.ang0)*u;
+      float rot=k.rotK*360.f*u+22.f*sinf(k.wobPh*2.f+u*7.f)*sinf(PI*u);
+      int deck=(i==last)?topDeck:k.deck;
+      g_renderer.drawCardTumble(px-cw/2,py-ch/2,k.c,deck,sc,ang,rot);
+   }
+}
+
+#include "overlay.h"
+
 static void drawScene(){
    if(!g_d2dRT)return;
    float fw=g_d2dRT->GetSize().width,fh=g_d2dRT->GetSize().height;int w=(int)fw,h=(int)fh;
@@ -1797,7 +1911,7 @@ static void drawScene(){
       if(hSrc||hDst)g_renderer.drawHighlight(fx,fy);}
    POINT rp=g_layout.reservePos();float rx=(float)rp.x,ry=(float)rp.y-OY;
    bool hRes=(g_hintActive||(g_hintBlinking&&g_hintShowSrc))&&g_hint.valid&&g_hint.fromIdx==-1&&!g_game.reserve.empty();
-   if(!g_game.reserve.empty()){g_renderer.drawBack(rx,ry,reserveTopDeck());g_renderer.drawReserveCount(rx,ry,(float)g_layout.cardW,(float)g_layout.cardH,std::to_wstring(g_game.reserve.size()));}
+   if(!g_game.reserve.empty()&&g_ngPhase!=1){g_renderer.drawBack(rx,ry,reserveTopDeck());g_renderer.drawReserveCount(rx,ry,(float)g_layout.cardW,(float)g_layout.cardH,std::to_wstring(g_game.reserve.size()+(g_ngPhase==2?(size_t)g_ngNotLaunched:0)));}
    if(hRes)g_renderer.drawHighlight(rx,ry);
    // White-pulse hint overlay on reserve card
    if(g_reservePulsing && g_reservePulseAlpha>0.f && !g_game.reserve.empty())
@@ -1806,7 +1920,9 @@ static void drawScene(){
    for(int col=0;col<NUM_COLS;col++){
       POINT cp=g_layout.colPos(col);float cpx=(float)cp.x;
       bool hDst2=hintOn&&g_hint.valid&&showDst&&g_hint.fromIdx>=0&&g_hint.toType==LOC_COLUMN&&g_hint.toIdx==col;
-      bool previewEmptiesCol=(g_hideCol==col&&g_hideFromIdx==0&&!g_game.cols[col].empty());
+      const DWORD ngNow=timeGetTime();
+      bool previewEmptiesCol=(g_hideCol==col&&g_hideFromIdx==0&&!g_game.cols[col].empty())
+                             ||(g_ngPhase==1)||(g_ngPhase==2&&ngNow<g_ngLand[col][0]);   // new-game animation: the cards are not on the table yet
       if(g_game.cols[col].empty()||previewEmptiesCol){
          // Use pulsing variant when hint targets empty cols, else normal
          float pulseA=(g_emptyColPulsing&&g_emptyColPulseAlpha>0.f)?g_emptyColPulseAlpha:0.f;
@@ -1833,6 +1949,7 @@ static void drawScene(){
          if(g_hideCol==col&&g_hideFromIdx>=0&&ci>=g_hideFromIdx)continue;
          if(g_hideDstCol==col&&g_hideDstFromIdx>=0&&ci>=g_hideDstFromIdx)continue;
          if(g_hideDealCol[col]>=0&&ci>=g_hideDealCol[col])continue;
+         if(g_ngPhase==2&&ci<NUM_COLS&&ngNow<g_ngLand[col][ci])continue;
          bool hS2=hintOn&&g_hint.valid&&showSrc&&g_hint.fromType==LOC_COLUMN&&g_hint.fromIdx==col&&g_hint.fromIdx>=0&&ci>=g_hint.fromCard;
          g_renderer.drawCard(cpx,y,cards[ci],hS2,false);
          if(g_moveHighlightMode==2 && ci<oi.seqStart) g_renderer.drawDimOverlay(cpx,y);
@@ -1862,7 +1979,7 @@ static void drawScene(){
    }
    if(g_dealing){const PopIn* cur=g_deal.current();if(cur){int cx=g_layout.colPos(cur->col).x,cy=colCardY(cur->col,cur->cardIdx);float sc=cur->scale(),cw=(float)g_layout.cardW*sc,ch=(float)g_layout.cardH*sc;ID2D1Bitmap* bmp=GetCardD2D(cur->card.imgKey(),g_d2dRT);if(bmp)g_d2dRT->DrawBitmap(bmp,D2D1::RectF((float)cx+(g_layout.cardW-cw)/2.f,(float)cy+(g_layout.cardH-ch)/2.f-OY,(float)cx+(g_layout.cardW+cw)/2.f,(float)cy+(g_layout.cardH+ch)/2.f-OY));}}
    if(g_drag.active&&!g_drag.cards.empty()){int bx=g_drag.mx-g_drag.offX,by=g_drag.my-g_drag.offY;float dov=(g_drag.fromCol>=0)?g_colDispOv[g_drag.fromCol]:g_colDispOv[0];for(int i=0;i<(int)g_drag.cards.size();i++)g_renderer.drawCard((float)bx,(float)by+i*dov-OY,g_drag.cards[i],true,false);}
-   for(auto& a:g_cardAnims){if(a.done())continue;float cx=a.cx(),cy=a.cy()-OY,ov=a.renderOv();
+   for(auto& a:g_cardAnims){if(a.done()||timeGetTime()<a.startTime)continue;float cx=a.cx(),cy=a.cy()-OY,ov=a.renderOv();
       if(a.dealFlip&&a.cards.size()==1){
          // Lift (+30% at mid-flight, back to 100% on landing) and turn over: face-down
          // at the start, fully face-up from 90% of the flight to the end.
@@ -1880,6 +1997,13 @@ static void drawScene(){
          g_renderer.drawCardFlip(cx,cy,a.cards[0],a.deck,scale,flip);
          continue;}
       for(int i=0;i<(int)a.cards.size();i++)g_renderer.drawCard(cx,cy+i*ov,a.cards[i],false,false);}
+   ngDrawGather(fw,fh);    // new-game animation: the old cards in the whirlwind (no-op otherwise)
+   if(g_fw.active()){      // the table is dimmed by half while the fireworks are on (fades in and out)
+      float el=(float)(timeGetTime()-g_fwStart)/1000.f;
+      float k=std::min(1.f,el/0.6f)*std::min(1.f,(FW_TOTAL_S-el)/1.f);
+      if(k>0.f){ ID2D1SolidColorBrush* brD=nullptr; g_d2dRT->CreateSolidColorBrush(D2D1::ColorF(0.f,0.f,0.f,0.5f*k),&brD);
+         if(brD){ g_d2dRT->FillRectangle(D2D1::RectF(0,0,fw,fh),brD); brD->Release(); } }
+   }
    drawFireworks(fw,fh);   // the fireworks of a won game (no-op while there are none)
    // Compute move label position
    // Default: horizontally centred between rightmost foundation and reserve,
@@ -1920,6 +2044,7 @@ static void drawScene(){
                               mlx,mly,g_currentGameNumber,&moveLabelRect);
    // Store for hit-testing (mouse drag)
    g_moveLabelDrawnRect=moveLabelRect;
+   overlaysDraw(fw,fh);   // Settings / Statistics / Help, on top of everything (no-op when none is open)
 }
 
 static void invalidateGame(); // forward declaration
@@ -2165,7 +2290,7 @@ void onStateChanged(){
             if(g_gameHwnd) GetClientRect(g_gameHwnd,&rc);
             else { GetClientRect(g_hwnd,&rc); rc.top=Layout::TOOLBAR_H; }
             g_fw.start(rc.right,rc.bottom-(rc.top>0?rc.top:0));
-            g_fwLast=timeGetTime()/1000.0;
+            g_fwLast=timeGetTime()/1000.0; g_fwStart=timeGetTime();
             SetTimer(g_hwnd,TIMER_FW,16,nullptr);
             // Show record-breaking congratulations after a short delay
             if(newMoves || newTime){
@@ -2214,30 +2339,23 @@ void onStateChanged(){
 // ============================================================================
 // Deal animation
 // ============================================================================
-void startDealAnim(){
+static void ngStart(bool gather);
+void startDealAnim(bool gather=false){
    g_deal.clear();
-   float stagger=0.f;
-   // Same g_animDurationMul used for card flights — larger gaps between
-   // cards popping in means the whole initial deal-out takes proportionally
-   // longer (or shorter), matching the "Prędkość animacji" setting.
-   for(int row=0;row<NUM_COLS;row++){
-      for(int col=0;col<NUM_COLS-row;col++){
-         g_deal.queue(g_game.cols[col][row],col,row,stagger);
-         stagger+=0.12f*effectiveAnimMul();
-      }
-      stagger+=0.3f*effectiveAnimMul();
-   }
-   g_dealing=true;
    RECT rc;GetClientRect(g_hwnd,&rc);
    recalcLayout(true);   // noAnim — size may be 0×0 at startup; WM_SIZE will fix it
    initDealBoard(rc.right,rc.bottom);
-   SetTimer(g_hwnd,TIMER_DEAL,16,nullptr);
+   ngStart(gather);
 }
 
 // ============================================================================
 // New game
 // ============================================================================
 void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
+   // The cards of the game being replaced fly into a whirlwind first (see ngSnapshot()) — the
+   // picture of the old table has to be taken before anything below touches the game.
+   const bool gather=ngSnapshot();
+   g_ngPhase=0;
    // Credit the OUTCOME of the deal being replaced — but only now, as it
    // actually starts being replaced, not back when win/no-moves was first
    // reached. That's what lets the player undo out of a "no moves" (or even
@@ -2338,7 +2456,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
    g_smoothActive=false;
    g_gameReady=true;
    if(!silent) playSound("nowa",g_volume);
-   startDealAnim();
+   startDealAnim(gather);
    SetTimer(g_hwnd,TIMER_SECOND,250,nullptr); // 250ms for smooth display
    invalidateBestMoveCache();
    invalidateGame();
@@ -2613,6 +2731,61 @@ void doDeal(){
    }
    retimeDealFlights(firstAnim,now);
    markDirty();
+}
+
+// ── New-game animation: dealing out of the reserve, row by row ──────────────────
+static void ngStart(bool gather){
+   for(int c=0;c<NUM_COLS;c++) for(int r=0;r<NUM_COLS;r++) g_ngLand[c][r]=0xFFFFFFFFu;
+   g_ngNotLaunched=0; for(int c=0;c<NUM_COLS;c++) g_ngNotLaunched+=std::min((int)g_game.cols[c].size(),NUM_COLS);
+   g_ngRow=0; g_dealing=true;
+   g_ngT0=timeGetTime(); g_ngNextRowAt=g_ngT0;
+   g_ngPhase=gather?1:2;
+   if(!gather) g_ngCards.clear();
+}
+static const float NG_ROW_GAP_S=0.30f;     // seconds between two rows leaving the reserve (scaled by the animation speed)
+static void ngLaunchRow(int row){
+   POINT rp=g_layout.reservePos(); float srcX=(float)rp.x, srcY=(float)rp.y;
+   const size_t before=g_cardAnims.size();
+   const DWORD now=timeGetTime();
+   int idx=0;
+   for(int col=0;col<NUM_COLS;col++){
+      if(row>=(int)g_game.cols[col].size()) continue;
+      float dstX=(float)g_layout.colPos(col).x;
+      float dstY=landingY(col,row);
+      CardAnim a;
+      a.cards={g_game.cols[col][row]};
+      a.sx=srcX; a.sy=srcY; a.ex=dstX; a.ey=dstY;
+      a.srcOv=0.f; a.dstOv=landingOv(col); a.arcH=60.f; a.dur=0;
+      a.startTime=now; a.toFound=false; a.isPreview=false; a.phase=0;
+      a.dealFlip=true; a.deck=reserveDeckAt(g_game.reserve.size()+(size_t)g_ngNotLaunched,(size_t)idx);
+      g_cardAnims.push_back(a); g_animating=true;
+      g_ngNotLaunched--; idx++;
+   }
+   if(g_cardAnims.size()==before) return;
+   retimeDealFlights(before,now);
+   for(size_t i=before;i<g_cardAnims.size();i++){
+      const CardAnim& a=g_cardAnims[i];
+      for(int col=0;col<NUM_COLS;col++)
+         if(std::abs(a.ex-(float)g_layout.colPos(col).x)<4.f && row<(int)g_game.cols[col].size()){ g_ngLand[col][row]=a.startTime+a.duration(); break; }
+   }
+   playSound("rozloz",g_volume);
+}
+static void ngTick(){
+   if(!g_ngPhase) return;
+   DWORD now=timeGetTime();
+   if(g_ngPhase==1){
+      if(now-g_ngT0<NG_GATHER_MS){ invalidateGame(); UpdateWindow(g_gameHwnd?g_gameHwnd:g_hwnd); return; }
+      g_ngPhase=2; g_ngCards.clear(); g_ngNextRowAt=now; g_ngRow=0;
+   }
+   while(g_ngRow<NUM_COLS && now>=g_ngNextRowAt){
+      ngLaunchRow(g_ngRow); g_ngRow++;
+      g_ngNextRowAt+=(DWORD)(NG_ROW_GAP_S*1000.f*effectiveAnimMul());
+   }
+   if(g_ngRow>=NUM_COLS && g_cardAnims.empty()){
+      g_ngPhase=0; g_dealing=false;
+      g_gameStartTick=timeGetTime(); g_gameSeconds=0;   // the clock starts when the cards are on the table
+      onStateChanged(); invalidateGame();
+   }
 }
 
 // Find what changed between two snapshots and start card animation
@@ -3218,153 +3391,6 @@ static void loadStats(){
       }
    }
 }
-// Stats window WndProc
-static LRESULT CALLBACK StatsWndProc(HWND dlg,UINT msg,WPARAM wp,LPARAM lp){
-   switch(msg){
-   case WM_KEYDOWN:
-      if(wp==VK_ESCAPE){DestroyWindow(dlg);return 0;}
-      break;
-   case WM_NOTIFY:{
-      NMHDR* hdr=(NMHDR*)lp;
-      if(hdr->code==TCN_SELCHANGE){
-         HWND hTab=GetDlgItem(dlg,900);
-         int sel=(int)SendMessageW(hTab,TCM_GETCURSEL,0,0);
-         // Show/hide stat pages
-         ShowWindow(GetDlgItem(dlg,801),sel==0?SW_SHOW:SW_HIDE);
-         ShowWindow(GetDlgItem(dlg,802),sel==1?SW_SHOW:SW_HIDE);
-      }
-      return 0;}
-   case WM_COMMAND:
-      if(LOWORD(wp)==IDOK||LOWORD(wp)==IDCANCEL){DestroyWindow(dlg);return 0;}
-      if(LOWORD(wp)==1001){
-         for(int m=0;m<2;m++){
-            g_statsGames[m]=g_statsWins[m]=0;
-            g_statsMoveSum[m][0]=g_statsMoveSum[m][1]=0;
-            g_statsTimeSum[m][0]=g_statsTimeSum[m][1]=0;
-            g_statsRecordMoves[m]=-1; g_statsRecordTime[m]=-1;
-         }
-         g_gameStarted=false; g_moveCount=0; g_gameSeconds=0;
-         saveStats(); DestroyWindow(dlg); newGame(); return 0;
-      }
-      return 0;
-   case WM_DESTROY: PostMessageW(dlg,WM_NULL,0,0); return 0;
-   case WM_CLOSE:   DestroyWindow(dlg); return 0;
-   }
-   return DefWindowProcW(dlg,msg,wp,lp);
-}
-
-static void showStats(HWND parent){
-   HINSTANCE hInst=(HINSTANCE)GetWindowLongPtrW(parent,GWLP_HINSTANCE);
-   INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_TAB_CLASSES};
-   InitCommonControlsEx(&icc);
-   static bool reg=false;
-   if(!reg){
-      WNDCLASSEXW wc={sizeof(wc)};
-      wc.lpfnWndProc=StatsWndProc; wc.hInstance=hInst;
-      wc.lpszClassName=L"PasjansStats";
-      wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
-      wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
-      RegisterClassExW(&wc); reg=true;
-   }
-
-   const int DW=310, DH=350; // client area size (+10 for buttons)
-   RECT adjR={0,0,DW,DH};
-   AdjustWindowRectEx(&adjR,WS_POPUP|WS_CAPTION|WS_SYSMENU,FALSE,WS_EX_DLGMODALFRAME);
-   HWND dlg=CreateWindowExW(WS_EX_DLGMODALFRAME,L"PasjansStats",L"Statystyki",
-      WS_POPUP|WS_CAPTION|WS_SYSMENU,0,0,adjR.right-adjR.left,adjR.bottom-adjR.top,parent,nullptr,hInst,nullptr);
-   if(!dlg) return;
-
-   HFONT hf=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
-   HFONT hfB=CreateFontW(-MulDiv(9,GetDeviceCaps(GetDC(nullptr),LOGPIXELSY),72),
-      0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-
-   auto mk=[&](HWND par,const wchar_t* cls,const wchar_t* txt,DWORD sty,
-               int x,int y,int w,int h,int id,bool bold=false)->HWND{
-      HWND hw=CreateWindowExW(0,cls,txt,WS_CHILD|WS_VISIBLE|sty,
-         x,y,w,h,par,(HMENU)(INT_PTR)id,hInst,nullptr);
-      SendMessageW(hw,WM_SETFONT,(WPARAM)(bold?hfB:hf),TRUE);
-      return hw;};
-
-   // Helper: format average
-   auto avgMoves=[](int sum,int cnt,wchar_t* buf){
-      if(cnt<=0){wcscpy(buf,L"-");return;}
-      int t=(int)((double)sum/cnt*10+0.5);
-      wsprintfW(buf,L"%d.%d",t/10,t%10);};
-   auto avgTime=[](int sum,int cnt,wchar_t* buf){
-      if(cnt<=0){wcscpy(buf,L"-");return;}
-      int s=(int)((double)sum/cnt+0.5);
-      wcscpy(buf,fmtTime(s).c_str());};
-   auto recMoves=[](int v,wchar_t* buf){
-      if(v<0)wcscpy(buf,L"-"); else wsprintfW(buf,L"%d",v);};
-   auto recTime=[](int v,wchar_t* buf){
-      if(v<0)wcscpy(buf,L"-"); else wcscpy(buf,fmtTime(v).c_str());};
-
-   // Tab control
-   HWND hTab=mk(dlg,WC_TABCONTROLW,L"",WS_CLIPSIBLINGS,5,5,DW-15,DH-50,900);
-   TCITEMW ti={TCIF_TEXT};
-   ti.pszText=(LPWSTR)L"Tylko kr\u00f3l"; SendMessageW(hTab,TCM_INSERTITEMW,0,(LPARAM)&ti);
-   ti.pszText=(LPWSTR)L"Dowolna karta"; SendMessageW(hTab,TCM_INSERTITEMW,1,(LPARAM)&ti);
-
-   // Page panels
-   const int PX=10,PY=32,PW=DW-28,PH=DH-90;
-   HWND page[2];
-   page[0]=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE,PX,PY,PW,PH,dlg,(HMENU)801,hInst,nullptr);
-   page[1]=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,PX,PY,PW,PH,dlg,(HMENU)802,hInst,nullptr);
-
-   wchar_t buf[32];
-   const int LW=130, VW=60, VC=140, RH=20, R0=4;
-
-   for(int m=0;m<2;m++){
-      HWND pg=page[m];
-      int wins=g_statsWins[m], games=g_statsGames[m], losses=games-wins;
-      auto row=[&](int r,const wchar_t* lbl,const wchar_t* val){
-         mk(pg,L"STATIC",lbl,SS_LEFT,4,R0+r*RH,LW,18,0);
-         mk(pg,L"STATIC",val,SS_CENTER,VC,R0+r*RH,VW,18,0);};
-
-      wsprintfW(buf,L"%d",games);             row(0,L"Rozegrane:",buf);
-      wsprintfW(buf,L"%d",wins);              row(1,L"Wygrane:",buf);
-      int pct10=games>0?(int)(wins*1000.0/games+0.5):0; // percent × 10, rounded
-      wsprintfW(buf,L"%d.%d%%",pct10/10,pct10%10);  row(2,L"% wygranych:",buf);
-      avgMoves(g_statsMoveSum[m][1],wins,buf); row(3,L"Śr. ruchów wyg.:",buf);
-      avgMoves(g_statsMoveSum[m][0],losses,buf);row(4,L"Śr. ruchów prz.:",buf);
-      avgTime(g_statsTimeSum[m][1],wins,buf);  row(5,L"Śr. czas wyg.:",buf);
-      avgTime(g_statsTimeSum[m][0],losses,buf);row(6,L"Śr. czas prz.:",buf);
-
-      // Records
-      CreateWindowExW(0,L"STATIC",L"",SS_ETCHEDHORZ|WS_CHILD|WS_VISIBLE,
-         4,R0+7*RH+2,PW-8,2,pg,nullptr,hInst,nullptr);
-      mk(pg,L"STATIC",L"Rekordy wygranych:",SS_LEFT,4,R0+7*RH+8,PW-8,18,0,true);
-      recMoves(g_statsRecordMoves[m],buf); row(8+1,L"Najmniej ruchów:",buf);
-      recTime(g_statsRecordTime[m],buf);   row(9+1,L"Najkrótszy czas:",buf);
-   }
-
-   // Buttons
-   mk(dlg,L"BUTTON",L"Resetuj",           BS_PUSHBUTTON,   15,DH-37,100,26,1001);
-   mk(dlg,L"BUTTON",L"Zamknij",           BS_DEFPUSHBUTTON,DW-115,DH-37,100,26,IDOK);
-
-   // Centre
-   RECT pr; GetWindowRect(parent,&pr);
-   SetWindowPos(dlg,HWND_TOP,
-      pr.left+(pr.right-pr.left-(adjR.right-adjR.left))/2,
-      pr.top +(pr.bottom-pr.top-(adjR.bottom-adjR.top))/2,
-      0,0,SWP_NOSIZE|SWP_SHOWWINDOW);
-
-   // Open on current game mode tab
-   int initTab=(int)g_freeColMode;
-   SendMessageW(hTab,TCM_SETCURSEL,initTab,0);
-   ShowWindow(page[0],initTab==0?SW_SHOW:SW_HIDE);
-   ShowWindow(page[1],initTab==1?SW_SHOW:SW_HIDE);
-
-   EnableWindow(parent,FALSE);
-   MSG m;
-   while(IsWindow(dlg)&&GetMessage(&m,nullptr,0,0)){
-      if(m.message==WM_QUIT){PostQuitMessage((int)m.wParam);break;}
-      if(!IsDialogMessage(dlg,&m)){TranslateMessage(&m);DispatchMessage(&m);}
-   }
-   EnableWindow(parent,TRUE); SetFocus(parent);
-}
-
-
 // Date this exe was compiled (main.cpp is the single translation unit, so it
 // changes with every build), as dd.mm.yyyy from the compiler's "Mmm dd yyyy".
 #if defined(__clang__)
@@ -3381,633 +3407,6 @@ static std::wstring buildDateText(){
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
-
-static void showHelp(HWND parent){
-   std::wstring text = std::wstring(L"PASJANS DZIADKOWY\n")
-      + L"Wersja " + APP_VERSION + L"   (zbudowana " + buildDateText() + L")\n" +
-      L"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
-      L"CEL GRY\n"
-      L"Umie\u015b\u0107 wszystkich 8 kr\u00f3l\u00f3w na kolumnach (z prawidłowymi sekwensami)\n"
-      L"lub na stosach. Gr\u0119 rozgrywa si\u0119 dwiema taliami (104 karty).\n\n"
-      L"ZASADY\n"
-      L"• Na stole 10 kolumn. Mo\u017cna przenie\u015b\u0107 kart\u0119 lub sekwens (naprzemienne\n"
-      L"  kolory, rosn\u0105ca warto\u015b\u0107 ku g\u00f3rze) na kart\u0119 o 1 wy\u017cszej, przeciwnego koloru.\n"
-      L"• Pusta kolumna przyjmuje tylko kr\u00f3la (lub sekwens z kr\u00f3lem na g\u00f3rze).\n"
-      L"• Stosy (g\u00f3ra): As \u2192 2 \u2192 ... \u2192 Kr\u00f3l, ten sam kolor (suit).\n"
-      L"• Ze stosu mo\u017cna wr\u00f3ci\u0107 kart\u0119 na st\u00f3\u0142.\n"
-      L"• Rezerwa: kliknij stos nierozłożonych kart, aby dołożyć po 1 karcie\n"
-      L"  do ka\u017cdej kolumny (z wyj\u0105tkiem kolumn z Kr\u00f3lem na szczycie sekwensu).\n\n"
-      L"STEROWANIE\n"
-      L"  Lewy klik         Przeci\u0105gnij kart\u0119/sekwens lub kliknij dla autu\n"
-      L"  Lewy klik (krótki) Auto-ruch: najbli\u017csza mo\u017cliwa kolumna\n"
-      L"  \u2190 / Ctrl+Z    Cofnij ruch\n"
-      L"  \u2192 / Ctrl+Y    Ponów ruch\n"
-      L"  P                Podpowied\u017a\n"
-      L"  S                Statystyki\n"
-      L"\n"
-      L"TRYB GRY (Ustawienia)\n"
-      L"  Wolne miejsce: Kr\u00f3l  – tylko kr\u00f3l lub sekwens z kr\u00f3lem mo\u017ce\n"
-      L"                              trafić na puste miejsce\n"
-      L"  Wolne miejsce: Dowolny  – ka\u017cda karta lub sekwens mo\u017ce\n"
-      L"                              trafić na puste miejsce\n"
-      L"  H                Pomoc (ten ekran)\n"
-      L"  \u2191 / F11      Pe\u0142ny ekran\n"
-      L"  Escape           Wyj\u015bcie z pe\u0142nego ekranu\n"
-      L"  A                Automatyczny ruch (wykonuje podpowied\u017a)\n"
-      L"  F2               Nowa gra\n\n"
-      L"D\u017bWI\u0118KI\n"
-      L"  Pliki .wav w katalogu gry (click, nono, sukces, nowa, rozloz, koniec)\n";
-
-   MessageBoxW(parent, text.c_str(), L"Pomoc – Pasjans Dziadkowy", MB_OK|MB_ICONINFORMATION);
-}
-
-// ============================================================================
-// Settings dialog
-// ============================================================================
-// Settings dialog state
-struct SettingsState {
-   // General tab
-   HWND  hVolLbl, hSlider, hMoveHiRadio[3];
-   HWND  hBgSwatch[16];      // owner-drawn color squares (BG_COUNT of these used)
-   int   bgSel;              // currently selected swatch index (live, before OK)
-   HWND  hFreeColK, hFreeColAny; // radio buttons
-   HWND  hDepthFreeEdit, hDepthKingEdit; // AI search depth per mode
-   int   tmpBg;
-   float tmpVol;
-   bool  tmpFreeCol;
-   int   tmpDepthFree, tmpDepthKing;
-   bool  accepted;
-   HWND  hAnimSlider, hAnimLbl; // "Prędkość animacji" — dlg children, like hSlider/hVolLbl (see there for why)
-   int   tmpAnimStep;
-   HWND  hCheckUpdates; // "Sprawdzaj aktualizacje przy starcie" checkbox
-   // Sounds tab
-   HWND  hTab;
-   HWND  hSoundEdit[SOUND_COUNT];
-   HWND  hSoundBrowse[SOUND_COUNT];
-   HWND  hSoundPlay[SOUND_COUNT];
-   HWND  hSoundMute[SOUND_COUNT];   // "✕" — no sound for this event
-   HWND  hSoundReset[SOUND_COUNT];  // "↺" — restore default sound
-   bool  tmpMuted[SOUND_COUNT];
-   HWND  hGenPage, hSndPage, hKeyPage;
-   HWND  hTooltip;
-   std::wstring tmpPaths[SOUND_COUNT];
-   int   previewIdx=-1; // which sound (if any) is currently being previewed
-   // Keys tab
-   KeyBinding tmpKeys[KA_COUNT];
-   HWND  hKeyBtn[KA_COUNT][2]; // [action][key1/key2] — shows current key name
-   int   captureAction=-1;     // which action is being captured (-1=none)
-   int   captureSlot=-1;       // which slot (0 or 1)
-};
-static SettingsState s_st;
-
-static void switchTab(int idx){
-   ShowWindow(s_st.hGenPage, idx==0?SW_SHOW:SW_HIDE);
-   ShowWindow(s_st.hSndPage, idx==1?SW_SHOW:SW_HIDE);
-   ShowWindow(s_st.hKeyPage, idx==2?SW_SHOW:SW_HIDE);
-   // Slider and vol label are children of dlg — show/hide with sounds tab
-   if(s_st.hSlider)  ShowWindow(s_st.hSlider,  idx==1?SW_SHOW:SW_HIDE);
-   if(s_st.hVolLbl)  ShowWindow(s_st.hVolLbl,  idx==1?SW_SHOW:SW_HIDE);
-   // Animation-speed slider/label are also dlg children (same reason) — show with General tab
-   if(s_st.hAnimSlider) ShowWindow(s_st.hAnimSlider, idx==0?SW_SHOW:SW_HIDE);
-   if(s_st.hAnimLbl)    ShowWindow(s_st.hAnimLbl,    idx==0?SW_SHOW:SW_HIDE);
-   // Leaving the Sounds tab (or entering it) should cut short any sample
-   // preview that's currently playing, with a quick 0.3s fade.
-   SoundSystem::instance().fadeOutAll(300);
-   s_st.previewIdx=-1;
-}
-
-// Subclass proc for hSndPage: forwards WM_COMMAND to the parent dialog
-// so sound buttons (which are children of hSndPage) are handled by SettingsWndProc
-// Custom tooltip popup — used instead of the comctl32 tooltip control, which
-// (for reasons not fully pinned down — possibly a manifest/version issue)
-// would not display inside the Settings dialog despite window creation,
-// tool registration, and even forced TTM_TRACKACTIVATE all reporting success.
-// This is a plain self-drawn popup window we show/hide/position ourselves.
-static LRESULT CALLBACK CustomTipProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
-   if(msg==WM_PAINT){
-      PAINTSTRUCT ps; HDC dc=BeginPaint(hwnd,&ps);
-      RECT rc; GetClientRect(hwnd,&rc);
-      HBRUSH bg=CreateSolidBrush(RGB(255,255,225));
-      FillRect(dc,&rc,bg); DeleteObject(bg);
-      FrameRect(dc,&rc,(HBRUSH)GetStockObject(BLACK_BRUSH));
-      wchar_t buf[256]; GetWindowTextW(hwnd,buf,256);
-      RECT trc=rc; InflateRect(&trc,-5,-3);
-      SetBkMode(dc,TRANSPARENT);
-      HFONT f=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
-      HFONT old=(HFONT)SelectObject(dc,f);
-      DrawTextW(dc,buf,-1,&trc,DT_LEFT|DT_TOP|DT_WORDBREAK);
-      SelectObject(dc,old);
-      EndPaint(hwnd,&ps);
-      return 0;
-   }
-   return DefWindowProcW(hwnd,msg,wp,lp);
-}
-static void ensureCustomTipClass(HINSTANCE hInst){
-   static bool done=false; if(done) return; done=true;
-   WNDCLASSW wc={};
-   wc.lpfnWndProc=CustomTipProc; wc.hInstance=hInst;
-   wc.lpszClassName=L"PsjCustomTip";
-   wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
-   RegisterClassW(&wc);
-}
-static LRESULT CALLBACK TipRelaySubclassProc(HWND hwnd, UINT msg,
-      WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data){
-   static const UINT_PTR TIP_TIMER_ID = 4242;
-   HWND hTip=(HWND)data;
-   if(msg==WM_MOUSEMOVE){
-      TRACKMOUSEEVENT tme{sizeof(tme)}; tme.dwFlags=TME_LEAVE; tme.hwndTrack=hwnd;
-      TrackMouseEvent(&tme);
-      if(!IsWindowVisible(hTip)) SetTimer(hwnd,TIP_TIMER_ID,500,nullptr);
-   } else if(msg==WM_MOUSELEAVE){
-      KillTimer(hwnd,TIP_TIMER_ID);
-      ShowWindow(hTip,SW_HIDE);
-   } else if(msg==WM_TIMER && wp==TIP_TIMER_ID){
-      KillTimer(hwnd,TIP_TIMER_ID);
-      const wchar_t* text=(const wchar_t*)GetPropW(hwnd,L"TipText");
-      if(text){
-         RECT rc; GetWindowRect(hwnd,&rc);
-         SetWindowTextW(hTip,text);
-         RECT calc={0,0,260,1000};
-         HDC dc=GetDC(hTip);
-         HFONT f=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
-         HFONT old=(HFONT)SelectObject(dc,f);
-         DrawTextW(dc,text,-1,&calc,DT_CALCRECT|DT_WORDBREAK|DT_LEFT);
-         SelectObject(dc,old); ReleaseDC(hTip,dc);
-         int w=calc.right-calc.left+12, h=calc.bottom-calc.top+8;
-         // Show ABOVE the control (not below) so the mouse cursor doesn't
-         // sit on top of the tooltip text and obscure it.
-         SetWindowPos(hTip,HWND_TOPMOST,rc.left,rc.top-h-4,w,h,SWP_NOACTIVATE|SWP_SHOWWINDOW);
-         InvalidateRect(hTip,nullptr,TRUE);
-      }
-      return 0;
-   }
-   return DefSubclassProc(hwnd,msg,wp,lp);
-}
-
-static LRESULT CALLBACK SndPageSubclassProc(HWND hwnd, UINT msg,
-      WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR){
-   if(msg==WM_COMMAND || msg==WM_DRAWITEM){
-      // Forward to parent (the settings dialog)
-      return SendMessageW(GetParent(hwnd),msg,wp,lp);
-   }
-   return DefSubclassProc(hwnd,msg,wp,lp);
-}
-
-
-static LRESULT CALLBACK SettingsWndProc(HWND dlg,UINT msg,WPARAM wp,LPARAM lp){
-   switch(msg){
-   case WM_DRAWITEM:{
-      DRAWITEMSTRUCT* dis=(DRAWITEMSTRUCT*)lp;
-      for(int i=0;i<BG_COUNT;i++){
-         if(dis->hwndItem==s_st.hBgSwatch[i]){
-            HBRUSH br=CreateSolidBrush(RGB(BG_COLORS[i].r,BG_COLORS[i].g,BG_COLORS[i].b));
-            FillRect(dis->hDC,&dis->rcItem,br);
-            DeleteObject(br);
-            RECT rc=dis->rcItem;
-            HPEN pen=CreatePen(PS_SOLID, (i==s_st.bgSel)?3:1,
-               (i==s_st.bgSel)?RGB(255,220,0):RGB(90,90,90));
-            HPEN old=(HPEN)SelectObject(dis->hDC,pen);
-            HBRUSH nullBr=(HBRUSH)SelectObject(dis->hDC,GetStockObject(NULL_BRUSH));
-            Rectangle(dis->hDC,rc.left,rc.top,rc.right,rc.bottom);
-            SelectObject(dis->hDC,nullBr);
-            SelectObject(dis->hDC,old);
-            DeleteObject(pen);
-            return TRUE;
-         }
-      }
-      return FALSE;}
-   case WM_KEYDOWN:{
-      // Key capture mode: assign pressed key to the waiting slot
-      if(s_st.captureAction>=0){
-         DWORD vk=(DWORD)wp;
-         // Ignore modifier keys alone
-         if(vk==VK_SHIFT||vk==VK_CONTROL||vk==VK_MENU||vk==VK_LWIN||vk==VK_RWIN)
-            return 0;
-         if(vk==VK_ESCAPE){
-            // Escape = clear binding
-            vk=0;
-         }
-         int a=s_st.captureAction, sl=s_st.captureSlot;
-         bool shiftHeld=(GetKeyState(VK_SHIFT)&0x8000)!=0;
-         if(sl==0) { s_st.tmpKeys[a].key1=vk; }
-         else      { s_st.tmpKeys[a].key2=vk; }
-         if(vk!=0) s_st.tmpKeys[a].shift=shiftHeld; // Escape (clear) leaves shift as-is
-         // Update button text
-         std::wstring nm=bindingName(vk, s_st.tmpKeys[a].shift);
-         SetWindowTextW(s_st.hKeyBtn[a][sl],nm.c_str());
-         s_st.captureAction=-1; s_st.captureSlot=-1;
-         // Restore normal cursor
-         SetCursor(LoadCursor(nullptr,IDC_ARROW));
-         return 0;
-      }
-      if(wp==VK_ESCAPE){DestroyWindow(dlg);return 0;}
-      return 0;}
-   case WM_HSCROLL:{
-      if((HWND)lp==s_st.hSlider){
-         SCROLLINFO si={sizeof(si),SIF_TRACKPOS|SIF_POS|SIF_RANGE};
-         GetScrollInfo(s_st.hSlider,SB_CTL,&si);
-         int pos=si.nPos;
-         switch(LOWORD(wp)){
-            case SB_LINELEFT:       pos=std::max(si.nMin,pos-1);  break;
-            case SB_LINERIGHT:      pos=std::min(si.nMax,pos+1);  break;
-            case SB_PAGELEFT:       pos=std::max(si.nMin,pos-10); break;
-            case SB_PAGERIGHT:      pos=std::min(si.nMax,pos+10); break;
-            case SB_THUMBTRACK:     pos=si.nTrackPos; break;
-            case SB_THUMBPOSITION:  pos=si.nTrackPos; break;
-            case SB_TOP:            pos=si.nMin; break;
-            case SB_BOTTOM:         pos=si.nMax; break;
-         }
-         si.fMask=SIF_POS; si.nPos=pos;
-         SetScrollInfo(s_st.hSlider,SB_CTL,&si,TRUE);
-         g_volume=pos/100.f;
-         wchar_t buf[16]; wsprintfW(buf,L"%d%%",pos);
-         SetWindowTextW(s_st.hVolLbl,buf);
-      } else if((HWND)lp==s_st.hAnimSlider){
-         SCROLLINFO si={sizeof(si),SIF_TRACKPOS|SIF_POS|SIF_RANGE};
-         GetScrollInfo(s_st.hAnimSlider,SB_CTL,&si);
-         int pos=si.nPos;
-         switch(LOWORD(wp)){
-            case SB_LINELEFT:       pos=std::max(si.nMin,pos-1); break;
-            case SB_LINERIGHT:      pos=std::min(si.nMax,pos+1); break;
-            case SB_PAGELEFT:       pos=std::max(si.nMin,pos-1); break;
-            case SB_PAGERIGHT:      pos=std::min(si.nMax,pos+1); break;
-            case SB_THUMBTRACK:     pos=si.nTrackPos; break;
-            case SB_THUMBPOSITION:  pos=si.nTrackPos; break;
-            case SB_TOP:            pos=si.nMin; break;
-            case SB_BOTTOM:         pos=si.nMax; break;
-         }
-         si.fMask=SIF_POS; si.nPos=pos;
-         SetScrollInfo(s_st.hAnimSlider,SB_CTL,&si,TRUE);
-         applyAnimSpeedStep(pos-2);
-         SetWindowTextW(s_st.hAnimLbl,animSpeedLabel(g_animSpeedStep).c_str());
-      }
-      return 0;}
-   case WM_NOTIFY:{
-      NMHDR* hdr=(NMHDR*)lp;
-      if(hdr->hwndFrom==s_st.hTab && hdr->code==TCN_SELCHANGE){
-         int sel=(int)SendMessageW(s_st.hTab,TCM_GETCURSEL,0,0);
-         switchTab(sel);
-      }
-      return 0;}
-   case WM_COMMAND:{
-      int id=LOWORD(wp);
-      if(id==IDOK){
-         s_st.accepted=true;
-         g_bgIndex=s_st.bgSel;
-         if(g_bgIndex<0||g_bgIndex>=BG_COUNT) g_bgIndex=0;
-         bool newFreeMode=(IsDlgButtonChecked(s_st.hGenPage,1007)==BST_CHECKED);
-         if(newFreeMode!=g_freeColMode){
-            g_freeColMode=newFreeMode;
-            if(g_gameStarted && !g_won && g_moveCount>0) newGame();
-         }
-         g_moveHighlightMode=0;
-         for(int i=0;i<3;i++) if(IsDlgButtonChecked(s_st.hGenPage,1020+i)==BST_CHECKED) g_moveHighlightMode=i;
-         g_checkUpdatesOnStart=(IsDlgButtonChecked(s_st.hGenPage,1050)==BST_CHECKED);
-         {
-            wchar_t db[8];
-            GetWindowTextW(s_st.hDepthFreeEdit,db,8);
-            int nd=_wtoi(db);
-            if(nd<1) nd=4; else if(nd>MAX_SEARCH_DEPTH) nd=MAX_SEARCH_DEPTH; // too large: use the maximum, not the default
-            if(nd!=g_searchDepthFree){ g_searchDepthFree=nd; invalidateBestMoveCache(); }
-            GetWindowTextW(s_st.hDepthKingEdit,db,8);
-            nd=_wtoi(db);
-            if(nd<1) nd=5; else if(nd>MAX_SEARCH_DEPTH) nd=MAX_SEARCH_DEPTH;
-            if(nd!=g_searchDepthKing){ g_searchDepthKing=nd; invalidateBestMoveCache(); }
-         }
-         // Apply key bindings
-         for(int i=0;i<KA_COUNT;i++) g_keys[i]=s_st.tmpKeys[i];
-         saveKeyBindings(getIniPath());
-         // Apply sound paths / mute state
-         for(int i=0;i<SOUND_UI_COUNT;i++){
-            SoundSystem::instance().setMuted(i,s_st.tmpMuted[i]);
-            if(!s_st.tmpMuted[i]){
-               wchar_t buf[MAX_PATH]={};
-               GetWindowTextW(s_st.hSoundEdit[i],buf,MAX_PATH);
-               std::wstring p(buf);
-               s_st.tmpPaths[i]=p;
-               SoundSystem::instance().setCustomPath(i,p);
-            }
-         }
-         saveSettings();
-         SoundSystem::instance().fadeOutAll(300);
-         DestroyWindow(dlg);
-      } else if(id==IDCANCEL){
-         s_st.accepted=false;
-         g_bgIndex    =s_st.tmpBg;
-         g_volume     =s_st.tmpVol;
-         g_freeColMode=s_st.tmpFreeCol;
-         applyAnimSpeedStep(s_st.tmpAnimStep);
-         SoundSystem::instance().fadeOutAll(300);
-         DestroyWindow(dlg);
-      } else if(id>=1010 && id<1010+BG_COUNT){
-         // Background color swatch clicked
-         s_st.bgSel=id-1010;
-         for(int i=0;i<BG_COUNT;i++) InvalidateRect(s_st.hBgSwatch[i],nullptr,TRUE);
-      } else {
-         // Check Browse buttons (2000..2007) and Play buttons (3000..3007)
-         if(id>=2000 && id<2000+SOUND_COUNT){
-            int idx=id-2000;
-            wchar_t path[MAX_PATH]={};
-            GetWindowTextW(s_st.hSoundEdit[idx],path,MAX_PATH);
-            OPENFILENAMEW ofn={};
-            ofn.lStructSize=sizeof(ofn);
-            ofn.hwndOwner=dlg;
-            ofn.lpstrFilter=L"Pliki dźwiękowe (*.wav;*.mp3) *.wav;*.mp3 WAV (*.wav) *.wav MP3 (*.mp3) *.mp3 Wszystkie *.* ";
-            ofn.lpstrFile=path;
-            ofn.nMaxFile=MAX_PATH;
-            ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST;
-            // lpstrTitle needs non-const buffer on some Windows versions
-            wchar_t titleBuf[64]={};
-            wcsncpy_s(titleBuf,64,SOUND_LABELS[idx],_TRUNCATE);
-            ofn.lpstrTitle=titleBuf;
-            if(GetOpenFileNameW(&ofn)){
-               SetWindowTextW(s_st.hSoundEdit[idx],path);
-               s_st.tmpMuted[idx]=false;
-               EnableWindow(s_st.hSoundEdit[idx],TRUE);
-               EnableWindow(s_st.hSoundPlay[idx],TRUE);
-            }
-         } else if(id>=4000 && id<4000+SOUND_COUNT){
-            // "✕" — no sound for this event
-            int idx=id-4000;
-            s_st.tmpMuted[idx]=true;
-            SetWindowTextW(s_st.hSoundEdit[idx],L"(brak d\u017awi\u0119ku)");
-            EnableWindow(s_st.hSoundEdit[idx],FALSE);
-            EnableWindow(s_st.hSoundPlay[idx],FALSE);
-            SoundSystem::instance().fadeOutAll(300);
-         } else if(id>=6000 && id<6000+SOUND_COUNT){
-            // "↺" — restore default sound
-            int idx=id-6000;
-            s_st.tmpMuted[idx]=false;
-            SetWindowTextW(s_st.hSoundEdit[idx],L"");
-            EnableWindow(s_st.hSoundEdit[idx],TRUE);
-            EnableWindow(s_st.hSoundPlay[idx],TRUE);
-         } else if(id>=3000 && id<3000+SOUND_COUNT){
-            int idx=id-3000;
-            if(s_st.tmpMuted[idx]) { /* muted — nothing to preview */ }
-            else {
-            // Cut off any sample already previewing with a quick 0.3s fade
-            // before starting the newly-selected one.
-            SoundSystem::instance().fadeOutAll(300);
-            wchar_t path[MAX_PATH]={};
-            GetWindowTextW(s_st.hSoundEdit[idx],path,MAX_PATH);
-            SoundSystem::instance().setCustomPath(idx, path[0] ? std::wstring(path) : L"");
-            SoundSystem::instance().playIdx(idx,g_volume);
-            s_st.previewIdx=idx;
-            }
-         }
-      } // end else
-      // Key binding buttons: 5000..5013 (action*2+slot)
-      if(id>=5000 && id<5000+KA_COUNT*2){
-         int a=(id-5000)/2, sl=(id-5000)%2;
-         s_st.captureAction=a; s_st.captureSlot=sl;
-         // Change button text to prompt and set focus to dialog for WM_KEYDOWN
-         SetWindowTextW(s_st.hKeyBtn[a][sl],L"[naciśnij...]");
-         SetFocus(dlg);
-      }
-      return 0;}
-   case WM_DESTROY:{
-      PostMessageW(dlg,WM_NULL,0,0);
-      return 0;}
-   case WM_CLOSE:{
-      s_st.accepted=false;
-      g_bgIndex=s_st.tmpBg;
-      g_volume =s_st.tmpVol;
-      applyAnimSpeedStep(s_st.tmpAnimStep);
-      SoundSystem::instance().fadeOutAll(300);
-      DestroyWindow(dlg);
-      return 0;}
-   }
-   return DefWindowProcW(dlg,msg,wp,lp);
-}
-
-static void showSettings(HWND parent){
-   HINSTANCE hInst=(HINSTANCE)GetWindowLongPtrW(parent,GWLP_HINSTANCE);
-   INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_TAB_CLASSES|ICC_WIN95_CLASSES};
-   InitCommonControlsEx(&icc);
-
-   static bool registered=false;
-   if(!registered){
-      WNDCLASSEXW wc={sizeof(wc)};
-      wc.lpfnWndProc  =SettingsWndProc;
-      wc.hInstance    =hInst;
-      wc.lpszClassName=L"PasjansSettings";
-      wc.hCursor      =LoadCursor(nullptr,IDC_ARROW);
-      wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
-      wc.style        =CS_HREDRAW|CS_VREDRAW;
-      RegisterClassExW(&wc);
-      registered=true;
-   }
-
-   s_st.tmpBg=g_bgIndex; s_st.tmpVol=g_volume;
-   s_st.tmpFreeCol=g_freeColMode; s_st.accepted=false;
-   s_st.tmpDepthFree=g_searchDepthFree; s_st.tmpDepthKing=g_searchDepthKing;
-   s_st.captureAction=-1; s_st.captureSlot=-1;
-   for(int i=0;i<SOUND_UI_COUNT;i++)
-      s_st.tmpPaths[i]=SoundSystem::instance().customPath(i);
-
-   // Dialog size: wide enough for sound paths, tall enough for all rows + buttons
-   // (+24 vs. before to comfortably fit the Samograj row on the Keys page)
-   const int DW=520, DH=535; // client area size (+5 for buttons)
-   RECT adjS={0,0,DW,DH};
-   AdjustWindowRectEx(&adjS,WS_POPUP|WS_CAPTION|WS_SYSMENU,FALSE,WS_EX_DLGMODALFRAME);
-   HWND dlg=CreateWindowExW(WS_EX_DLGMODALFRAME,L"PasjansSettings",L"Ustawienia",
-      WS_POPUP|WS_CAPTION|WS_SYSMENU,0,0,adjS.right-adjS.left,adjS.bottom-adjS.top,parent,nullptr,hInst,nullptr);
-   if(!dlg) return;
-   // Store dlg in s_st so WM_COMMAND Browse handler can use it
-   // (we access it via s_st.hTab's parent)
-
-   HFONT hf=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
-   auto mk=[&](HWND par,const wchar_t* cls,const wchar_t* txt,DWORD sty,
-               int x,int y,int w,int h,int id)->HWND{
-      HWND hw=CreateWindowExW(0,cls,txt,WS_CHILD|WS_VISIBLE|sty,
-         x,y,w,h,par,(HMENU)(INT_PTR)id,hInst,nullptr);
-      SendMessageW(hw,WM_SETFONT,(WPARAM)hf,TRUE); return hw;};
-
-   // Tab control — leave 40px at bottom for OK/Cancel
-   s_st.hTab=mk(dlg,WC_TABCONTROLW,L"",WS_CLIPSIBLINGS,5,5,DW-15,DH-55,900);
-   TCITEMW ti={TCIF_TEXT};
-   ti.pszText=(LPWSTR)L"Og\u00f3lne";  SendMessageW(s_st.hTab,TCM_INSERTITEMW,0,(LPARAM)&ti);
-   ti.pszText=(LPWSTR)L"D\u017awi\u0119ki"; SendMessageW(s_st.hTab,TCM_INSERTITEMW,1,(LPARAM)&ti);
-   ti.pszText=(LPWSTR)L"Klawisze"; SendMessageW(s_st.hTab,TCM_INSERTITEMW,2,(LPARAM)&ti);
-
-   const int PX=10,PY=32,PW=DW-30,PH=DH-100;
-   s_st.hGenPage=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE,PX,PY,PW,PH,dlg,nullptr,hInst,nullptr);
-   SetWindowSubclass(s_st.hGenPage,SndPageSubclassProc,1,0);
-   s_st.hSndPage=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,PX,PY,PW,PH,dlg,nullptr,hInst,nullptr);
-   SetWindowSubclass(s_st.hSndPage,SndPageSubclassProc,1,0);
-   s_st.hKeyPage=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,PX,PY,PW,PH,dlg,nullptr,hInst,nullptr);
-
-   // ── General page ────────────────────────────────────────────────────────
-   auto mkg=[&](const wchar_t* cls,const wchar_t* txt,DWORD sty,int x,int y,int w,int h,int id)->HWND{
-      return mk(s_st.hGenPage,cls,txt,sty,x,y,w,h,id);};
-   mkg(L"STATIC",L"Kolor t\u0142a:",SS_LEFT,5,8,95,18,0);
-   {
-      const int SW=52,SGAP=8,SX=105,SY=6,PER_ROW=5;
-      for(int i=0;i<BG_COUNT;i++){
-         int row=i/PER_ROW, col=i%PER_ROW;
-         s_st.hBgSwatch[i]=mkg(L"BUTTON",L"",BS_OWNERDRAW,
-            SX+col*(SW+SGAP),SY+row*(SW+SGAP),SW,SW,1010+i);
-      }
-   }
-   s_st.bgSel=g_bgIndex;
-   mkg(L"STATIC",L"Wolne miejsce:",SS_LEFT,5,132,PW-15,18,0);
-   s_st.hFreeColK  =mkg(L"BUTTON",L"Tylko kr\u00f3l (standardowe)",BS_AUTORADIOBUTTON|WS_GROUP,15,152,PW-30,18,1006);
-   s_st.hFreeColAny=mkg(L"BUTTON",L"Dowolna karta",BS_AUTORADIOBUTTON,15,174,PW-30,18,1007);
-   CheckDlgButton(s_st.hGenPage, g_freeColMode?1007:1006, BST_CHECKED);
-   mkg(L"STATIC",L"Zaznaczanie sekwencji:",SS_LEFT,5,202,PW-15,18,0);
-   const wchar_t* moveHiLabels[3]={
-      L"Nie zaznaczaj",
-      L"Obrys wok\u00f3\u0142 sekwencji",
-      L"Przyciemnij karty, kt\u00f3rych nie mo\u017cna ruszy\u0107"
-   };
-   for(int i=0;i<3;i++){
-      DWORD sty=BS_AUTORADIOBUTTON|(i==0?WS_GROUP:0);
-      s_st.hMoveHiRadio[i]=mkg(L"BUTTON",moveHiLabels[i],sty,15,222+i*22,PW-30,18,1020+i);
-   }
-   CheckDlgButton(s_st.hGenPage, 1020+g_moveHighlightMode, BST_CHECKED);
-
-   // AI look-ahead depth, per mode (base ply count fed into rankCandidates();
-   // free mode always adds +4 more on top of this when an empty column is
-   // present, king-only mode does not — see game.h). Plain numeric edit boxes,
-   // clamped to [1,MAX_SEARCH_DEPTH] on OK to match game.h's own defensive clamp.
-   mkg(L"STATIC",L"Głębokość przewidywań SI (dowolna karta):",SS_LEFT,5,296,PW-70-15,18,0);
-   s_st.hDepthFreeEdit=mkg(L"EDIT",L"",WS_BORDER|ES_NUMBER,PW-70,294,50,22,1040);
-   SendMessageW(s_st.hDepthFreeEdit,EM_SETLIMITTEXT,2,0);
-   {wchar_t b[8]; wsprintfW(b,L"%d",s_st.tmpDepthFree); SetWindowTextW(s_st.hDepthFreeEdit,b);}
-   mkg(L"STATIC",L"Głębokość przewidywań SI (tylko król):",SS_LEFT,5,322,PW-70-15,18,0);
-   s_st.hDepthKingEdit=mkg(L"EDIT",L"",WS_BORDER|ES_NUMBER,PW-70,320,50,22,1041);
-   SendMessageW(s_st.hDepthKingEdit,EM_SETLIMITTEXT,2,0);
-   {wchar_t b[8]; wsprintfW(b,L"%d",s_st.tmpDepthKing); SetWindowTextW(s_st.hDepthKingEdit,b);}
-
-   // Animation speed slider — the visible label is a child of hGenPage (shown
-   // /hidden automatically with the page), but the slider control itself and
-   // its live-value label must be children of dlg, not hGenPage, for the same
-   // reason the volume slider is (see its comment): a SCROLLBAR's WM_HSCROLL
-   // notification goes to its immediate parent, and hGenPage only forwards
-   // WM_COMMAND/WM_DRAWITEM, not WM_HSCROLL. So they're shown/hidden manually
-   // in switchTab() instead of riding along with hGenPage's own visibility.
-   mkg(L"STATIC",L"Prędkość animacji:",SS_LEFT,5,356,PW-15,18,0);
-   {
-      const int AY=PY+376;
-      s_st.tmpAnimStep=g_animSpeedStep;
-      // Slider shifted left and its live-value label widened — the label's
-      // longest text ("Szybciej (x2,25)") was clipping/wrapping inside the
-      // old 70px-wide box (see label position below: old width doubled to
-      // 150 and given its own dedicated span instead of overlapping the
-      // slider's trailing edge).
-      const int animLblW=150;
-      const int animLblX=PX+PW-animLblW;
-      const int animSliderX=PX+120;
-      const int animSliderW=animLblX-10-animSliderX;
-      s_st.hAnimSlider=mk(dlg,L"SCROLLBAR",L"",SBS_HORZ,animSliderX,AY,animSliderW,20,1030);
-      SCROLLINFO si={sizeof(si),SIF_RANGE|SIF_POS,0,4,0,g_animSpeedStep+2,0};
-      SetScrollInfo(s_st.hAnimSlider,SB_CTL,&si,TRUE);
-      s_st.hAnimLbl=mk(dlg,L"STATIC",animSpeedLabel(g_animSpeedStep).c_str(),SS_LEFT,animLblX,AY,animLblW,18,1031);
-   }
-   s_st.hCheckUpdates=mkg(L"BUTTON",L"Sprawdzaj aktualizacje przy starcie",BS_AUTOCHECKBOX,5,398,PW-15,18,1050);
-   CheckDlgButton(s_st.hGenPage,1050,g_checkUpdatesOnStart?BST_CHECKED:BST_UNCHECKED);
-
-   // ── Sound page (volume + custom files) ──────────────────────────────────
-   auto mks=[&](const wchar_t* cls,const wchar_t* txt,DWORD sty,int x,int y,int w,int h,int id)->HWND{
-      return mk(s_st.hSndPage,cls,txt,sty,x,y,w,h,id);};
-
-   // Volume row — slider must be child of dlg (not hSndPage) so WM_HSCROLL reaches SettingsWndProc
-   // It's shown/hidden together with hSndPage via switchTab
-   const int SVY=PY+4; // y in dlg coords: page top (PY) + row offset (4)
-   mk(s_st.hSndPage,L"STATIC",L"G\u0142o\u015bno\u015b\u0107:",SS_LEFT,5,4,90,18,0);
-   s_st.hSlider=mk(dlg,L"SCROLLBAR",L"",SBS_HORZ,PX+100,SVY,PW-175,20,1002);
-   {SCROLLINFO si={sizeof(si),SIF_RANGE|SIF_POS,0,100,0,(int)(g_volume*100.f),0};
-    SetScrollInfo(s_st.hSlider,SB_CTL,&si,TRUE);}
-   wchar_t vb[16]; wsprintfW(vb,L"%d%%",(int)(g_volume*100.f));
-   s_st.hVolLbl=mk(dlg,L"STATIC",vb,SS_LEFT,PX+PW-70,SVY,60,18,1003);
-   // Slider/volLbl are dlg children — hide until Sounds tab is shown
-   ShowWindow(s_st.hSlider,SW_HIDE);
-   ShowWindow(s_st.hVolLbl,SW_HIDE);
-
-   // Separator
-   CreateWindowExW(0,L"STATIC",L"",SS_ETCHEDHORZ|WS_CHILD|WS_VISIBLE,
-      4,28,PW-8,2,s_st.hSndPage,nullptr,hInst,nullptr);
-
-   // Sound rows
-   mks(L"STATIC",L"Akcja",SS_LEFT,5,36,125,16,0);
-   mks(L"STATIC",L"Plik d\u017awi\u0119kowy",SS_LEFT,135,36,200,16,0);
-
-   for(int i=0;i<SOUND_UI_COUNT;i++){
-      int row=56+i*29;
-      s_st.tmpMuted[i]=SoundSystem::instance().isMuted(i);
-      mks(L"STATIC",SOUND_LABELS[i],SS_LEFT|SS_ENDELLIPSIS,5,row+5,129,16,0);
-      s_st.hSoundEdit[i]=mks(L"EDIT",
-         s_st.tmpMuted[i]?L"(brak d\u017awi\u0119ku)":s_st.tmpPaths[i].c_str(),
-         WS_BORDER|ES_AUTOHSCROLL|(s_st.tmpMuted[i]?WS_DISABLED:0),135,row+3,PW-255,20,1100+i);
-      s_st.hSoundBrowse[i]=mks(L"BUTTON",L"\u2026",BS_PUSHBUTTON,PW-114,row+2,24,22,2000+i);
-      s_st.hSoundPlay[i]  =mks(L"BUTTON",L"\u25b6",BS_PUSHBUTTON|(s_st.tmpMuted[i]?WS_DISABLED:0),PW-86,row+2,24,22,3000+i);
-      s_st.hSoundMute[i]  =mks(L"BUTTON",L"\u2715",BS_PUSHBUTTON,PW-58,row+2,24,22,4000+i);
-      s_st.hSoundReset[i] =mks(L"BUTTON",L"\u21ba",BS_PUSHBUTTON,PW-30,row+2,24,22,6000+i);
-   }
-
-   // ── Tooltips for the "...", "▶" and "✕" buttons on each sound row ────────
-   // NOTE: deliberately not using the SDK TOOLINFOW struct here — mirrors the
-   // main window's toolbar tooltips, which use a hand-rolled struct because
-   // of a cbSize/layout mismatch with this mingw header's TOOLINFOW.
-   ensureCustomTipClass(hInst);
-   s_st.hTooltip=CreateWindowExW(WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,
-      L"PsjCustomTip",L"",WS_POPUP|WS_BORDER,
-      0,0,220,40,dlg,nullptr,hInst,nullptr);
-   auto addTip=[&](HWND ctrl,const wchar_t* text){
-      SetPropW(ctrl,L"TipText",(HANDLE)text);
-      static UINT_PTR relayId=9000;
-      SetWindowSubclass(ctrl,TipRelaySubclassProc,relayId++,(DWORD_PTR)s_st.hTooltip);
-   };
-   for(int i=0;i<SOUND_UI_COUNT;i++){
-      addTip(s_st.hSoundBrowse[i],L"Wybierz w\u0142asny plik d\u017awi\u0119kowy (WAV lub MP3)");
-      addTip(s_st.hSoundPlay[i],  L"Odtw\u00f3rz pr\u00f3bk\u0119 tego d\u017awi\u0119ku");
-      addTip(s_st.hSoundMute[i],  L"Usu\u0144 d\u017awi\u0119k dla tego zdarzenia");
-      addTip(s_st.hSoundReset[i], L"Przywr\u00f3\u0107 domy\u015blny d\u017awi\u0119k");
-   }
-
-   // ── Keys page ────────────────────────────────────────────────────────────
-   auto mkk=[&](const wchar_t* cls,const wchar_t* txt,DWORD sty,int x,int y,int w,int h,int id)->HWND{
-      return mk(s_st.hKeyPage,cls,txt,sty,x,y,w,h,id);};
-   // Init tmpKeys from current g_keys
-   for(int i=0;i<KA_COUNT;i++) s_st.tmpKeys[i]=g_keys[i];
-   mkk(L"STATIC",L"Funkcja",SS_LEFT,5,5,140,16,0);
-   mkk(L"STATIC",L"Klawisz 1",SS_CENTER,148,5,80,16,0);
-   mkk(L"STATIC",L"Klawisz 2",SS_CENTER,232,5,80,16,0);
-   for(int i=0;i<KA_COUNT;i++){
-      int row=26+i*30;
-      mkk(L"STATIC",KA_LABELS[i],SS_LEFT|SS_ENDELLIPSIS,5,row+6,140,18,0);
-      std::wstring n1=bindingName(s_st.tmpKeys[i].key1, s_st.tmpKeys[i].shift);
-      std::wstring n2=bindingName(s_st.tmpKeys[i].key2, s_st.tmpKeys[i].shift);
-      s_st.hKeyBtn[i][0]=mkk(L"BUTTON",n1.c_str(),BS_PUSHBUTTON,148,row+2,80,24,5000+i*2);
-      s_st.hKeyBtn[i][1]=mkk(L"BUTTON",n2.c_str(),BS_PUSHBUTTON,232,row+2,80,24,5001+i*2);
-   }
-   // Subclass hKeyPage too so WM_COMMAND from its buttons reaches dlg
-   SetWindowSubclass(s_st.hKeyPage,SndPageSubclassProc,1,0);
-
-   // ── OK / Cancel — anchored to dialog bottom ──────────────────────────────
-   mk(dlg,L"BUTTON",L"OK",     BS_DEFPUSHBUTTON,DW/2-105,DH-40,95,28,IDOK);
-   mk(dlg,L"BUTTON",L"Anuluj", BS_PUSHBUTTON,   DW/2+15, DH-40,95,28,IDCANCEL);
-
-   switchTab(0);
-
-   // Centre on parent
-   RECT pr; GetWindowRect(parent,&pr);
-   SetWindowPos(dlg,HWND_TOP,
-      pr.left+(pr.right-pr.left-(adjS.right-adjS.left))/2,
-      pr.top +(pr.bottom-pr.top-(adjS.bottom-adjS.top))/2,
-      0,0,SWP_NOSIZE|SWP_SHOWWINDOW);
-
-   EnableWindow(parent,FALSE);
-   MSG m;
-   while(IsWindow(dlg)&&GetMessage(&m,nullptr,0,0)){
-      if(m.message==WM_QUIT){PostQuitMessage((int)m.wParam);break;}
-      if(!IsDialogMessage(dlg,&m)){TranslateMessage(&m);DispatchMessage(&m);}
-   }
-   EnableWindow(parent,TRUE);
-   SetForegroundWindow(parent);
-   markDirty(); invalidateGame();
-}
-
 
 // Execute the currently suggested hint move automatically
 static void rebuildBoardFull(int,int){}
@@ -4455,45 +3854,66 @@ static void loadButtonIcons(HINSTANCE hInst){
    }
 }
 
+// ── The toolbar, in the style of Garibaldka: a darker strip of the table colour with translucent
+// rounded plates (white at 14%, brighter under the mouse, a thin lighter outline); icons only.
+static COLORREF toolbarColor(){
+   const BgColor& c=BG_COLORS[(g_bgIndex<0||g_bgIndex>=BG_COUNT)?0:g_bgIndex];
+   return RGB((int)(c.r*0.58f),(int)(c.g*0.58f),(int)(c.b*0.58f));
+}
+static HBRUSH toolbarBrush(){
+   static HBRUSH br=nullptr; static COLORREF col=CLR_INVALID;
+   COLORREF c=toolbarColor();
+   if(!br||c!=col){ if(br) DeleteObject(br); br=CreateSolidBrush(c); col=c; }
+   return br;
+}
+static int g_hoverBtn=0;     // control id of the toolbar button under the mouse (0 = none)
+static void toolbarRefresh(){
+   if(!g_hwnd) return;
+   RECT rc; GetClientRect(g_hwnd,&rc); rc.bottom=Layout::TOOLBAR_H;
+   InvalidateRect(g_hwnd,&rc,TRUE);
+   for(int i=0;i<BTN_ICON_COUNT;i++){ HWND b=GetDlgItem(g_hwnd,BTN_ICON_IDS[i]); if(b) InvalidateRect(b,nullptr,FALSE); }
+   invalidateGame();
+}
+static LRESULT CALLBACK BtnHoverProc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR){
+   if(m==WM_MOUSEMOVE){
+      int id=GetDlgCtrlID(h);
+      if(g_hoverBtn!=id){ g_hoverBtn=id; InvalidateRect(h,nullptr,FALSE); TRACKMOUSEEVENT t={sizeof(t),TME_LEAVE,h,0}; TrackMouseEvent(&t); }
+   } else if(m==WM_MOUSELEAVE){
+      if(g_hoverBtn==GetDlgCtrlID(h)){ g_hoverBtn=0; InvalidateRect(h,nullptr,FALSE); }
+   }
+   return DefSubclassProc(h,m,w,l);
+}
+
 static void drawIconButton(DRAWITEMSTRUCT* dis){
    int idx=-1;
    for(int i=0;i<BTN_ICON_COUNT;i++) if(BTN_ICON_IDS[i]==(int)dis->CtlID){idx=i;break;}
    HDC hdc=dis->hDC;
    RECT& rc=dis->rcItem;
-   // "Samograj" is a switch button: stays visually pressed for as long as
-   // self-play is active, not just while the mouse button is down on it.
    bool pressed=(dis->itemState&ODS_SELECTED)!=0;
-   if((int)dis->CtlID==ID_SAMOGRAJ && g_samogranoActive) pressed=true;
-   // Background
-   FillRect(hdc,&rc,(HBRUSH)(COLOR_BTNFACE+1));
-   if(pressed){
-      DrawEdge(hdc,&rc,EDGE_SUNKEN,BF_RECT);
-   } else {
-      DrawEdge(hdc,&rc,EDGE_RAISED,BF_RECT);
-   }
-   // Icon — kept square and centred even though the button itself is wider
-   // than it is tall, so a wider button doesn't stretch the artwork.
+   // "Samograj" is a switch button: lit (gold outline) for as long as self-play is active.
+   bool active=((int)dis->CtlID==ID_SAMOGRAJ && g_samogranoActive);
+   bool hover=((int)dis->CtlID==g_hoverBtn);
+   bool enabled=(dis->itemState&ODS_DISABLED)==0;
+   FillRect(hdc,&rc,toolbarBrush());
+   Graphics g(hdc);
+   g.SetSmoothingMode(SmoothingModeAntiAlias);
+   g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+   const float x=rc.left+1.5f, y=rc.top+1.5f, w=(float)(rc.right-rc.left)-3.f, h=(float)(rc.bottom-rc.top)-3.f, r=9.f;
+   GraphicsPath path;
+   path.AddArc(x,y,2*r,2*r,180,90); path.AddArc(x+w-2*r,y,2*r,2*r,270,90);
+   path.AddArc(x+w-2*r,y+h-2*r,2*r,2*r,0,90); path.AddArc(x,y+h-2*r,2*r,2*r,90,90); path.CloseFigure();
+   const float fa= !enabled?0.05f : (pressed||active)?0.30f : hover?0.28f : 0.14f;
+   SolidBrush fill(Color((BYTE)(fa*255.f),255,255,255)); g.FillPath(&fill,&path);
+   if(active){ Pen pen(Color(242,255,220,77),2.f); g.DrawPath(&pen,&path); }
+   else      { Pen pen(Color((BYTE)((enabled?0.38f:0.12f)*255.f),255,255,255),1.f); g.DrawPath(&pen,&path); }
+   // Icon — kept square and centred even though the button itself is wider than it is tall.
    if(idx>=0 && g_btnIcons[idx]){
-      int off=pressed?2:1;
-      int availW=rc.right-rc.left-8, availH=rc.bottom-rc.top-8;
-      int sz=std::min(availW,availH);
-      int ix=rc.left+(rc.right-rc.left-sz)/2+off;
-      int iy=rc.top+(rc.bottom-rc.top-sz)/2+off;
-      Graphics g(hdc);
-      g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-      g.DrawImage(g_btnIcons[idx],ix,iy,sz,sz);
-   } else {
-      // Fallback: text if icon missing
-      const wchar_t* labels[]={L"New",L"Hint",L"Undo",L"Redo",L"Stats",L"Sett",L"Samo"};
-      if(idx>=0 && idx<BTN_ICON_COUNT){
-         SetBkMode(hdc,TRANSPARENT);
-         DrawTextW(hdc,labels[idx],-1,&rc,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-      }
-   }
-   // Focus rect
-   if(dis->itemState&ODS_FOCUS){
-      RECT fr={rc.left+3,rc.top+3,rc.right-3,rc.bottom-3};
-      DrawFocusRect(hdc,&fr);
+      int off=pressed?1:0;
+      int sz=(int)std::min(w,h)-8;
+      int ix=rc.left+(rc.right-rc.left-sz)/2+off, iy=rc.top+(rc.bottom-rc.top-sz)/2+off;
+      ImageAttributes ia; ColorMatrix cm={1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,enabled?1.f:0.4f,0, 0,0,0,0,1};
+      ia.SetColorMatrix(&cm);
+      g.DrawImage(g_btnIcons[idx],Rect(ix,iy,sz,sz),0,0,(INT)g_btnIcons[idx]->GetWidth(),(INT)g_btnIcons[idx]->GetHeight(),UnitPixel,&ia);
    }
 }
 
@@ -5551,26 +4971,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       addTip(hBStats, L"Statystyki (S)");
       addTip(hBSett,  L"Ustawienia");
 
-      // Caption labels under each button (small static text, centred)
-      HFONT hCaptionFont=CreateFontW(
-         -MulDiv(8, GetDeviceCaps(GetDC(nullptr),LOGPIXELSY), 72),
-         0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
-         DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
-         CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
-      auto mkLabel=[&](int x,const wchar_t* text){
-         HWND h=CreateWindowW(L"STATIC",text,WS_CHILD|WS_VISIBLE|SS_CENTER,
-            x,BTN_Y+BTN_H+2,BTN_W,16,hwnd,nullptr,
-            ((CREATESTRUCT*)lp)->hInstance,nullptr);
-         SendMessageW(h,WM_SETFONT,(WPARAM)hCaptionFont,TRUE);
-      };
-      mkLabel(BX_NEW,  L"Nowa");
-      mkLabel(BX_HINT, L"Podpowiedź");
-      mkLabel(BX_SAMO, L"Samograj");
-      mkLabel(BX_SOLV, L"Solver");
-      mkLabel(BX_UNDO, L"Cofnij");
-      mkLabel(BX_REDO, L"Ponów");
-      mkLabel(BX_STATS,L"Statystyki");
-      mkLabel(BX_SETT, L"Ustawienia");
+      // Icons only (no captions under the buttons); hover highlight comes from a small subclass.
+      for(HWND b:{hBNew,hBHint,hBSamo,hBSolv,hBUndo,hBRedo,hBStats,hBSett}) SetWindowSubclass(b,BtnHoverProc,1,0);
 
       // Auto-play scoreboard: three lines, one under the other, right of the
       // Settings button (hidden until auto-play is used — see updateAutoStatsUI).
@@ -5583,7 +4985,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
          const int SX=BX_SETT+BTN_W+BTN_GAP+12;
          for(int i=0;i<3;i++){
             g_hAutoStat[i]=CreateWindowW(L"STATIC",L"",WS_CHILD|SS_LEFT|SS_NOPREFIX,
-               SX,8+i*26,190,22,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
+               SX,4+i*21,190,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
             SendMessageW(g_hAutoStat[i],WM_SETFONT,(WPARAM)hStatFont,TRUE);
          }
          updateAutoStatsUI(false);
@@ -5624,6 +5026,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       // Any toolbar/menu action other than the Samograj toggle itself is a
       // manual move by the player — hand control back from self-play.
       if(LOWORD(wp)!=ID_SAMOGRAJ) cancelSamograj();
+      // A toolbar/menu action other than opening/closing an overlay first closes the open overlay.
+      if(ovActive() && LOWORD(wp)!=ID_SETTINGS && LOWORD(wp)!=ID_STATS && LOWORD(wp)!=ID_HELP) ovClose();
       switch(LOWORD(wp)){
       case ID_NEW:  newGame();  return 0;
       case ID_RESTART: restartCurrentGame(); return 0;
@@ -5710,6 +5114,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
          double now=timeGetTime()/1000.0;
          g_fw.update((float)(now-g_fwLast),rc.right,rc.bottom); g_fwLast=now;
          fireworksSounds(now);
+         { float el=(float)(timeGetTime()-g_fwStart)/1000.f;
+           if(el>=FW_TOTAL_S) stopFireworks();
+           else if(el>=FW_TOTAL_S-2.5f) g_fw.stopLaunching(); }
          invalidateGame();
       } else if(wp==TIMER_SMOOTH){
          // Legacy path — now driven by PeekMessage loop; keep as no-op safety net
@@ -5789,8 +5196,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       }
       break;
 
+   case WM_MOUSEWHEEL:
+      if(ovActive()){ ovWheel((short)HIWORD(wp)); return 0; }
+      break;
+
    case WM_KEYDOWN:{
       DWORD vk=(DWORD)wp;
+      if(ovActive()){ ovKey(wp); return 0; }       // an open overlay (Settings / Statistics / Help) takes the keyboard
       if(wp==VK_ESCAPE&&g_isFS) toggleFS();
       // Ctrl+Z / Ctrl+Y always work regardless of bindings
       if(wp=='Z'&&(GetKeyState(VK_CONTROL)&0x8000)){ cancelSamograj(); doUndo(); }
@@ -5821,11 +5233,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
 
    case WM_ERASEBKGND:{
       HDC hdc=(HDC)wp;
-      // Fill toolbar area with system color; game area will be painted by doPaint
+      // Fill the toolbar strip with the (darkened) table colour; the game area is painted by doPaint
       RECT rc2; GetClientRect(hwnd,&rc2);
       rc2.bottom=Layout::TOOLBAR_H;
-      FillRect(hdc,&rc2,(HBRUSH)(COLOR_BTNFACE+1));
+      FillRect(hdc,&rc2,toolbarBrush());
       return 1;}
+   case WM_CTLCOLORSTATIC:{                    // the Samograj scoreboard on the toolbar: light text on the strip
+      HDC hdc=(HDC)wp;
+      SetTextColor(hdc,RGB(238,243,238)); SetBkMode(hdc,TRANSPARENT);
+      return (LRESULT)toolbarBrush();}
    case WM_DESTROY:
       saveWindowPlacement();
       saveStats();
@@ -6039,9 +5455,10 @@ static LRESULT CALLBACK GameWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       doPaint(hwnd);
       EndPaint(hwnd,&ps); return 0;}
    case WM_ERASEBKGND: return 1;
-   case WM_LBUTTONDOWN: onLDown(LOWORD(lp), (int)(short)HIWORD(lp)+TH); return 0;
-   case WM_LBUTTONUP:   onLUp  (LOWORD(lp), (int)(short)HIWORD(lp)+TH); return 0;
-   case WM_MOUSEMOVE:   onMouseMove(LOWORD(lp), (int)(short)HIWORD(lp)+TH); return 0;
+   // While Settings / Statistics / Help is open it takes all the mouse input (coordinates stay relative to the game area).
+   case WM_LBUTTONDOWN: if(ovActive()){ ovMouseDown((float)(short)LOWORD(lp),(float)(short)HIWORD(lp)); return 0; } onLDown(LOWORD(lp), (int)(short)HIWORD(lp)+TH); return 0;
+   case WM_LBUTTONUP:   if(ovActive()||g_ovSwallowUp||g_ovDragVol||g_ovDragAnim||g_ovDragThumb){ ovMouseUp(); return 0; } onLUp  (LOWORD(lp), (int)(short)HIWORD(lp)+TH); return 0;
+   case WM_MOUSEMOVE:   if(ovActive()){ ovMouseMove((float)(short)LOWORD(lp),(float)(short)HIWORD(lp)); return 0; } onMouseMove(LOWORD(lp), (int)(short)HIWORD(lp)+TH); return 0;
    case WM_LBUTTONDBLCLK: PostMessageW(g_hwnd,WM_LBUTTONDBLCLK,wp,lp); return 0;
    }
    return DefWindowProcW(hwnd,msg,wp,lp);
@@ -6145,13 +5562,14 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int nShow){
       // Tick smooth overlap animation, card flight animations, and the
       // "Myślę" thinking pulse (all three want the same fast, low-latency
       // tick loop instead of waiting on WM_TIMER).
-      bool anyAnim = g_smoothActive || g_animating || g_previewAnimating || g_thinking;
+      bool anyAnim = g_smoothActive || g_animating || g_previewAnimating || g_thinking || g_ngPhase;
       if(anyAnim){
          DWORD now=timeGetTime();
          if(now-lastAnimTick>=ANIM_INTERVAL_MS){
             lastAnimTick=now;
             if(g_smoothActive && !tickSmoothAnim())
                g_smoothActive=false;
+            ngTick();
             if(g_animating || g_previewAnimating)
                tickCardAnims();
             if(g_thinking){
