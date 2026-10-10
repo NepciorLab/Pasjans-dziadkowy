@@ -238,7 +238,7 @@ public:
                        bool won, bool noMoves, int moveCount, int seconds,
                        bool thinking, float thinkAlpha,
                        float mlx, float mly, long long gameNumber,
-                       D2D1_RECT_F* moveLabelRect=nullptr) const {
+                       D2D1_RECT_F* moveLabelRect=nullptr,bool counters=true) const {
       if(!m_rt||!m_dw) return;
       float fs=13.f;
       IDWriteTextFormat* fmt=nullptr;
@@ -250,7 +250,7 @@ public:
       float curY=mly;
 
       // "Układ #N" — shown above the move count, when a game number is known
-      if(gameNumber>=0){
+      if(counters && gameNumber>=0){
          std::wstring deal=L"Uk\u0142ad #"+std::to_wstring(gameNumber);
          IDWriteTextLayout* layD=nullptr;
          m_dw->CreateTextLayout(deal.c_str(),(UINT32)deal.size(),fmt,400,40,&layD);
@@ -267,6 +267,7 @@ public:
       IDWriteTextLayout* layM=nullptr;
       m_dw->CreateTextLayout(moves.c_str(),(UINT32)moves.size(),fmt,400,40,&layM);
       float labelH=0.f;
+      if(layM && !counters){ layM->Release(); layM=nullptr; }
       if(layM){
          auto m=metrics(layM);
          m_rt->DrawTextLayout(D2D1::Point2F(mlx,curY),layM,m_brStatusText);
@@ -284,6 +285,7 @@ public:
          else     wsprintfW(tbuf,L"%02d:%02d",mm,ss);
          IDWriteTextLayout* layT=nullptr;
          m_dw->CreateTextLayout(tbuf,(UINT32)wcslen(tbuf),fmt,200,30,&layT);
+         if(layT && !counters){ layT->Release(); layT=nullptr; }
          if(layT){
             auto t=metrics(layT);
             timeH=t.height;

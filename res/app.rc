@@ -12,7 +12,7 @@ IMG_SAMOGRAJ   RCDATA "icons/samograj.png"
 IMG_SOLVER     RCDATA "icons/solver.png"
 
 // Default sounds, in SOUND_DEFAULTS order (an identically named .wav next to the exe still overrides them)
-SND_0 RCDATA "sounds/nowa.wav"
+SND_0 RCDATA "sounds/tornado.wav"
 SND_1 RCDATA "sounds/click.wav"
 SND_2 RCDATA "sounds/rozloz.wav"
 SND_3 RCDATA "sounds/sukces.wav"

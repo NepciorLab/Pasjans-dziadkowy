@@ -9,25 +9,49 @@
 // uses the globals declared above that point (settings, statistics, sounds, key bindings, the D2D target).
 // ============================================================================
 
-enum { OV_NONE=0, OV_SETTINGS, OV_STATS, OV_HELP };
+enum { OV_NONE=0, OV_SETTINGS, OV_STATS, OV_HELP,
+       OV_SOLVER_PICK, OV_SOLVER_RUN, OV_SOLVER_ASK, OV_SOLVER_RESULT };     // the Solver windows (modal: they keep the table, the toolbar and the menu to themselves)
 struct OvHit{ float x,y,w,h; int kind,a; };
 enum { OH_CLOSE=1, OH_GROUP, OH_BG, OH_FREE, OH_HILITE, OH_DEPTH, OH_ANIM, OH_UPDATES, OH_VOL, OH_SBROWSE, OH_SPLAY, OH_SMUTE,
-       OH_SDEF, OH_KEY, OH_KEYCLR, OH_KEYDEF, OH_STATRESET };
+       OH_SDEF, OH_KEY, OH_KEYCLR, OH_KEYDEF, OH_STATRESET,
+       OH_SVP_ROW, OH_SVP_ALL, OH_SVP_NONE, OH_SVP_OK, OH_SVP_CANCEL, OH_SVP_ADD, OH_SVP_MODE, OH_SV_SLIDER, OH_SV_NEXT, OH_SV_THR,
+       OH_SVR_STOP, OH_SVA_YES, OH_SVA_NO, OH_SVX_OK, OH_NEWDEAL, OH_TORNADO, OH_DEVFIELD, OH_DEVSL, OH_DEVBTN, OH_DEVRESET };
 
 static int   g_ov=OV_NONE;                       // which overlay is open
 static std::vector<OvHit> g_ovHits;
 static float g_ovW=800.f, g_ovH=600.f;           // size of the game area as last drawn
-static int   g_ovGroup=0;                        // settings group: 0 general, 1 sounds, 2 keys
+static int   g_ovGroup=0;                        // settings group: 0 general, 1 graphics, 2 sounds, 3 keys
 static int   g_ovCapture=-1;                     // key being captured: action*2+slot (-1 none)
 static bool  g_ovDragVol=false, g_ovDragAnim=false;
 static float g_ovVolX=0, g_ovVolW=1, g_ovAnimX=0, g_ovAnimW=1;     // slider geometry of the last draw
 static float g_ovScroll=0, g_ovContentH=0, g_ovBuiltW=-1;           // help window
 static bool  g_ovDragThumb=false; static float g_ovGrabDy=0;
+static bool  g_ovDragSv=false, g_svDragThumb=false;        // Solver: stage slider / list scroll bar being dragged
+static float g_svGrabDy=0;
+static int   g_devFocus=-1;                  // Deweloper: the numeric field being typed into (-1 none)
+static std::wstring g_devBuf;
+static int   g_ovDragSl=-1, g_ovDragKnob=0;     // Deweloper: the fireworks slider being dragged and which of its two knobs
+static float g_devSlX[10]={}, g_devSlW[10]={1,1,1,1,1,1,1,1,1,1};
+static int   g_devCaret=0, g_devSelA=-1;      // the caret of the field being typed into and the other end of the selection (-1 none)
+static bool  g_devDragSel=false;
+static bool  g_ovDragWin=false; static float g_ovGrabX=0, g_ovGrabY=0, g_setDx=0, g_setDy=0;   // the Settings window can be moved by its title bar
 static bool  g_ovSwallowUp=false;     // the button-up of a click the overlay consumed (even one that closed it) must not reach the table
 
 static bool ovActive(){ return g_ov!=OV_NONE; }
+static bool ovSolver(){ return g_ov>=OV_SOLVER_PICK; }
+// Solver windows (implemented next to the Solver code in main.cpp)
+static void solverOverlayDraw();
+static void solverPanelRect(float& px,float& py,float& pw,float& ph);
+static void solverOverlayClick(const OvHit& h,float mx,float my);
+static void solverOverlayMove(float mx,float my);
+static void solverOverlayUp();
+static void solverOverlayWheel(int delta);
+static void solverOverlayKey(WPARAM k);
+static void solverOverlayDown(float mx,float my);
 static void ovClose();
 static void invalidateGame();
+static void devRunRow(); static void devRunDealAll(); static void devRunTornado(); static void devRunFireworks();
+static void devSave(); static bool devFileExists(); static void devStopLoops();
 static std::wstring buildDateText();
 
 // ---- drawing helpers (the target is the game window's Direct2D target)
@@ -71,14 +95,15 @@ static const float LIT_R=0.95f, LIT_G=0.97f, LIT_B=1.00f;        // body text
 static const float DIM_R=0.78f, DIM_G=0.85f, DIM_B=0.95f;        // notes, subtitles
 
 // The dimmed table, a panel with title and subtitle and the close button.
-static void ovPanel(float px,float py,float pw,float ph,const std::wstring& title,const std::wstring& subtitle){
-   ovRect(0,0,g_ovW,g_ovH,0,0,0,0,0.65f);                                       // dim the table
+static void ovPanel(float px,float py,float pw,float ph,const std::wstring& title,const std::wstring& subtitle,bool closeBtn=true,bool dim=true){
+   if(dim) ovRect(0,0,g_ovW,g_ovH,0,0,0,0,0.65f);                               // dim the table
    ovRect(px+5,py+8,pw,ph,16,0,0,0,0.40f);                                      // shadow
    ovRect(px,py,pw,ph,16,PNL_R,PNL_G,PNL_B,0.99f);                              // the panel
    ovRect(px,py,pw,ph,16,0.95f,0.80f,0.30f,0.85f,false,2.f);                    // gold border
    ovText(title,px+28,py+12,pw-120,40,30,1.f,0.86f,0.25f,1.f,true,DWRITE_TEXT_ALIGNMENT_LEADING);
    ovText(subtitle,px+29,py+48,pw-120,22,15,DIM_R,DIM_G,DIM_B,0.95f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
    ovRect(px+24,py+76,pw-48,1.5f,0,1,1,1,0.20f);
+   if(!closeBtn) return;
    float cbx=px+pw-52, cby=py+16;
    ovRect(cbx,cby,34,34,8,1,1,1,0.14f); ovRect(cbx,cby,34,34,8,1,1,1,0.35f,false,1.f);
    g_renderer.drawLine(cbx+11,cby+11,cbx+23,cby+23,2.2f,255,255,255,230);
@@ -112,9 +137,12 @@ static void ovKnob(float x,float y){
 // The toolbar and the buttons are tinted from the table colour: repaint them after it changed.
 static void toolbarRefresh();
 
-static void ovOpen(int which){ if(g_ov==which){ ovClose(); return; } g_ov=which; g_ovCapture=-1; g_ovDragVol=g_ovDragAnim=g_ovDragThumb=false; g_ovScroll=0; g_ovBuiltW=-1; invalidateGame(); }
+static void devCommit();
+static void ovOpen(int which){ if(g_ov==which){ ovClose(); return; } if(which==OV_SETTINGS){ g_devMode=devFileExists(); if(g_ovGroup==4&&!g_devMode) g_ovGroup=0; } g_devFocus=-1; g_ov=which; g_ovCapture=-1; g_ovDragVol=g_ovDragAnim=g_ovDragThumb=false; g_ovScroll=0; g_ovBuiltW=-1; invalidateGame(); }
 static void ovClose(){
    if(g_ov==OV_NONE) return;
+   devCommit(); devStopLoops();
+   if(g_ovDragWin||g_ovDragSl>=0||g_devDragSel){ g_ovDragWin=false; g_ovDragSl=-1; g_devDragSel=false; ReleaseCapture(); }
    g_ov=OV_NONE; g_ovCapture=-1;
    if(g_ovDragVol||g_ovDragAnim||g_ovDragThumb){ g_ovDragVol=g_ovDragAnim=g_ovDragThumb=false; ReleaseCapture(); }
    SoundSystem::instance().fadeOutAll(200);
@@ -124,13 +152,121 @@ static void ovClose(){
 // ============================================================================
 // Settings
 // ============================================================================
-static const wchar_t* OV_GROUPS[3]={L"Ogólne",L"Dźwięki",L"Klawisze"};
+static const wchar_t* OV_GROUPS[5]={L"Ogólne",L"Grafika",L"Dźwięki",L"Klawisze",L"Deweloper"};
 
+// ---- Deweloper: the numeric fields and the fireworks sliders
+// A slider with two knobs sets a range [lo,hi]: the game draws the value for every single firework from it.
+struct DevSlider{ const wchar_t* name; float* lo; float* hi; float mn,mx,step; int fmt; };   // hi==nullptr: one knob; fmt: 0 = x.xx, 1 = percent, 2 = integer, 3 = seconds
+static const int DEV_SL_N=10;
+static DevSlider devSl(int i){
+   Fireworks2::Params& P=g_fw.P;
+   switch(i){
+   case 0: return {L"Odstęp między wystrzałami (×)",&P.launchGap,nullptr,0.2f,3.f,0.05f,0};
+   case 1: return {L"Rakiet naraz",&P.rockets.lo,&P.rockets.hi,1.f,8.f,1.f,2};
+   case 2: return {L"Liczba iskier (×)",&P.sparks.lo,&P.sparks.hi,0.2f,2.5f,0.05f,0};
+   case 3: return {L"Prędkość iskier (×)",&P.speed.lo,&P.speed.hi,0.4f,2.f,0.05f,0};
+   case 4: return {L"Grawitacja (×)",&P.gravity.lo,&P.gravity.hi,0.f,3.f,0.05f,0};
+   case 5: return {L"Czas życia iskier (×)",&P.life.lo,&P.life.hi,0.3f,2.5f,0.05f,0};
+   case 6: return {L"Jasność ognia (×)",&P.glow.lo,&P.glow.hi,0.2f,2.f,0.05f,0};
+   case 7: return {L"Szansa rozbłysku na końcu",&P.finale,nullptr,0.f,1.f,0.05f,1};
+   case 8: return {L"Czas trwania fajerwerków",&g_fwTotalS,nullptr,5.f,60.f,1.f,3};
+   default:return {L"Podział: stała ilość | zanikanie",&P.split,nullptr,0.f,1.f,0.05f,1};
+   }
+}
+static std::wstring devSlOne(float v,int fmt){
+   wchar_t b[32];
+   switch(fmt){
+   case 1: swprintf(b,32,L"%d%%",(int)std::lround(v*100.f)); break;
+   case 2: swprintf(b,32,L"%d",(int)std::lround(v)); break;
+   case 3: swprintf(b,32,L"%d s",(int)std::lround(v)); break;
+   default: swprintf(b,32,L"%.2f",v); break;
+   }
+   return b;
+}
+static std::wstring devSlText(const DevSlider& s){
+   if(!s.hi||std::fabs(*s.hi-*s.lo)<1e-4f) return devSlOne(*s.lo,s.fmt);
+   return devSlOne(*s.lo,s.fmt)+L" – "+devSlOne(*s.hi,s.fmt);
+}
+static int* devField(int i){ switch(i){ case 0: return &g_dev.tornadoMs; case 1: return &g_dev.accelMs; case 2: return &g_dev.decelMs; default: return &g_dev.rowGapMs; } }
+static void devFieldRange(int i,int& lo,int& hi){ switch(i){ case 0: lo=200; hi=20000; break; case 1: case 2: lo=0; hi=10000; break; default: lo=0; hi=3000; break; } }
+
+// the text of a numeric field: a caret, a selection (mouse, Shift+arrows, Ctrl+A), Backspace/Delete, Ctrl+C/X/V
+static float g_devFieldX[4]={};
+static IDWriteTextLayout* devLayout(const std::wstring& s){
+   IDWriteTextFormat* f=nullptr;
+   g_dwFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,15.f,L"",&f);
+   if(!f) return nullptr;
+   f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+   IDWriteTextLayout* l=nullptr; g_dwFactory->CreateTextLayout(s.c_str(),(UINT32)s.size(),f,1000.f,30.f,&l); f->Release();
+   return l;
+}
+static float devCaretX(int pos){                          // x of a character position, from the start of the text
+   IDWriteTextLayout* l=devLayout(g_devBuf); if(!l) return 0.f;
+   float x=0,y=0; DWRITE_HIT_TEST_METRICS m{}; l->HitTestTextPosition((UINT32)pos,FALSE,&x,&y,&m); l->Release(); return x;
+}
+static int devPosAt(float px){                            // the character position nearest to an x (from the start of the text)
+   IDWriteTextLayout* l=devLayout(g_devBuf); if(!l) return 0;
+   BOOL tr=FALSE,in=FALSE; DWRITE_HIT_TEST_METRICS m{}; l->HitTestPoint(px,10.f,&tr,&in,&m); l->Release();
+   int pos=(int)m.textPosition+(tr?1:0); return std::max(0,std::min((int)g_devBuf.size(),pos));
+}
+static bool devHasSel(){ return g_devSelA>=0 && g_devSelA!=g_devCaret; }
+static void devSelRange(int& a,int& b){ a=std::min(g_devSelA,g_devCaret); b=std::max(g_devSelA,g_devCaret); }
+static void devDeleteSel(){ if(!devHasSel()) return; int a,b; devSelRange(a,b); g_devBuf.erase((size_t)a,(size_t)(b-a)); g_devCaret=a; g_devSelA=-1; }
+static void devInsert(const std::wstring& s){
+   devDeleteSel();
+   for(wchar_t c:s){ if(c<L'0'||c>L'9') continue; if(g_devBuf.size()>=6) break; g_devBuf.insert((size_t)g_devCaret,1,c); g_devCaret++; }
+}
+static void devClipCopy(const std::wstring& s){
+   if(!OpenClipboard(g_hwnd)) return;
+   EmptyClipboard();
+   HGLOBAL h=GlobalAlloc(GMEM_MOVEABLE,(s.size()+1)*sizeof(wchar_t));
+   if(h){ wchar_t* d=(wchar_t*)GlobalLock(h); memcpy(d,s.c_str(),(s.size()+1)*sizeof(wchar_t)); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT,h); }
+   CloseClipboard();
+}
+static std::wstring devClipPaste(){
+   std::wstring r; if(!OpenClipboard(g_hwnd)) return r;
+   HANDLE h=GetClipboardData(CF_UNICODETEXT);
+   if(h){ const wchar_t* d=(const wchar_t*)GlobalLock(h); if(d) r=d; GlobalUnlock(h); }
+   CloseClipboard(); return r;
+}
+static void devCommit(){                              // the typed number becomes the value (clamped) and everything is saved
+   if(g_devFocus<0) return;
+   int i=g_devFocus; g_devFocus=-1; g_devSelA=-1; g_devDragSel=false;
+   if(g_devBuf.empty()) return;
+   int lo,hi; devFieldRange(i,lo,hi);
+   *devField(i)=std::max(lo,std::min(hi,_wtoi(g_devBuf.c_str())));
+   devSave();
+}
+static void devFocusField(int i){
+   if(g_devFocus!=i){ devCommit(); g_devFocus=i; g_devBuf=std::to_wstring(*devField(i)); g_devCaret=(int)g_devBuf.size(); g_devSelA=0; }   // the whole number is selected
+}
+static void devReset(){
+   g_dev=DevParams(); g_fw.P=Fireworks2::Params(); g_fwTotalS=20.f; devSave();
+}
+static void ovSetDevSlider(float mx){
+   int i=g_ovDragSl; if(i<0||i>=DEV_SL_N) return;
+   DevSlider s=devSl(i);
+   float u=std::max(0.f,std::min(1.f,(mx-g_devSlX[i])/std::max(1.f,g_devSlW[i])));
+   float v=s.mn+(s.mx-s.mn)*u; v=std::round(v/s.step)*s.step; v=std::max(s.mn,std::min(s.mx,v));
+   if(!s.hi) *s.lo=v;
+   else if(g_ovDragKnob==0) *s.lo=std::min(v,*s.hi);
+   else *s.hi=std::max(v,*s.lo);
+   invalidateGame();
+}
+// The Settings window: centred, then moved by the player (title bar), always at least partly on the screen.
+static void settingsRect(float& px,float& py,float& pw,float& ph,float* baseX=nullptr,float* baseY=nullptr){
+   pw=std::min(880.f,g_ovW-30.f); ph=std::min(640.f,g_ovH-30.f);
+   const float bx=std::floor((g_ovW-pw)/2.f), by=std::floor((g_ovH-ph)/2.f);
+   if(baseX) *baseX=bx;
+   if(baseY) *baseY=by;
+   px=std::max(-pw+140.f,std::min(g_ovW-140.f,bx+g_setDx));
+   py=std::max(0.f,std::min(g_ovH-80.f,by+g_setDy));
+}
 static void settingsOverlayDraw(){
-   const float pw=std::min(880.f,g_ovW-30.f), ph=std::min(640.f,g_ovH-30.f), px=std::floor((g_ovW-pw)/2.f), py=std::floor((g_ovH-ph)/2.f);
-   ovPanel(px,py,pw,ph,L"Ustawienia",L"Zmiany działają od razu i są zapamiętywane w pliku pasjans.ini");
+   float px,py,pw,ph; settingsRect(px,py,pw,ph);
+   ovPanel(px,py,pw,ph,L"Ustawienia",g_ovGroup==4?L"Zmiany działają od razu i są zapamiętywane w pliku dev.txt":L"Zmiany działają od razu i są zapamiętywane w pliku pasjans.ini",true,g_ovGroup!=4);
    const float nx=px+24, ny=py+92, nw=176;
-   for(int i=0;i<3;i++){
+   for(int i=0;i<(g_devMode?5:4);i++){
       float y=ny+i*52.f; bool act=(g_ovGroup==i);
       ovRect(nx,y,nw,44,8,1,1,1,act?0.22f:0.07f);
       if(act) ovRect(nx,y,nw,44,8,1.f,0.86f,0.30f,0.95f,false,2.f); else ovRect(nx,y,nw,44,8,1,1,1,0.20f,false,1.f);
@@ -142,26 +278,10 @@ static void settingsOverlayDraw(){
    ovHeading(OV_GROUPS[g_ovGroup],cx,y,cw); y+=48;
    switch(g_ovGroup){
    case 0:{                                                                         // General
-      ovLabel(L"Kolor tła",cx,y,200,28); y+=30;
-      { const float gap=8.f, sw=std::min(46.f,(cw-(BG_COUNT-1)*gap)/BG_COUNT);
-        for(int i=0;i<BG_COUNT;i++){
-           float sx=cx+i*(sw+gap);
-           ID2D1SolidColorBrush* br=nullptr; g_d2dRT->CreateSolidColorBrush(D2D1::ColorF(BG_COLORS[i].r/255.f,BG_COLORS[i].g/255.f,BG_COLORS[i].b/255.f),&br);
-           if(br){ g_d2dRT->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(sx,y,sx+sw,y+sw),8,8),br); br->Release(); }
-           if(i==g_bgIndex) ovRect(sx-2,y-2,sw+4,sw+4,9,1.f,0.86f,0.30f,1.f,false,3.f); else ovRect(sx,y,sw,sw,8,1,1,1,0.35f,false,1.f);
-           ovHit(sx,y,sw,sw,OH_BG,i);
-        }
-        y+=sw+14; }
       ovLabel(L"Wolne miejsce na pustej kolumnie",cx,y,cw,28); y+=30;
       ovButton(cx,y,210,36,L"Tylko król (standardowe)",OH_FREE,0,!g_freeColMode);
       ovButton(cx+218,y,170,36,L"Dowolna karta",OH_FREE,1,g_freeColMode);
-      y+=46;
-      ovLabel(L"Zaznaczanie sekwencji",cx,y,cw,28); y+=30;
-      { const float bw=(cw-16.f)/3.f;
-        ovButton(cx,y,bw,36,L"Nie zaznaczaj",OH_HILITE,0,g_moveHighlightMode==0);
-        ovButton(cx+bw+8,y,bw,36,L"Obrys wokół sekwencji",OH_HILITE,1,g_moveHighlightMode==1);
-        ovButton(cx+2*(bw+8),y,bw,36,L"Przyciemnij niemożliwe",OH_HILITE,2,g_moveHighlightMode==2); }
-      y+=46;
+      y+=54;
       ovLabel(L"Głębokość przewidywań SI (dowolna karta)",cx,y,cw-210,36);
       { float bx=cx+cw-190;
         ovButton(bx,y,36,36,L"−",OH_DEPTH,0,false,g_searchDepthFree>1,18);
@@ -173,9 +293,29 @@ static void settingsOverlayDraw(){
         ovButton(bx,y,36,36,L"−",OH_DEPTH,2,false,g_searchDepthKing>1,18);
         ovText(std::to_wstring(g_searchDepthKing),bx+38,y,50,36,16,1,1,1,1.f,true);
         ovButton(bx+90,y,36,36,L"+",OH_DEPTH,3,false,g_searchDepthKing<MAX_SEARCH_DEPTH,18); }
-      y+=46;
+      y+=54;
+      ovCheck(cx,y,cw,L"Sprawdzaj aktualizacje przy starcie gry",g_checkUpdatesOnStart,OH_UPDATES); y+=34;
+      ovNote(std::wstring(L"Wersja ")+APP_VERSION+L", zbudowana "+buildDateText()+L".",cx+32,y,cw-32,22);
+      break;}
+   case 1:{                                                                         // Graphics
+      ovLabel(L"Kolor tła",cx,y,200,28); y+=30;
+      { const float gap=8.f, sw=std::min(46.f,(cw-(BG_COUNT-1)*gap)/BG_COUNT);
+        for(int i=0;i<BG_COUNT;i++){
+           float sx=cx+i*(sw+gap);
+           ID2D1SolidColorBrush* br=nullptr; g_d2dRT->CreateSolidColorBrush(D2D1::ColorF(BG_COLORS[i].r/255.f,BG_COLORS[i].g/255.f,BG_COLORS[i].b/255.f),&br);
+           if(br){ g_d2dRT->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(sx,y,sx+sw,y+sw),8,8),br); br->Release(); }
+           if(i==g_bgIndex) ovRect(sx-2,y-2,sw+4,sw+4,9,1.f,0.86f,0.30f,1.f,false,3.f); else ovRect(sx,y,sw,sw,8,1,1,1,0.35f,false,1.f);
+           ovHit(sx,y,sw,sw,OH_BG,i);
+        }
+        y+=sw+18; }
+      ovLabel(L"Zaznaczanie sekwencji",cx,y,cw,28); y+=30;
+      { const float bw=(cw-16.f)/3.f;
+        ovButton(cx,y,bw,36,L"Nie zaznaczaj",OH_HILITE,0,g_moveHighlightMode==0);
+        ovButton(cx+bw+8,y,bw,36,L"Obrys wokół sekwencji",OH_HILITE,1,g_moveHighlightMode==1);
+        ovButton(cx+2*(bw+8),y,bw,36,L"Przyciemnij niemożliwe",OH_HILITE,2,g_moveHighlightMode==2); }
+      y+=54;
       ovLabel(L"Prędkość animacji",cx,y,200,28); y+=30;
-      g_ovAnimX=cx+40.f; g_ovAnimW=cw-80.f;
+      g_ovAnimX=cx+50.f; g_ovAnimW=cw-100.f;
       ovRect(g_ovAnimX,y+11,g_ovAnimW,6,3,1,1,1,0.20f);
       ovRect(g_ovAnimX,y+11,g_ovAnimW*(g_animSpeedStep+2)/4.f,6,3,1.f,0.86f,0.30f,0.95f);
       for(int k=0;k<5;k++){
@@ -185,11 +325,11 @@ static void settingsOverlayDraw(){
       }
       ovKnob(g_ovAnimX+g_ovAnimW*(g_animSpeedStep+2)/4.f,y+14);
       ovHit(g_ovAnimX-24,y-4,g_ovAnimW+48,48,OH_ANIM);
-      y+=58;
-      ovCheck(cx,y,cw,L"Sprawdzaj aktualizacje przy starcie gry",g_checkUpdatesOnStart,OH_UPDATES); y+=34;
-      ovNote(std::wstring(L"Wersja ")+APP_VERSION+L", zbudowana "+buildDateText()+L".",cx+32,y,cw-32,22);
+      y+=66;
+      ovCheck(cx,y,cw,L"Animacja nowego rozdania",g_newDealAnim,OH_NEWDEAL); y+=34;
+      ovNote(L"Odznaczenie pomija animację nowej gry: rozdanie od razu leży na stole.",cx+32,y,cw-32,22);
       break;}
-   case 1:{                                                                         // Sounds
+   case 2:{                                                                         // Sounds
       ovLabel(L"Głośność",cx,y,100,30);
       g_ovVolX=cx+110; g_ovVolW=cw-110-70;
       ovRect(g_ovVolX,y+12,g_ovVolW,6,3,1,1,1,0.20f);
@@ -197,9 +337,10 @@ static void settingsOverlayDraw(){
       ovKnob(g_ovVolX+g_ovVolW*g_volume,y+15);
       ovHit(g_ovVolX-10,y,g_ovVolW+20,30,OH_VOL);
       ovText(std::to_wstring((int)(g_volume*100.f+0.5f))+L"%",cx+cw-60,y,60,30,15,1,1,1,1.f,false,DWRITE_TEXT_ALIGNMENT_TRAILING);
-      y+=44;
+      y+=40;
+      ovCheck(cx,y,cw,L"Dźwięk tornada przy animacji nowego rozdania",g_tornadoSound,OH_TORNADO); y+=40;
       ovText(L"Własne dźwięki (WAV lub MP3)",cx,y,cw,26,15,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_LEADING); y+=32;
-      for(int i=0;i<SOUND_UI_COUNT;i++){
+      for(int i=SOUND_UI_FIRST;i<SOUND_UI_COUNT;i++){
          const bool mut=SoundSystem::instance().isMuted(i); const std::wstring& cp=SoundSystem::instance().customPath(i);
          ovText(SOUND_LABELS[i],cx,y,190,32,14.5f,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
          std::wstring cur=mut?L"(bez dźwięku)":cp.empty()?L"domyślny":ovFileBase(cp);
@@ -213,7 +354,42 @@ static void settingsOverlayDraw(){
          y+=38;
       }
       break;}
-   case 2:{                                                                         // Keys
+   case 4:{                                                                         // Developer
+      ovButton(cx+cw-150,ny-4,150,30,L"Domyślne",OH_DEVRESET,0,false,true,13.f);
+      const wchar_t* fl[4]={L"Tornado – czas całej animacji [ms]",L"Przyspieszanie na początku [ms]",L"Opóźnianie na końcu [ms]",L"Odstęp między wierszami rozdania [ms]"};
+      const bool caretOn=(GetTickCount()/530)%2==0;
+      for(int i=0;i<4;i++,y+=32){
+         ovLabel(fl[i],cx,y,cw-136,32);
+         const float fx=cx+cw-120; const bool foc=(g_devFocus==i); g_devFieldX[i]=fx+8.f;
+         ovRect(fx,y+1,120,30,6,0,0,0,0.35f);
+         if(foc) ovRect(fx,y+1,120,30,6,1.f,0.86f,0.30f,0.85f,false,1.5f); else ovRect(fx,y+1,120,30,6,1,1,1,0.22f,false,1.f);
+         if(foc){
+            if(devHasSel()){ int a,b; devSelRange(a,b); float x1=devCaretX(a), x2=devCaretX(b); ovRect(fx+8+x1,y+5,x2-x1,22,2,1.f,0.86f,0.30f,0.40f); }
+            ovText(g_devBuf,fx+8,y+1,104,30,15,1,1,1,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+            if(caretOn){ float cxp=fx+8+devCaretX(g_devCaret); ovRect(cxp,y+6,1.6f,20,0,1,1,1,0.95f); }       // the caret only blinks, the text stays still
+         } else ovText(std::to_wstring(*devField(i)),fx+8,y+1,104,30,15,1,1,1,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+         ovHit(fx,y+1,120,30,OH_DEVFIELD,i);
+      }
+      y+=6;
+      { const wchar_t* bl[4]={g_devRowLoop?L"Zatrzymaj rozdawanie":L"Rozdaj 1 wiersz",L"Rozdaj wszystkie",L"Tornado",g_devFwLoop?L"Zatrzymaj fajerwerki":L"Fajerwerki"};
+        const bool on[4]={g_devRowLoop,false,false,g_devFwLoop}; const float bw=(cw-24.f)/4.f;
+        for(int i=0;i<4;i++) ovButton(cx+i*(bw+8.f),y,bw,38,bl[i],OH_DEVBTN,i,on[i],true,12.5f); }
+      y+=46;
+      ovText(L"Fajerwerki  (dwa punkty: zakres, z którego gra losuje wartość dla każdego ognia)",cx,y,cw,22,13.5f,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_LEADING); y+=26;
+      for(int i=0;i<DEV_SL_N;i++,y+=25){
+         DevSlider s=devSl(i);
+         ovText(s.name,cx,y,214,24,13.5f,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+         g_devSlX[i]=cx+220; g_devSlW[i]=cw-220-92;
+         const float u0=(*s.lo-s.mn)/(s.mx-s.mn), u1=s.hi?(*s.hi-s.mn)/(s.mx-s.mn):u0;
+         ovRect(g_devSlX[i],y+9,g_devSlW[i],6,3,1,1,1,0.20f);
+         if(s.hi) ovRect(g_devSlX[i]+g_devSlW[i]*u0,y+9,std::max(2.f,g_devSlW[i]*(u1-u0)),6,3,1.f,0.86f,0.30f,0.95f);
+         else     ovRect(g_devSlX[i],y+9,g_devSlW[i]*u0,6,3,1.f,0.86f,0.30f,0.95f);
+         ovKnob(g_devSlX[i]+g_devSlW[i]*u0,y+12);
+         if(s.hi) ovKnob(g_devSlX[i]+g_devSlW[i]*u1,y+12);
+         ovHit(g_devSlX[i]-10,y,g_devSlW[i]+20,24,OH_DEVSL,i);
+         ovText(devSlText(s),cx+cw-88,y,88,24,13.f,1,1,1,1.f,true,DWRITE_TEXT_ALIGNMENT_TRAILING);
+      }
+      break;}   case 3:{                                                                         // Keys
       ovNote(L"Kliknij pole skrótu i naciśnij klawisz (z Shiftem, jeśli ma go wymagać). Każda akcja ma dwa skróty; ✕ czyści skrót.",cx,y-4,cw,40); y+=38;
       for(int i=0;i<KA_COUNT;i++,y+=32){
          ovText(KA_LABELS[i],cx,y,240,30,14.5f,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -230,7 +406,6 @@ static void settingsOverlayDraw(){
       break;}
    }
 }
-
 static void ovSetVolume(float mx){
    float v=(mx-g_ovVolX)/std::max(1.f,g_ovVolW);
    g_volume=std::max(0.f,std::min(1.f,std::round(v*100.f)/100.f)); invalidateGame();
@@ -246,7 +421,7 @@ static void keysResetDefaults(){
 
 static void settingsOverlayClick(const OvHit& h,float mx){
    switch(h.kind){
-   case OH_GROUP: g_ovGroup=h.a; g_ovCapture=-1; SoundSystem::instance().fadeOutAll(150); break;
+   case OH_GROUP: devCommit(); devStopLoops(); g_ovGroup=h.a; g_ovCapture=-1; SoundSystem::instance().fadeOutAll(150); break;
    case OH_BG:    g_bgIndex=h.a; saveSettings(); toolbarRefresh(); break;
    case OH_FREE:{
       bool nf=(h.a==1);
@@ -265,6 +440,26 @@ static void settingsOverlayClick(const OvHit& h,float mx){
       break;}
    case OH_ANIM:  g_ovDragAnim=true; SetCapture(g_gameHwnd); ovSetAnim(mx); break;
    case OH_UPDATES: g_checkUpdatesOnStart=!g_checkUpdatesOnStart; saveSettings(); break;
+   case OH_NEWDEAL: g_newDealAnim=!g_newDealAnim; saveSettings(); break;
+   case OH_DEVFIELD:{
+      static DWORD lastT=0; static int lastF=-1;
+      const DWORD now=GetTickCount();
+      if(g_devFocus==h.a){
+         if(lastF==h.a && now-lastT<400){ g_devSelA=0; g_devCaret=(int)g_devBuf.size(); }              // double click: everything
+         else{ g_devCaret=devPosAt(mx-g_devFieldX[h.a]); g_devSelA=g_devCaret; g_devDragSel=true; SetCapture(g_gameHwnd); }
+      } else devFocusField(h.a);
+      lastT=now; lastF=h.a;
+      break;}
+   case OH_DEVSL:{
+      DevSlider s=devSl(h.a); g_ovDragSl=h.a; g_ovDragKnob=0;
+      if(s.hi){ float x0=g_devSlX[h.a]+g_devSlW[h.a]*(*s.lo-s.mn)/(s.mx-s.mn), x1=g_devSlX[h.a]+g_devSlW[h.a]*(*s.hi-s.mn)/(s.mx-s.mn);
+                g_ovDragKnob=(std::fabs(mx-x1)<std::fabs(mx-x0)||(mx>x1))?1:0; if(mx<x0) g_ovDragKnob=0; }
+      SetCapture(g_gameHwnd); ovSetDevSlider(mx); break;}
+   case OH_DEVRESET: devReset(); break;
+   case OH_DEVBTN:
+      switch(h.a){ case 0: devRunRow(); break; case 1: devRunDealAll(); break; case 2: devRunTornado(); break; default: devRunFireworks(); break; }
+      break;
+   case OH_TORNADO: g_tornadoSound=!g_tornadoSound; saveSettings(); break;
    case OH_VOL:   g_ovDragVol=true; SetCapture(g_gameHwnd); ovSetVolume(mx); break;
    case OH_SBROWSE:{
       wchar_t path[MAX_PATH]={};
@@ -484,45 +679,91 @@ static void overlaysDraw(float W,float H){
    case OV_SETTINGS: settingsOverlayDraw(); break;
    case OV_STATS:    statsOverlayDraw(); break;
    case OV_HELP:     helpOverlayDraw(); break;
+   default:          solverOverlayDraw(); break;
    }
 }
 // The panel rectangle of the open overlay (a click outside it closes it).
 static void ovPanelRect(float& px,float& py,float& pw,float& ph){
-   if(g_ov==OV_SETTINGS){ pw=std::min(880.f,g_ovW-30.f); ph=std::min(640.f,g_ovH-30.f); }
+   if(ovSolver()){ solverPanelRect(px,py,pw,ph); return; }
+   if(g_ov==OV_SETTINGS){ settingsRect(px,py,pw,ph); return; }
    else if(g_ov==OV_STATS){ pw=std::min(780.f,g_ovW-30.f); ph=std::min(620.f,g_ovH-30.f); }
    else { float vx,vy,vw,vh; helpGeom(px,py,pw,ph,vx,vy,vw,vh); return; }
    px=std::floor((g_ovW-pw)/2.f); py=std::floor((g_ovH-ph)/2.f);
 }
 static void ovMouseDown(float mx,float my){
    g_ovSwallowUp=true;
+   if(g_ov==OV_SETTINGS && g_devFocus>=0){          // a click outside the field being typed into ends the typing
+      bool onField=false; for(const OvHit& h:g_ovHits) if(h.kind==OH_DEVFIELD&&mx>=h.x&&mx<=h.x+h.w&&my>=h.y&&my<=h.y+h.h) onField=true;
+      if(!onField) devCommit();
+   }
    if(g_ovCapture>=0){ g_ovCapture=-1; invalidateGame(); }                    // a click cancels the waiting for a key
    for(const OvHit& h:g_ovHits){
       if(mx<h.x||mx>h.x+h.w||my<h.y||my>h.y+h.h) continue;
+      if(ovSolver()){ solverOverlayClick(h,mx,my); invalidateGame(); return; }
       if(h.kind==OH_CLOSE){ ovClose(); return; }
       if(g_ov==OV_SETTINGS) settingsOverlayClick(h,mx);
       else if(g_ov==OV_STATS && h.kind==OH_STATRESET){ statsReset(); }
       invalidateGame(); return;
    }
+   if(ovSolver()){ solverOverlayDown(mx,my); invalidateGame(); return; }                  // modal: a click outside does not close it
    float px,py,pw,ph; ovPanelRect(px,py,pw,ph);
+   if(g_ov==OV_SETTINGS && mx>=px && mx<=px+pw && my>=py && my<=py+76){        // the title bar: the window can be moved
+      g_ovDragWin=true; g_ovGrabX=mx-px; g_ovGrabY=my-py; SetCapture(g_gameHwnd); return;
+   }
+   if(g_ov==OV_SETTINGS && g_ovGroup==4) return;                              // the developer group stays open (it is a window to work with)
    if(mx<px||mx>px+pw||my<py||my>py+ph){ ovClose(); return; }
    if(g_ov==OV_HELP) helpMouseDown(mx,my);
 }
 static void ovMouseMove(float mx,float my){
+   if(ovSolver()){ solverOverlayMove(mx,my); return; }
+   if(g_ovDragSl>=0){ ovSetDevSlider(mx); return; }
+   if(g_devDragSel){ g_devCaret=devPosAt(mx-g_devFieldX[std::max(0,g_devFocus)]); invalidateGame(); return; }
+   if(g_ovDragWin){
+      float px,py,pw,ph,bx,by; settingsRect(px,py,pw,ph,&bx,&by);
+      g_setDx=mx-g_ovGrabX-bx; g_setDy=my-g_ovGrabY-by; invalidateGame(); return;
+   }
    if(g_ovDragVol) ovSetVolume(mx); else if(g_ovDragAnim) ovSetAnim(mx); else if(g_ovDragThumb) helpMouseMove(my);
 }
 static void ovMouseUp(){
    g_ovSwallowUp=false;
+   if(g_ovDragSv||g_svDragThumb){ solverOverlayUp(); return; }
+   if(g_ovDragSl>=0){ g_ovDragSl=-1; ReleaseCapture(); devSave(); invalidateGame(); }
+   if(g_devDragSel){ g_devDragSel=false; ReleaseCapture(); if(g_devSelA==g_devCaret) g_devSelA=-1; invalidateGame(); }
+   if(g_ovDragWin){ g_ovDragWin=false; ReleaseCapture(); invalidateGame(); }
    if(g_ovDragVol){ g_ovDragVol=false; ReleaseCapture(); saveSettings(); playSound("click",g_volume); invalidateGame(); }
    if(g_ovDragAnim){ g_ovDragAnim=false; ReleaseCapture(); saveSettings(); invalidateGame(); }
    if(g_ovDragThumb){ g_ovDragThumb=false; ReleaseCapture(); invalidateGame(); }
 }
 static void ovWheel(int delta){
+   if(ovSolver()){ solverOverlayWheel(delta); return; }
    if(g_ov!=OV_HELP) return;
    float px,py,pw,ph,vx,vy,vw,vh; helpGeom(px,py,pw,ph,vx,vy,vw,vh);
    g_ovScroll-=(float)delta/120.f*60.f; helpClamp(vh); invalidateGame();
 }
 static void ovKey(WPARAM k){
-   if(g_ov==OV_SETTINGS && g_ovCapture>=0){
+   if(ovSolver()){ solverOverlayKey(k); return; }
+   if(g_ov==OV_SETTINGS && g_devFocus>=0){                                   // typing into a numeric field
+      const bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0, shift=(GetKeyState(VK_SHIFT)&0x8000)!=0;
+      const int n=(int)g_devBuf.size();
+      auto move=[&](int to){ if(shift){ if(g_devSelA<0) g_devSelA=g_devCaret; } else g_devSelA=-1; g_devCaret=std::max(0,std::min(n,to)); };
+      if(ctrl && k=='A'){ g_devSelA=0; g_devCaret=n; }
+      else if(ctrl && (k=='C'||k=='X')){
+         int a=0,b=n; if(devHasSel()) devSelRange(a,b);
+         devClipCopy(g_devBuf.substr((size_t)a,(size_t)(b-a)));
+         if(k=='X'){ if(!devHasSel()){ g_devSelA=0; g_devCaret=n; } devDeleteSel(); }
+      }
+      else if(ctrl && k=='V') devInsert(devClipPaste());
+      else if((k>='0'&&k<='9')||(k>=VK_NUMPAD0&&k<=VK_NUMPAD9)){ if(!ctrl) devInsert(std::wstring(1,(wchar_t)(k>=VK_NUMPAD0&&k<=VK_NUMPAD9?k-VK_NUMPAD0+'0':k))); }
+      else if(k==VK_BACK){ if(devHasSel()) devDeleteSel(); else if(g_devCaret>0){ g_devBuf.erase((size_t)g_devCaret-1,1); g_devCaret--; g_devSelA=-1; } }
+      else if(k==VK_DELETE){ if(devHasSel()) devDeleteSel(); else if(g_devCaret<n){ g_devBuf.erase((size_t)g_devCaret,1); g_devSelA=-1; } }
+      else if(k==VK_LEFT){ if(!shift&&devHasSel()){ int a,b; devSelRange(a,b); g_devCaret=a; g_devSelA=-1; } else move(g_devCaret-1); }
+      else if(k==VK_RIGHT){ if(!shift&&devHasSel()){ int a,b; devSelRange(a,b); g_devCaret=b; g_devSelA=-1; } else move(g_devCaret+1); }
+      else if(k==VK_HOME) move(0);
+      else if(k==VK_END) move(n);
+      else if(k==VK_RETURN||k==VK_TAB) devCommit();
+      else if(k==VK_ESCAPE){ g_devFocus=-1; g_devSelA=-1; }
+      invalidateGame(); return;
+   }   if(g_ov==OV_SETTINGS && g_ovCapture>=0){
       DWORD vk=(DWORD)k;
       if(vk==VK_SHIFT||vk==VK_CONTROL||vk==VK_MENU||vk==VK_LWIN||vk==VK_RWIN) return;      // a modifier alone is not a key
       if(vk==VK_ESCAPE){ g_ovCapture=-1; invalidateGame(); return; }

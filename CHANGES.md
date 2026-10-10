@@ -1,4 +1,4 @@
-﻿# Zmiany w silniku AI (przyspieszenie „myślenia”)
+# Zmiany w silniku AI (przyspieszenie „myślenia”)
 
 Pliki: src/game.h, src/main.cpp. Reszta bez zmian.
 
@@ -383,3 +383,57 @@ tryb Tylko król, seed 4): 2 wątki 1,30 -> 12 wątków 6,20 -> 3 wątki 1,91 ->
   pozostałe); kupka przesuwa się na rezerwę ruchem z przyspieszeniem i opóźnieniem (wygładzenie czwartego stopnia).
 - Fajerwerki: wybuch "pierścień" jest teraz kołem (był spłaszczoną elipsą); mniej więcej co trzeci fajerwerk gaśnie z
   rozbłyskiem - każda iskra w końcówce życia na chwilę wybłyskuje na biało i dopiero gaśnie.
+
+- Chwycona karta/sekwencja: miejsca, w które można ją przełożyć (kolumny i fundacje), są obrysowane zieloną ramką w miejscu lądowania, jak w Garibaldce.
+
+# Wersja 1.1.3: podpisy przyciskow, Solver w stylu gry, szybsze tornado i rozdanie
+- Pod przyciskami paska znów są podpisy (Nowa gra, Podpowiedź, Samograj, Solver, Cofnij, Ponów, Statystyki, Ustawienia);
+  pasek ma znów 94 px (Layout::TOOLBAR_H).
+- Okna Solvera (wybór rozdań, szukanie rozwiązań, pytanie "kontynuować?" z 10-sekundowym odliczaniem i wynik) są nakładkami
+  w oknie gry, w tym samym stylu co Ustawienia: lista z polami wyboru i paskiem przewijania (klik zaznacza, Shift - zakres,
+  Ctrl+A - wszystkie), pole ziarna wpisywane z klawiatury, suwak długości etapu, pole "przejdź do następnego", liczba wątków
+  przyciskami -/+ (zmiana działa od razu w trwającym etapie), paski postępu. Okna są modalne: pasek, menu i skróty
+  nie działają, dopóki Solver jest otwarty. Zamknięcie programu w trakcie szukania zatrzymuje wątki.
+- Tornado nowej partii o 30% szybsze, bez postoju kupki na środku: kupka od razu jedzie na miejsce rezerwy (całość ok. 2,9 s).
+- Rozdawanie na stół przy nowej partii: kolejny wiersz rusza, gdy poprzedni jest w połowie lotu (połowa czasu lotu
+  najdalszej karty wiersza).
+
+# Wersja 1.1.3: grupa Grafika, dźwięk tornada, prędkości animacji
+- Ustawienia: nowa grupa "Grafika" po "Ogólne" (kolor tła, zaznaczanie sekwencji, prędkość animacji, pole "Animacja nowego
+  rozdania" - domyślnie zaznaczone; odznaczone pomija animację nowej gry, rozdanie od razu leży na stole).
+- Prędkość animacji: "Bardzo wolno" (25%), "Wolno" (50%), "Normalnie" (100%), "Szybko" (200%), "Bardzo szybko" (400%).
+- Dźwięk tornada (res/sounds/tornado.wav, z dołączonego Tornado.mp3, pierwsze 3,4 s) odtwarzany przez animację zbierania
+  kart z narastaniem (0,6 s) i wyciszaniem (0,8 s) na jej końcu; pole wyboru "Dźwięk tornada" w grupie Dźwięki. Z listy
+  własnych dźwięków zniknął "Nowa gra" (jego miejsce zajął dźwięk tornada; nowa gra bez animacji zbierania jest bez dźwięku).
+- Dźwięk rozdania przy nowej partii gra raz na całe rozdanie, nie przy każdym wierszu; przerwa między wierszami 0,2 s
+  (skalowana prędkością animacji).
+
+# Wersja 1.1.3: grupa "Deweloper"
+- Ustawienia -> "Deweloper" pojawia się tylko wtedy, gdy obok gry leży plik Developer.PMa. Wszystkie jej wartości zapisują się
+  w dev.txt (Key=Value) i działają tylko w tym trybie.
+- Pola w milisekundach: czas całej animacji tornada, przyspieszanie na początku, opóźnianie na końcu (prędkość animacji rośnie
+  i maleje liniowo przez podany czas) oraz odstęp między wierszami rozdania.
+- Przyciski: rozdanie 1 wiersza z rezerwy (to prawdziwy ruch - można go cofnąć), rozdanie wszystkich wierszy i tornado
+  (podgląd na aktualnym stole, gra się nie zmienia), fajerwerki. Na czas animacji nakładka znika; klik lub klawisz przywraca ją.
+- Suwaki fajerwerków: odstęp między wystrzałami, liczba rakiet naraz, liczba i prędkość iskier, grawitacja, czas życia iskier,
+  jasność poświaty, szansa rozbłysku na końcu, czas trwania. Zmiany działają od razu także w trwających fajerwerkach.
+
+- Dźwięk tornada jest zapętlonym 6-sekundowym klipem (płynne połączenie końca z początkiem) i trwa tyle, ile animacja - także po zmianie jej czasu w ustawieniach dewelopera; narasta 0,6 s i cichnie 0,8 s na jej końcu.
+
+# Wersja 1.1.3: dopracowana grupa "Deweloper", fajerwerki z zakresami i dwoma etapami
+- Wartości domyślne (animacje i fajerwerki) przejęte z dev.txt: tornado 2500 ms, przyspieszanie 250 ms, opóźnianie 500 ms,
+  odstęp wierszy 150 ms; fajerwerki: odstęp 0,8, 5 rakiet, iskry 1,3, życie 1,2, jasność 0,8, rozbłysk 35%, 20 s.
+- Pola liczbowe: kursor tylko miga (tekst się nie przesuwa), zaznaczanie myszą / Shift+strzałki / Ctrl+A / dwuklik, Backspace
+  kasuje znak przed kursorem, Delete za kursorem, strzałki, Home/End, Ctrl+C/X/V.
+- Okno ustawień zostaje na ekranie podczas animacji i można je przesuwać za pasek tytułu; w grupie Deweloper nie przyciemnia
+  stołu i nie zamyka się kliknięciem obok.
+- "Fajerwerki" i "Rozdaj 1 wiersz" działają w pętli do ponownego wciśnięcia przycisku (fajerwerki startują od nowa; wiersz
+  jest rozdawany i cofany do rezerwy). Zamknięcie ustawień zatrzymuje pętle.
+- Suwaki fajerwerków z dwoma punktami (zakres min-maks: rakiety naraz, liczba i prędkość iskier, grawitacja, czas życia,
+  jasność); gra losuje wartość z zakresu dla każdego ognia. Odstęp, szansa rozbłysku, czas trwania i podział - jeden punkt.
+- Czas trwania fajerwerków ma dwa etapy: pierwsze 60% (suwak podziału 0-100%) - stała liczba rakiet i odstęp, potem
+  liczba wystrzałów maleje aż do pojedynczego fajerwerku na samym końcu. Dotyczy też fajerwerków po wygranej.
+
+- Numer układu, liczba ruchów i czas przeniesione z planszy na pasek przycisków, za ostatni przycisk (trzy wiersze); licznik Samograju jest dalej na prawo. Komunikaty (np. Brak możliwych ruchów) i Myślę zostają na planszy.
+
+- Nowe wartości domyślne z dev.txt: tornado 2500 ms (przyspieszanie 250, opóźnianie 500), odstęp wierszy 150 ms; fajerwerki: iskry 0,4-2,0, prędkość 0,9-1,2, życie 0,9-1,2, podział etapów 70%.

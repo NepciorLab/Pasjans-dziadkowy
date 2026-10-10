@@ -21,7 +21,7 @@ struct Layout {
 
    static constexpr float PNG_ASPECT = 224.f / 160.f;
    // 64px icon (Y=4) + 2px gap + 16px caption label + 8px bottom margin
-   static const int TOOLBAR_H  = 72;
+   static const int TOOLBAR_H  = 94;
    static const int MARGIN_BOT = 8;
    static const int MARGIN_SIDE= 8;
 

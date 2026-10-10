@@ -11,10 +11,11 @@
 #include <algorithm>
 #include <cmath>
 
-// Sound slot keys — 0..8 are the 9 actions the player can give an own sound (Settings → Dźwięki);
+// Sound slot keys — 1..8 are the 8 actions the player can give an own sound (Settings → Dźwięki); 0 is the whirlwind of the
+// new-game animation (a fixed sound, switched on/off with a checkbox);
 // 9..18 are the rocket whistles and the bangs of the fireworks (fixed, not shown in the settings)
 static const char* SOUND_KEYS[] = {
-   "nowa",    // 0 Nowa gra
+   "tornado",  // 0 Tornado (animacja nowej gry)
    "click",   // 1 Przełożenie karty
    "rozloz",  // 2 Rozdanie z rezerwy
    "sukces",  // 3 Wygrana
@@ -26,11 +27,11 @@ static const char* SOUND_KEYS[] = {
    "swist1", "swist2", "swist3", "swist4", "swist5",        // 9..13   whistles of the rockets
    "wybuch1", "wybuch2", "wybuch3", "wybuch4", "wybuch5",   // 14..18  bangs of the bursts
 };
-static const int SOUND_UI_COUNT = 9;     // slots shown in the settings window
+static const int SOUND_UI_FIRST = 1, SOUND_UI_COUNT = 9;     // slots shown in the settings window: SOUND_UI_FIRST .. SOUND_UI_COUNT-1
 static const int SOUND_COUNT = 19;
 static const int SOUND_WHISTLE0 = 9, SOUND_BANG0 = 14, SOUND_VARIANTS = 5;
 static const wchar_t* SOUND_LABELS[] = {
-   L"Nowa gra",
+   L"Tornado",
    L"Przełożenie karty",
    L"Rozdanie z rezerwy",
    L"Wygrana",
@@ -42,7 +43,7 @@ static const wchar_t* SOUND_LABELS[] = {
    L"", L"", L"", L"", L"", L"", L"", L"", L"", L"",
 };
 static const wchar_t* SOUND_DEFAULTS[] = {
-   L"nowa.wav",
+   L"tornado.wav",
    L"click.wav",
    L"rozloz.wav",
    L"sukces.wav",
@@ -261,6 +262,45 @@ public:
       }
    }
 
+   // Plays slot `idx` once, for `totalMs` at most: the volume rises over fadeInMs, falls over the last fadeOutMs and the
+   // sound is stopped at the end. cancelFaded() makes all of them end at once (with a short fade-out).
+   void playFaded(int idx, float volume, int totalMs, int fadeInMs, int fadeOutMs) {
+      if(idx < 0 || idx >= SOUND_COUNT || volume < 0.01f || !m_ds) return;
+      SoundSlot& s = m_slots[idx];
+      if(s.muted || !s.primary) return;
+      IDirectSoundBuffer* dup = nullptr;
+      if(FAILED(m_ds->DuplicateSoundBuffer(s.primary, &dup)) || !dup) return;
+      dup->SetVolume(DSBVOLUME_MIN);
+      dup->SetCurrentPosition(0);
+      dup->Play(0, 0, DSBPLAY_LOOPING);      // the clip is a seamless loop: it lasts as long as the animation does
+      struct FadeJob { IDirectSoundBuffer* b; float vol; int total, in, out; int gen; };
+      auto* job = new FadeJob{dup, volume, std::max(100, totalMs), std::max(1, fadeInMs), std::max(1, fadeOutMs), s_fadeGen.load()};
+      HANDLE h = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
+         auto* j = (FadeJob*)p;
+         const DWORD t0 = GetTickCount();
+         float gain = 0.f; bool cancelled = false; DWORD cancelAt = 0; float cancelGain = 0.f;
+         for(;;) {
+            const int el = (int)(GetTickCount() - t0);
+            if(!cancelled && s_fadeGen.load() != j->gen) { cancelled = true; cancelAt = GetTickCount(); cancelGain = gain; }
+            if(cancelled) {
+               float f = 1.f - (float)(GetTickCount() - cancelAt) / 150.f;
+               if(f <= 0.f) break;
+               gain = cancelGain * f;
+            } else {
+               if(el >= j->total) break;
+               gain = std::min(1.f, (float)el / (float)j->in) * std::min(1.f, (float)(j->total - el) / (float)j->out);
+            }
+            j->b->SetVolume(volFracToDs(j->vol * gain));
+            Sleep(15);
+         }
+         j->b->Stop(); j->b->Release();
+         delete j;
+         return 0;
+      }, job, 0, nullptr);
+      if(h) CloseHandle(h); else { dup->Stop(); dup->Release(); delete job; }
+   }
+   void cancelFaded() { s_fadeGen++; }
+
    void shutdown() {
       for(auto b : m_dups) b->Release();
       m_dups.clear();
@@ -360,6 +400,7 @@ private:
    SoundSystem() { InitializeCriticalSection(&m_mciLock); }
    SoundSystem(const SoundSystem&) = delete;
 
+   inline static std::atomic<int> s_fadeGen{0};
    HWND                m_hwnd = nullptr;
    IDirectSound8*      m_ds   = nullptr;
    std::wstring        m_exeDir;

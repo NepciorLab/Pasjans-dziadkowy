@@ -17,6 +17,17 @@ public:
    void start(int w,int h){ m_active=true; m_spawn=true; m_w=w; m_h=h; m_rockets.clear(); m_parts.clear(); m_flashes.clear(); m_events.clear(); m_time=0; m_acc=0; m_next=0.05f; }
    void stop(){ m_active=false; m_rockets.clear(); m_parts.clear(); m_flashes.clear(); m_events.clear(); }
    bool active() const { return m_active; }
+   // Tunable from the developer settings (all 1 / the defaults = the look of the released game)
+   // Every Range is drawn anew for each firework (a burst) from [lo,hi]; the single values are fixed.
+   struct Range{ float lo, hi; };
+   struct Params{
+      float launchGap=0.8f;                    // base gap between two launches (x of 0.45..1.35 s)
+      Range rockets{5.f,5.f}, sparks{0.4f,2.f}, speed{0.9f,1.2f}, gravity{1.f,1.f}, life{0.9f,1.2f}, glow{0.8f,0.8f};
+      float finale=0.35f;                      // chance that a burst dies out with a flash
+      float totalS=20.f;                       // the whole show (set by the game); the show shrinks to one rocket towards its end
+      float split=0.7f;                        // first `split` of totalS: steady number of rockets and gap, then fewer and fewer
+   };
+   Params P;
    void stopLaunching(){ m_spawn=false; }          // no new rockets; the ones in the air still burst
    size_t particles() const { return m_parts.size(); }
    // What the ears have to know: a rocket was launched (kind 0: it flies `flight` seconds, then bursts; x = 0..1 across the
@@ -98,9 +109,8 @@ private:
    bool m_active=false, m_spawn=true; int m_w=800,m_h=600,m_bw=0,m_bh=0; float m_time=0,m_acc=0,m_next=0;
    std::vector<float> m_acc3, m_b1, m_b2; std::vector<float> m_lut; int m_pal=0, m_burstNo=0; std::vector<float> m_hues;
    std::mt19937 m_rng{std::random_device{}()};
-   float m_finaleP=0.35f;                                                // chance that a burst dies out with a flash
 public:
-   void setFinaleChance(float p){ m_finaleP=p; }
+   void setFinaleChance(float p){ P.finale=p; }
 private:
    float rnd(){ return (float)(m_rng()%100000)/100000.f; }
    float scale() const { return std::min((float)m_w,(float)m_h*1.25f)/1000.f; }       // design: ~1000 px wide
@@ -165,6 +175,7 @@ private:
       h=h-std::floor(h); float c=v*s, x=c*(1.f-std::fabs(std::fmod(h*6.f,2.f)-1.f)), m=v-c; int i=(int)(h*6.f)%6;
       float R[6]={c,x,0,0,x,c}, G[6]={x,c,c,x,0,0}, B[6]={0,0,x,c,c,x}; r=R[i]+m; g=G[i]+m; b=B[i]+m;
    }
+   float rr(const Range& r){ return r.lo+(r.hi-r.lo)*rnd(); }
    void spawnRocket(){
       Rocket r; r.x=m_w*(0.12f+0.76f*rnd()); r.y=(float)m_h; r.ty=m_h*(0.10f+0.38f*rnd());
       r.T=0.85f+0.5f*rnd(); r.t=0.f; float dist=r.y-r.ty; r.vy=-2.f*dist/r.T; r.ay=-r.vy/r.T;
@@ -181,9 +192,10 @@ private:
       if(m_hues.empty()){ m_hues={0.90f,0.50f,0.13f,0.76f,0.33f,0.02f,0.60f,0.95f,0.42f}; std::shuffle(m_hues.begin(),m_hues.end(),m_rng); }
       float hue=m_hues.back(); m_hues.pop_back(); float var=0.03f+0.12f*rnd();
       float fr,fg,fb; hsv(hue,0.55f+0.4f*rnd(),1.f,fr,fg,fb); 
-      m_flashes.push_back({x,y,0.f,0.45f,fr*0.6f+0.4f,fg*0.6f+0.4f,fb*0.6f+0.4f});
-      const bool finale=rnd()<m_finaleP;                                                                    // this one dies out with a flash
-      int N=(type==1)?420:(type==3?520:600+(int)(rnd()*300));
+      const float kSparks=rr(P.sparks), kSpeed=rr(P.speed), kGrav=rr(P.gravity), kLife=rr(P.life), kGlow=rr(P.glow);   // drawn for this firework                                                                    // this one dies out with a flash
+      m_flashes.push_back({x,y,0.f,0.45f,(fr*0.6f+0.4f)*kGlow,(fg*0.6f+0.4f)*kGlow,(fb*0.6f+0.4f)*kGlow});
+      const bool finale=rnd()<P.finale;
+      int N=(int)(((type==1)?420:(type==3?520:600+(int)(rnd()*300)))*kSparks);
       for(int i=0;i<N;i++){
          Part p; p.x=x; p.y=y; p.glitter=false; p.tw=rnd(); p.hn=0; p.hmax=11; p.flareAt=finale?0.72f+0.22f*rnd():2.f;
          float a=rnd()*6.2831853f, v;
@@ -205,21 +217,30 @@ private:
             bool inner=i<N*0.45f; v=(inner?(120.f+210.f*rnd()):(280.f+380.f*rnd()))*k; p.vx=std::cos(a)*v; p.vy=std::sin(a)*v;
             if(inner) hsv(hue+0.5f,0.7f,1.f,p.r,p.g,p.b);
          }
+         p.vx*=kSpeed; p.vy*=kSpeed; p.grav*=kGrav; p.maxLife*=kLife; p.bright*=kGlow;
          m_parts.push_back(p);
       }
       // glitter: dim sparks that drift down and twinkle for a long time
       m_events.push_back({1,0.f,x/(float)std::max(1,m_w),(float)N});
-      int G=120+(int)(rnd()*120);
+      int G=(int)((120+(int)(rnd()*120))*kSparks);
       for(int i=0;i<G;i++){
          Part p; p.x=x; p.y=y; p.glitter=true; p.tw=rnd(); p.hn=0; p.hmax=1; p.flareAt=finale?0.72f+0.22f*rnd():2.f;
          float a=rnd()*6.2831853f, v=(60.f+300.f*rnd())*k; p.vx=std::cos(a)*v; p.vy=std::sin(a)*v; p.maxLife=2.6f+rnd()*2.4f;
          p.drag=0.93f+0.02f*rnd(); p.grav=(25.f+25.f*rnd())*k; p.bright=0.5f+0.5f*rnd(); hsv(hue+(rnd()-0.5f)*0.2f,0.25f+0.4f*rnd(),1.f,p.r,p.g,p.b);
+         p.vx*=kSpeed; p.vy*=kSpeed; p.grav*=kGrav; p.maxLife*=kLife; p.bright*=kGlow;
          m_parts.push_back(p);
       }
    }
    void step(){
       m_time+=STEP;
-      if(m_active&&m_spawn){ m_next-=STEP; if(m_next<=0.f && m_rockets.size()<3){ spawnRocket(); m_next=0.45f+0.9f*rnd(); } }
+      if(m_active&&m_spawn){ m_next-=STEP; if(m_next<=0.f){
+            // two stages: a steady number of rockets, and from `split` of the show on fewer and fewer, down to a single one at the end
+            const float T=std::max(1.f,P.totalS), s0=P.split*T;
+            const float f= m_time<=s0 ? 1.f : std::max(0.f,1.f-(m_time-s0)/std::max(0.01f,T-s0));
+            const float lim=std::max(1.f,std::round(rr(P.rockets)*f));
+            if((float)m_rockets.size()<lim){ spawnRocket(); m_next=(0.45f+0.9f*rnd())*P.launchGap/std::max(0.25f,f); }
+            else m_next=0.05f;                           // all slots busy: look again shortly
+         } }
       for(Rocket& r:m_rockets){
          r.t+=STEP; r.vy+=r.ay*STEP; r.x+=r.vx*STEP; r.y+=r.vy*STEP;
          if(r.hn<19) r.hn++; for(int i=r.hn-1;i>0;i--){ r.hx[i]=r.hx[i-1]; r.hy[i]=r.hy[i-1]; } r.hx[0]=r.x; r.hy[0]=r.y;

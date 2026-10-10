@@ -33,7 +33,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.1.2";
+static const wchar_t* APP_VERSION = L"1.1.3";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -71,6 +71,18 @@ static const DWORD CARD_ANIM_PAUSE_MS   = 500;  // hint: pause at dest before va
 // of the duration). Steps compound multiplicatively, so -2/+2 are a further
 // 50% on top of -1/+1, not simply double the single-step change.
 static int   g_animSpeedStep = 0;
+static bool  g_newDealAnim  = true;   // Settings -> Grafika: the animation of a new game (gathering the old cards, dealing the new ones)
+static bool  g_tornadoSound = true;   // Settings -> Dźwięki: the whirlwind sound during that animation
+// Settings -> Deweloper (only when Developer.PMa lies next to the game; saved in dev.txt)
+struct DevParams{ int tornadoMs=2500, accelMs=250, decelMs=500, rowGapMs=150; };   // the defaults: the values tuned with these settings
+static DevParams g_dev;
+static bool  g_devMode    = false;
+static bool  g_devFwLoop  = false;     // the fireworks started from the developer settings start over until the button is pressed again
+static bool  g_devRowLoop = false;     // the row deal started from there: deal, take back, deal ... until the button is pressed again
+static int   g_devRowState= 0;         // 0 = next: deal the row, 1 = next: take it back
+static bool  g_devRowWait = false;     // an animation of the loop is running
+static DWORD g_devRowAt   = 0;         // when the loop may go on
+static bool  g_ngPreview  = false;     // the animation runs on the table as it is, the game itself is not touched
 static float g_animDurationMul = 1.0f; // derived from g_animSpeedStep — multiplies every animation's base duration
 static void applyAnimSpeedStep(int step){
    if(step<-2) step=-2; if(step>2) step=2;
@@ -78,18 +90,18 @@ static void applyAnimSpeedStep(int step){
    switch(step){
       case -2: g_animDurationMul=4.0f;      break; // speed x0.25
       case -1: g_animDurationMul=2.0f;      break; // speed x0.5
-      case  1: g_animDurationMul=1.f/1.5f;  break; // speed x1.5
-      case  2: g_animDurationMul=1.f/2.25f; break; // speed x2.25 (1.5 x1.5)
+      case  1: g_animDurationMul=0.5f;      break; // speed x2
+      case  2: g_animDurationMul=0.25f;     break; // speed x4
       default: g_animDurationMul=1.0f;      break; // step 0: unchanged
    }
 }
 static std::wstring animSpeedLabel(int step){
    switch(step){
-      case -2: return L"Wolniej (x0,25)";
-      case -1: return L"Wolniej (x0,5)";
-      case  1: return L"Szybciej (x1,5)";
-      case  2: return L"Szybciej (x2,25)";
-      default: return L"Normalna";
+      case -2: return L"Bardzo wolno";     // 25%
+      case -1: return L"Wolno";            // 50%
+      case  1: return L"Szybko";           // 200%
+      case  2: return L"Bardzo szybko";    // 400%
+      default: return L"Normalnie";        // 100%
    }
 }
 
@@ -226,8 +238,11 @@ static int   g_ngPhase=0;           // 0 = off, 1 = old cards gathering, 2 = dea
 static DWORD g_ngT0=0, g_ngNextRowAt=0;
 static int   g_ngRow=0, g_ngNotLaunched=0;
 static DWORD g_ngLand[NUM_COLS][NUM_COLS];   // phase 2: when card `row` of column `col` has landed (0xFFFFFFFF = not launched yet)
-static const DWORD NG_GATHER_MS=4000;
-static const float NG_HOLD_S=2.9f, NG_SLIDE_S=3.3f;   // all cards in the pile from here / the pile starts to slide to the reserve
+// The whole gathering phase lasts g_dev.tornadoMs. Its "timetable" runs from 0 to NG_VIRT_END seconds (the swirl until NG_HOLD_S,
+// then the slide of the pile): ngWarp() turns real time into timetable time, with an acceleration at the start and a
+// deceleration at the end (g_dev.accelMs / decelMs; 0 = steady).
+static const float NG_VIRT_END=2.9f+0.7f*1.3f;
+static const float NG_HOLD_S=2.9f;   // (timetable seconds) all cards are in the pile from here; the pile slides to the reserve right away
 static const int  DRAG_THR=5;
 
 // ============================================================================
@@ -386,7 +401,7 @@ static ID2D1Bitmap*   g_fwBmp=nullptr;
 static int            g_fwBw=0, g_fwBh=0;
 static double         g_fwLast=0;
 static DWORD          g_fwStart=0;           // timeGetTime() when the fireworks began
-static const float    FW_TOTAL_S=20.f;       // the fireworks are switched off after this long (no new rockets from FW_TOTAL_S-2.5)            // seconds (timeGetTime) of the last g_fw.update()
+static float          g_fwTotalS=20.f;       // the fireworks are switched off after this long (no new rockets for the last 2.5 s)
 static MoveHint       g_hint;
 static bool           g_hintActive  = false;
 static bool           g_hintBlinking= false;   // true during blink animation
@@ -1036,6 +1051,59 @@ static void playRandomWinningNumber(HWND hwnd){
    g_statsExcluded=true;
 }
 
+// ── Developer settings (dev.txt, next to the game) ───────────────────────────
+// The "Deweloper" group of the settings exists only when a file Developer.PMa lies in the game folder; its values are kept
+// in dev.txt (Key=Value lines) and applied only in that case.
+static bool devFileExists(){ return GetFileAttributesW(exeDirFile(L"Developer.PMa").c_str())!=INVALID_FILE_ATTRIBUTES; }
+static void devSave(){
+   FILE* f=nullptr; _wfopen_s(&f,exeDirFile(L"dev.txt").c_str(),L"wb");
+   if(!f) return;
+   const Fireworks2::Params& P=g_fw.P;
+   fprintf(f,"TornadoMs=%d\r\nAccelMs=%d\r\nDecelMs=%d\r\nRowGapMs=%d\r\n",g_dev.tornadoMs,g_dev.accelMs,g_dev.decelMs,g_dev.rowGapMs);
+   fprintf(f,"FwLaunchGap=%.3f\r\n",P.launchGap);
+   fprintf(f,"FwRocketsMin=%.0f\r\nFwRocketsMax=%.0f\r\nFwSparksMin=%.3f\r\nFwSparksMax=%.3f\r\nFwSpeedMin=%.3f\r\nFwSpeedMax=%.3f\r\n",
+      P.rockets.lo,P.rockets.hi,P.sparks.lo,P.sparks.hi,P.speed.lo,P.speed.hi);
+   fprintf(f,"FwGravityMin=%.3f\r\nFwGravityMax=%.3f\r\nFwLifeMin=%.3f\r\nFwLifeMax=%.3f\r\nFwGlowMin=%.3f\r\nFwGlowMax=%.3f\r\n",
+      P.gravity.lo,P.gravity.hi,P.life.lo,P.life.hi,P.glow.lo,P.glow.hi);
+   fprintf(f,"FwFinale=%.3f\r\nFwTotalS=%.1f\r\nFwSplit=%.3f\r\n",P.finale,g_fwTotalS,P.split);
+   fclose(f);
+}
+static void devLoad(){
+   FILE* f=nullptr; _wfopen_s(&f,exeDirFile(L"dev.txt").c_str(),L"rb");
+   if(!f) return;
+   char line[128];
+   while(fgets(line,128,f)){
+      char* eq=strchr(line,'='); if(!eq) continue; *eq=0; const char* k=line; double v=atof(eq+1);
+      Fireworks2::Params& P=g_fw.P;
+      if(!strcmp(k,"TornadoMs")) g_dev.tornadoMs=(int)v;
+      else if(!strcmp(k,"AccelMs")) g_dev.accelMs=(int)v;
+      else if(!strcmp(k,"DecelMs")) g_dev.decelMs=(int)v;
+      else if(!strcmp(k,"RowGapMs")) g_dev.rowGapMs=(int)v;
+      else if(!strcmp(k,"FwLaunchGap")) P.launchGap=(float)v;
+      else if(!strcmp(k,"FwRockets")) P.rockets.lo=P.rockets.hi=(float)v;          // the old single values
+      else if(!strcmp(k,"FwSparks")) P.sparks.lo=P.sparks.hi=(float)v;
+      else if(!strcmp(k,"FwSpeed")) P.speed.lo=P.speed.hi=(float)v;
+      else if(!strcmp(k,"FwGravity")) P.gravity.lo=P.gravity.hi=(float)v;
+      else if(!strcmp(k,"FwLife")) P.life.lo=P.life.hi=(float)v;
+      else if(!strcmp(k,"FwGlow")) P.glow.lo=P.glow.hi=(float)v;
+      else if(!strcmp(k,"FwRocketsMin")) P.rockets.lo=(float)v; else if(!strcmp(k,"FwRocketsMax")) P.rockets.hi=(float)v;
+      else if(!strcmp(k,"FwSparksMin")) P.sparks.lo=(float)v;   else if(!strcmp(k,"FwSparksMax")) P.sparks.hi=(float)v;
+      else if(!strcmp(k,"FwSpeedMin")) P.speed.lo=(float)v;     else if(!strcmp(k,"FwSpeedMax")) P.speed.hi=(float)v;
+      else if(!strcmp(k,"FwGravityMin")) P.gravity.lo=(float)v; else if(!strcmp(k,"FwGravityMax")) P.gravity.hi=(float)v;
+      else if(!strcmp(k,"FwLifeMin")) P.life.lo=(float)v;       else if(!strcmp(k,"FwLifeMax")) P.life.hi=(float)v;
+      else if(!strcmp(k,"FwGlowMin")) P.glow.lo=(float)v;       else if(!strcmp(k,"FwGlowMax")) P.glow.hi=(float)v;
+      else if(!strcmp(k,"FwSplit")) P.split=(float)v;
+      else if(!strcmp(k,"FwFinale")) P.finale=(float)v;
+      else if(!strcmp(k,"FwTotalS")) g_fwTotalS=(float)v;
+   }
+   fclose(f);
+   g_dev.tornadoMs=std::max(200,std::min(20000,g_dev.tornadoMs)); g_dev.accelMs=std::max(0,std::min(10000,g_dev.accelMs));
+   g_dev.decelMs=std::max(0,std::min(10000,g_dev.decelMs)); g_dev.rowGapMs=std::max(0,std::min(3000,g_dev.rowGapMs));
+   g_fwTotalS=std::max(5.f,std::min(60.f,g_fwTotalS));
+   g_fw.P.split=std::max(0.f,std::min(1.f,g_fw.P.split));
+   for(Fireworks2::Range* r:{&g_fw.P.rockets,&g_fw.P.sparks,&g_fw.P.speed,&g_fw.P.gravity,&g_fw.P.life,&g_fw.P.glow}) if(r->lo>r->hi) std::swap(r->lo,r->hi);
+}
+
 static void saveSettings(){
    std::wstring ini=getIniPath();
    wchar_t buf[64];
@@ -1054,6 +1122,8 @@ static void saveSettings(){
    wsprintfW(buf,L"%d",g_animSpeedStep);
    WritePrivateProfileStringW(L"Settings",L"AnimSpeedStep",buf,ini.c_str());
    WritePrivateProfileStringW(L"Settings",L"CheckUpdatesOnStart",g_checkUpdatesOnStart?L"1":L"0",ini.c_str());
+   WritePrivateProfileStringW(L"Settings",L"NewDealAnim",g_newDealAnim?L"1":L"0",ini.c_str());
+   WritePrivateProfileStringW(L"Settings",L"TornadoSound",g_tornadoSound?L"1":L"0",ini.c_str());
    // Save move label position (only if user has manually placed it)
    if(g_moveLabelCustom){
       wsprintfW(buf,L"%.1f,%.1f",g_moveLabelX,g_moveLabelY);
@@ -1062,7 +1132,7 @@ static void saveSettings(){
       WritePrivateProfileStringW(L"Settings",L"MoveLabelPos",L"",ini.c_str());
    }
    // Save custom sound paths / mute flags
-   for(int i=0;i<SOUND_UI_COUNT;i++){
+   for(int i=SOUND_UI_FIRST;i<SOUND_UI_COUNT;i++){
       const std::wstring& p=SoundSystem::instance().customPath(i);
       std::wstring key=std::wstring(L"Sound_")+std::to_wstring(i);
       WritePrivateProfileStringW(L"Sounds",key.c_str(),p.c_str(),ini.c_str());
@@ -1102,6 +1172,9 @@ static void loadSettings(){
    if(g_moveHighlightMode<0||g_moveHighlightMode>2) g_moveHighlightMode=0;
    applyAnimSpeedStep((int)GetPrivateProfileIntW(L"Settings",L"AnimSpeedStep",0,ini.c_str()));
    g_checkUpdatesOnStart=(GetPrivateProfileIntW(L"Settings",L"CheckUpdatesOnStart",1,ini.c_str())!=0);
+   g_devMode=devFileExists(); if(g_devMode) devLoad();
+   g_newDealAnim=(GetPrivateProfileIntW(L"Settings",L"NewDealAnim",1,ini.c_str())!=0);
+   g_tornadoSound=(GetPrivateProfileIntW(L"Settings",L"TornadoSound",1,ini.c_str())!=0);
    // Load move label position
    wchar_t posBuf[64]={};
    GetPrivateProfileStringW(L"Settings",L"MoveLabelPos",L"",posBuf,64,ini.c_str());
@@ -1112,7 +1185,7 @@ static void loadSettings(){
       }
    }
    // Load custom sound paths / mute flags
-   for(int i=0;i<SOUND_UI_COUNT;i++){
+   for(int i=SOUND_UI_FIRST;i<SOUND_UI_COUNT;i++){
       std::wstring key=std::wstring(L"Sound_")+std::to_wstring(i);
       wchar_t spath[MAX_PATH]={};
       GetPrivateProfileStringW(L"Sounds",key.c_str(),L"",spath,MAX_PATH,ini.c_str());
@@ -1797,6 +1870,19 @@ static int reserveTopDeck(){
 // of its own random motion - end up face-down in one pile in the middle of the table, and the
 // pile slides to the reserve's place. All of it takes NG_GATHER_MS.
 // Phase 2: the new deal is dealt out of the reserve row by row, like a reserve deal (ngLaunchRow).
+// real seconds since the phase began -> timetable seconds (trapezoidal speed: rises over accelMs, falls over decelMs)
+static float ngWarp(float tr){
+   const float T=std::max(0.2f,(float)g_dev.tornadoMs/1000.f);
+   float A=std::max(0.f,(float)g_dev.accelMs/1000.f), D=std::max(0.f,(float)g_dev.decelMs/1000.f);
+   if(A+D>T){ float k=T/(A+D); A*=k; D*=k; }
+   tr=std::max(0.f,std::min(T,tr));
+   float f;                                                  // distance covered at speed 1 at the top
+   if(A>0.f&&tr<A) f=tr*tr/(2.f*A);
+   else if(D>0.f&&tr>T-D){ float r=T-tr; f=A*0.5f+(T-D-A)+(D-r*r/(2.f*D)); }
+   else f=A*0.5f+(tr-A);
+   const float total=T-(A+D)*0.5f;
+   return NG_VIRT_END*f/std::max(1e-4f,total);
+}
 static float ngSmooth(float u){ u=std::max(0.f,std::min(1.f,u)); return u*u*(3.f-2.f*u); }
 void onStateChanged();
 
@@ -1850,7 +1936,8 @@ static bool ngSnapshot(){
 // Draws the gathering phase (nothing when it's not running). t = seconds since the phase began.
 static void ngDrawGather(float W,float H){
    if(g_ngPhase!=1) return;
-   const float t=(float)(timeGetTime()-g_ngT0)/1000.f;
+   const float tr=(float)(timeGetTime()-g_ngT0)/1000.f;      // real seconds
+   const float t=ngWarp(tr);                                // seconds of the timetable
    const float cw=(float)g_layout.cardW, ch=(float)g_layout.cardH;
    const float cx=W*0.5f, cy=H*0.5f;                       // the pile
    const float PI=3.14159265f;
@@ -1859,7 +1946,7 @@ static void ngDrawGather(float W,float H){
       // all cards lie in one pile: a single back stands for it; later it slides to the reserve
       const POINT rp=g_layout.reservePos();
       const float rx=(float)rp.x, ry=(float)rp.y-(float)Layout::TOOLBAR_H;
-      float s=ngSmooth((t-NG_SLIDE_S)/(NG_GATHER_MS/1000.f-NG_SLIDE_S));
+      float s=ngSmooth((t-NG_HOLD_S)/(NG_VIRT_END-NG_HOLD_S));
       s=s<0.5f? 8.f*s*s*s*s : 1.f-8.f*(1.f-s)*(1.f-s)*(1.f-s)*(1.f-s);   // slow start, fast middle, slow stop (quartic ease-in-out)
       float px=cx-cw/2+(rx-(cx-cw/2))*s, py=cy-ch/2+(ry-(cy-ch/2))*s;
       g_renderer.drawBack(px,py,topDeck);
@@ -1888,8 +1975,25 @@ static void ngDrawGather(float W,float H){
 
 #include "overlay.h"
 
+// The deal number, the number of moves and the clock: three lines on the toolbar, after the last button (STATIC controls).
+static HWND g_hStat[3]={nullptr,nullptr,nullptr};
+static void updateStatusUI(){
+   if(!g_hStat[0]) return;
+   wchar_t b0[48]={}, b1[48], b2[24];
+   if(g_currentGameNumber>=0) swprintf(b0,48,L"Układ #%lld",g_currentGameNumber);
+   swprintf(b1,48,L"Ruchy: %d",g_moveCount);
+   { int s=g_gameSeconds, hh=s/3600, mm=(s%3600)/60, ss=s%60;
+     if(hh>0) swprintf(b2,24,L"%d:%02d:%02d",hh,mm,ss); else swprintf(b2,24,L"%02d:%02d",mm,ss); }
+   const wchar_t* t[3]={b0,b1,b2};
+   for(int i=0;i<3;i++){
+      wchar_t cur[48]={}; GetWindowTextW(g_hStat[i],cur,48);
+      if(wcscmp(cur,t[i])!=0) SetWindowTextW(g_hStat[i],t[i]);
+   }
+}
+
 static void drawScene(){
    if(!g_d2dRT)return;
+   updateStatusUI();
    float fw=g_d2dRT->GetSize().width,fh=g_d2dRT->GetSize().height;int w=(int)fw,h=(int)fh;
    // Child window Y=0 corresponds to main window Y=TOOLBAR_H
    const float OY=(float)Layout::TOOLBAR_H;
@@ -1906,14 +2010,15 @@ static void drawScene(){
       bool hSrc=hintOn&&g_hint.valid&&showSrc&&g_hint.fromType==LOC_FOUNDATION&&g_hint.fromIdx==i;
       bool hDst=hintOn&&g_hint.valid&&showDst&&g_hint.toType==LOC_FOUNDATION&&g_hint.toIdx==i;
       bool hideTop=(g_hideDstFound==i&&!g_game.found[i].empty());
-      if(g_game.found[i].empty()||hideTop){
-         if(hideTop&&g_game.found[i].size()>1)g_renderer.drawCard(fx,fy,g_game.found[i][g_game.found[i].size()-2],false,false);
+      const bool ngHideF=(g_ngPhase==1);
+      if(g_game.found[i].empty()||hideTop||ngHideF){
+         if(hideTop&&!ngHideF&&g_game.found[i].size()>1)g_renderer.drawCard(fx,fy,g_game.found[i][g_game.found[i].size()-2],false,false);
          else g_renderer.drawEmptyFound(fx,fy,i);
       }else g_renderer.drawCard(fx,fy,g_game.found[i].back(),hSrc||hDst,false);
       if(hSrc||hDst)g_renderer.drawHighlight(fx,fy);}
    POINT rp=g_layout.reservePos();float rx=(float)rp.x,ry=(float)rp.y-OY;
    bool hRes=(g_hintActive||(g_hintBlinking&&g_hintShowSrc))&&g_hint.valid&&g_hint.fromIdx==-1&&!g_game.reserve.empty();
-   if(!g_game.reserve.empty()&&g_ngPhase!=1){g_renderer.drawBack(rx,ry,reserveTopDeck());g_renderer.drawReserveCount(rx,ry,(float)g_layout.cardW,(float)g_layout.cardH,std::to_wstring(g_game.reserve.size()+(g_ngPhase==2?(size_t)g_ngNotLaunched:0)));}
+   if(!g_game.reserve.empty()&&g_ngPhase!=1){g_renderer.drawBack(rx,ry,reserveTopDeck());g_renderer.drawReserveCount(rx,ry,(float)g_layout.cardW,(float)g_layout.cardH,std::to_wstring(g_game.reserve.size()+((g_ngPhase==2&&!g_ngPreview)?(size_t)g_ngNotLaunched:0)));}
    if(hRes)g_renderer.drawHighlight(rx,ry);
    // White-pulse hint overlay on reserve card
    if(g_reservePulsing && g_reservePulseAlpha>0.f && !g_game.reserve.empty())
@@ -1981,6 +2086,24 @@ static void drawScene(){
    }
    if(g_dealing){const PopIn* cur=g_deal.current();if(cur){int cx=g_layout.colPos(cur->col).x,cy=colCardY(cur->col,cur->cardIdx);float sc=cur->scale(),cw=(float)g_layout.cardW*sc,ch=(float)g_layout.cardH*sc;ID2D1Bitmap* bmp=GetCardD2D(cur->card.imgKey(),g_d2dRT);if(bmp)g_d2dRT->DrawBitmap(bmp,D2D1::RectF((float)cx+(g_layout.cardW-cw)/2.f,(float)cy+(g_layout.cardH-ch)/2.f-OY,(float)cx+(g_layout.cardW+cw)/2.f,(float)cy+(g_layout.cardH+ch)/2.f-OY));}}
    if(g_drag.active&&!g_drag.cards.empty()){int bx=g_drag.mx-g_drag.offX,by=g_drag.my-g_drag.offY;float dov=(g_drag.fromCol>=0)?g_colDispOv[g_drag.fromCol]:g_colDispOv[0];for(int i=0;i<(int)g_drag.cards.size();i++)g_renderer.drawCard((float)bx,(float)by+i*dov-OY,g_drag.cards[i],true,false);}
+   // Places a grabbed card/sequence can be put on: a green frame where it would land (as in Garibaldka)
+   if(g_drag.active&&g_drag.moved&&!g_drag.cards.empty()){
+      auto ring=[&](float x,float y){
+         float r=(float)g_layout.cornerR+3.f; ID2D1SolidColorBrush* br=nullptr;
+         g_d2dRT->CreateSolidColorBrush(D2D1::ColorF(0.45f,1.f,0.6f,0.9f),&br);
+         if(br){ g_d2dRT->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x-3.f,y-3.f,x+(float)g_layout.cardW+3.f,y+(float)g_layout.cardH+3.f),r,r),br,3.f); br->Release(); }
+      };
+      const Card& head=g_drag.cards[0];
+      if(g_drag.cards.size()==1)
+         for(int i=0;i<NUM_FOUND;i++) if(g_game.canDropOnFound(head,i)){ POINT fp=g_layout.foundPos(i); ring((float)fp.x,(float)fp.y-OY); }
+      for(int col=0;col<NUM_COLS;col++){
+         if(col==g_drag.fromCol&&g_drag.fromFound<0) continue;
+         if(!g_game.canDropOnCol(head,col)) continue;
+         POINT cp=g_layout.colPos(col); int n=(int)g_game.cols[col].size(); float ly=(float)cp.y;
+         if(n>0){ ColOverlapInfo oi=calcColOverlap(col,avH); ly=colCardYExact(col,n-1,oi)+std::max(12.f,n>=oi.seqStart?oi.seqOv:oi.topOv); }
+         ring((float)cp.x,std::min(ly,(float)g_layout.panelH-(float)g_layout.cardH-2.f)-OY);
+      }
+   }
    for(auto& a:g_cardAnims){if(a.done()||timeGetTime()<a.startTime)continue;float cx=a.cx(),cy=a.cy()-OY,ov=a.renderOv();
       if(a.dealFlip&&a.cards.size()==1){
          // Lift (+30% at mid-flight, back to 100% on landing) and turn over: face-down
@@ -2002,7 +2125,7 @@ static void drawScene(){
    ngDrawGather(fw,fh);    // new-game animation: the old cards in the whirlwind (no-op otherwise)
    if(g_fw.active()){      // the table is dimmed by half while the fireworks are on (fades in and out)
       float el=(float)(timeGetTime()-g_fwStart)/1000.f;
-      float k=std::min(1.f,el/0.6f)*std::min(1.f,(FW_TOTAL_S-el)/1.f);
+      float k=std::min(1.f,el/0.6f)*std::min(1.f,(g_fwTotalS-el)/1.f);
       if(k>0.f){ ID2D1SolidColorBrush* brD=nullptr; g_d2dRT->CreateSolidColorBrush(D2D1::ColorF(0.f,0.f,0.f,0.5f*k),&brD);
          if(brD){ g_d2dRT->FillRectangle(D2D1::RectF(0,0,fw,fh),brD); brD->Release(); } }
    }
@@ -2043,9 +2166,8 @@ static void drawScene(){
    }
    g_renderer.drawStatusText(g_status,(float)w,g_won,g_noMoves,g_moveCount,g_gameSeconds,
                               g_thinking,thinkAlpha,
-                              mlx,mly,g_currentGameNumber,&moveLabelRect);
-   // Store for hit-testing (mouse drag)
-   g_moveLabelDrawnRect=moveLabelRect;
+                              mlx,mly,g_currentGameNumber,&moveLabelRect,false);   // false: the counters live on the toolbar now
+   g_moveLabelDrawnRect={-1.f,-1.f,-1.f,-1.f};                                   // (the label can no longer be dragged)
    overlaysDraw(fw,fh);   // Settings / Statistics / Help, on top of everything (no-op when none is open)
 }
 
@@ -2356,7 +2478,8 @@ void startDealAnim(bool gather=false){
 void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
    // The cards of the game being replaced fly into a whirlwind first (see ngSnapshot()) — the
    // picture of the old table has to be taken before anything below touches the game.
-   const bool gather=ngSnapshot();
+   SoundSystem::instance().cancelFaded();    // the whirlwind sound of a game that is being replaced
+   const bool gather=g_newDealAnim && ngSnapshot();
    g_ngPhase=0;
    // Credit the OUTCOME of the deal being replaced — but only now, as it
    // actually starts being replaced, not back when win/no-moves was first
@@ -2457,11 +2580,15 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
    snapColOverlaps();    // snap immediately — no animation at game start
    g_smoothActive=false;
    g_gameReady=true;
-   if(!silent) playSound("nowa",g_volume);
    startDealAnim(gather);
    SetTimer(g_hwnd,TIMER_SECOND,250,nullptr); // 250ms for smooth display
    invalidateBestMoveCache();
    invalidateGame();
+   if(g_ngPhase==0){                // no animation: the deal lies on the table at once
+      g_dealing=false;
+      g_gameStartTick=timeGetTime(); g_gameSeconds=0;
+      onStateChanged();
+   }
 }
 
 void newGameRetry(){ newGame(true); }
@@ -2737,15 +2864,17 @@ void doDeal(){
 
 // ── New-game animation: dealing out of the reserve, row by row ──────────────────
 static void ngStart(bool gather){
+   if(!g_newDealAnim){ g_ngPhase=0; g_ngCards.clear(); g_dealing=false; return; }
    for(int c=0;c<NUM_COLS;c++) for(int r=0;r<NUM_COLS;r++) g_ngLand[c][r]=0xFFFFFFFFu;
    g_ngNotLaunched=0; for(int c=0;c<NUM_COLS;c++) g_ngNotLaunched+=std::min((int)g_game.cols[c].size(),NUM_COLS);
    g_ngRow=0; g_dealing=true;
    g_ngT0=timeGetTime(); g_ngNextRowAt=g_ngT0;
    g_ngPhase=gather?1:2;
    if(!gather) g_ngCards.clear();
+   else if(g_tornadoSound && !g_samogranoMarathon)      // the whirlwind: fades in, fades out at the end of the gathering
+      SoundSystem::instance().playFaded(0,g_volume,std::max(200,g_dev.tornadoMs),600,800);
 }
-static const float NG_ROW_GAP_S=0.30f;     // seconds between two rows leaving the reserve (scaled by the animation speed)
-static void ngLaunchRow(int row){
+static DWORD ngLaunchRow(int row){      // returns how long the longest flight of the row lasts (ms)
    POINT rp=g_layout.reservePos(); float srcX=(float)rp.x, srcY=(float)rp.y;
    const size_t before=g_cardAnims.size();
    const DWORD now=timeGetTime();
@@ -2763,33 +2892,92 @@ static void ngLaunchRow(int row){
       g_cardAnims.push_back(a); g_animating=true;
       g_ngNotLaunched--; idx++;
    }
-   if(g_cardAnims.size()==before) return;
+   if(g_cardAnims.size()==before) return 0;
    retimeDealFlights(before,now);
+   DWORD longest=0; for(size_t i=before;i<g_cardAnims.size();i++) longest=std::max(longest,g_cardAnims[i].duration());
    for(size_t i=before;i<g_cardAnims.size();i++){
       const CardAnim& a=g_cardAnims[i];
       for(int col=0;col<NUM_COLS;col++)
          if(std::abs(a.ex-(float)g_layout.colPos(col).x)<4.f && row<(int)g_game.cols[col].size()){ g_ngLand[col][row]=a.startTime+a.duration(); break; }
    }
-   playSound("rozloz",g_volume);
+   return longest;
 }
 static void ngTick(){
    if(!g_ngPhase) return;
    DWORD now=timeGetTime();
    if(g_ngPhase==1){
-      if(now-g_ngT0<NG_GATHER_MS){ invalidateGame(); UpdateWindow(g_gameHwnd?g_gameHwnd:g_hwnd); return; }
+      if(now-g_ngT0<(DWORD)std::max(200,g_dev.tornadoMs)){ invalidateGame(); UpdateWindow(g_gameHwnd?g_gameHwnd:g_hwnd); return; }
+      if(g_ngPreview){ g_ngPhase=0; g_ngCards.clear(); g_dealing=false; g_ngPreview=false; invalidateGame(); return; }     // developer preview: the table just comes back
       g_ngPhase=2; g_ngCards.clear(); g_ngNextRowAt=now; g_ngRow=0;
    }
    while(g_ngRow<NUM_COLS && now>=g_ngNextRowAt){
+      if(g_ngRow==0) playSound("rozloz",g_volume);    // the deal sound: once for the whole deal, not for every row
       ngLaunchRow(g_ngRow); g_ngRow++;
-      g_ngNextRowAt+=(DWORD)(NG_ROW_GAP_S*1000.f*effectiveAnimMul());
+      g_ngNextRowAt=now+(DWORD)((float)g_dev.rowGapMs*effectiveAnimMul());     // the next row leaves rowGapMs later (200 ms) — scaled by the animation speed
    }
    if(g_ngRow>=NUM_COLS && g_cardAnims.empty()){
       g_ngPhase=0; g_dealing=false;
-      g_gameStartTick=timeGetTime(); g_gameSeconds=0;   // the clock starts when the cards are on the table
-      onStateChanged(); invalidateGame();
+      if(g_ngPreview) g_ngPreview=false;                // developer preview: nothing in the game changes
+      else{
+         g_gameStartTick=timeGetTime(); g_gameSeconds=0;   // the clock starts when the cards are on the table
+         onStateChanged();
+      }
+      invalidateGame();
    }
 }
 
+// ── buttons of the "Deweloper" settings: each runs one animation on the table as it is ───────────
+void doUndo();
+static bool devBusy(){ return g_ngPhase||g_animating||g_dealing||g_cardAnims.size()||g_thinking; }
+// "Rozdaj 1 wiersz": the deal of one row from the reserve, as in the middle of a game — taken back and dealt again until the
+// button is pressed once more. (The deal is a real move; every round is undone, so the game ends up as it was.)
+static void devStopRowLoop(){
+   if(!g_devRowLoop) return;
+   g_devRowLoop=false;
+   if(g_devRowState==1 && !devBusy()) doUndo();          // the row is lying on the table: take it back
+}
+static void devRunRow(){
+   if(g_devRowLoop){ devStopRowLoop(); return; }
+   if(devBusy()) return;
+   if(g_game.reserve.empty()){ g_status=L"Rezerwa jest pusta!"; invalidateGame(); return; }
+   g_devRowLoop=true; g_devRowState=0; g_devRowWait=false; g_devRowAt=0;
+}
+static void devTick(){                                   // called from the main loop while a developer loop runs
+   if(!g_devRowLoop) return;
+   const DWORD now=timeGetTime();
+   if(devBusy()){ g_devRowWait=true; return; }
+   if(g_devRowWait){ g_devRowWait=false; g_devRowAt=now+450; }      // a short pause after every animation
+   if(now<g_devRowAt) return;
+   if(g_devRowState==0){
+      if(g_game.reserve.empty()){ g_devRowLoop=false; return; }
+      doDeal(); g_devRowState=1;
+   } else { doUndo(); g_devRowState=0; }
+   g_devRowWait=true;
+}
+static void devRunDealAll(){    // the new-game deal of all rows, with the cards that lie on the table now
+   if(devBusy()) return;
+   bool keep=g_newDealAnim; g_newDealAnim=true; ngStart(false); g_newDealAnim=keep;
+   g_ngPreview=true;
+}
+static void devRunTornado(){    // the whirlwind with the cards on the table, then they come back
+   if(devBusy()||!ngSnapshot()) return;
+   g_ngPreview=true; g_ngPhase=1; g_dealing=true; g_ngT0=timeGetTime();
+   if(g_tornadoSound) SoundSystem::instance().playFaded(0,g_volume,std::max(200,g_dev.tornadoMs),600,800);
+}
+static void devRunFireworks(){  // starts the show, which starts over each time it ends; pressing the button again stops it
+   if(g_devFwLoop){ g_devFwLoop=false; stopFireworks(); return; }
+   RECT rc;
+   if(g_gameHwnd) GetClientRect(g_gameHwnd,&rc); else { GetClientRect(g_hwnd,&rc); rc.top=Layout::TOOLBAR_H; }
+   stopFireworks();
+   g_devFwLoop=true;
+   g_fw.start(rc.right,rc.bottom-(rc.top>0?rc.top:0));
+   g_fwLast=timeGetTime()/1000.0; g_fwStart=timeGetTime();
+   SetTimer(g_hwnd,TIMER_FW,16,nullptr);
+}
+static void devStopLoops(){      // the settings are closed (or another group is chosen)
+   devStopRowLoop();
+   if(g_devFwLoop){ g_devFwLoop=false; stopFireworks(); }
+}
 // Find what changed between two snapshots and start card animation
 static void animateStateDiff(const Snapshot& before, const Snapshot& after){
    // Find columns that gained cards (destination) and lost cards (source)
@@ -3869,11 +4057,14 @@ static HBRUSH toolbarBrush(){
    return br;
 }
 static int g_hoverBtn=0;     // control id of the toolbar button under the mouse (0 = none)
+static HWND g_hBtnCap[8]={};  // the captions under the toolbar buttons
 static void toolbarRefresh(){
    if(!g_hwnd) return;
    RECT rc; GetClientRect(g_hwnd,&rc); rc.bottom=Layout::TOOLBAR_H;
    InvalidateRect(g_hwnd,&rc,TRUE);
    for(int i=0;i<BTN_ICON_COUNT;i++){ HWND b=GetDlgItem(g_hwnd,BTN_ICON_IDS[i]); if(b) InvalidateRect(b,nullptr,FALSE); }
+   for(HWND c:g_hBtnCap) if(c) InvalidateRect(c,nullptr,TRUE);
+   for(HWND c:g_hStat) if(c) InvalidateRect(c,nullptr,TRUE);
    invalidateGame();
 }
 static LRESULT CALLBACK BtnHoverProc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR){
@@ -4109,81 +4300,75 @@ static HWND solverChild(HWND parent,const wchar_t* cls,const wchar_t* text,DWORD
    return c;
 }
 
+// ── Solver windows ───────────────────────────────────────────────────────────
+// The picker, the progress window, the "keep searching?" question and the result are overlays in the game
+// window (overlay.h gives them the same look as Settings): modal — each one runs a small message loop of its
+// own until it is closed, while the table, the toolbar and the menu do not react (WM_COMMAND is ignored).
+static bool g_svQuit=false;       // WM_QUIT arrived while a Solver window was open
+template<class Cond,class Tick> static void solverOverlayLoop(Cond keepOpen,Tick tick){
+   MSG m;
+   while(keepOpen() && !g_svQuit){
+      while(PeekMessage(&m,nullptr,0,0,PM_REMOVE)){
+         if(m.message==WM_QUIT){ PostQuitMessage((int)m.wParam); g_svQuit=true; return; }
+         TranslateMessage(&m); DispatchMessage(&m);
+      }
+      // what the main loop would do: the deal animation of the table behind the window keeps running
+      if(g_ngPhase) ngTick();
+      if(g_animating||g_previewAnimating) tickCardAnims();
+      if(g_smoothActive && !tickSmoothAnim()) g_smoothActive=false;
+      tick();
+      MsgWaitForMultipleObjects(0,nullptr,FALSE,(g_animating||g_ngPhase||g_smoothActive)?8:30,QS_ALLINPUT);
+   }
+}
+static void solverOverlayOpen(int which){ g_ov=which; g_ovCapture=-1; g_ovDragSv=g_svDragThumb=g_ovDragVol=g_ovDragAnim=g_ovDragThumb=false; invalidateGame(); }
+
 // ── stage length slider, "go on to the next deal" checkbox, thread count ─────
 // Shown both in the picker (so they can be set before starting) and in the
 // progress window (to change them while searching); both edit the same
 // g_solverStageMin / g_solverAutoNext / g_solverThreads, remembered in pasjans.ini.
-static const int IDC_SV_SLIDER=3102, IDC_SV_NEXT=3103, IDC_SV_THREADS=3104, IDC_SV_THREADS_SPIN=3105;
-struct SolverStageUi { HWND slider=nullptr, val=nullptr, chk=nullptr, thr=nullptr, thrSpin=nullptr; };
-// Rows: label + slider + value at `y`, the checkbox 40 px below, the thread count
-// 70 px below (≈96 px in all); x0/w = content span.
-static void solverMakeStageControls(HWND h,int x0,int y,int w,SolverStageUi& u){
-   INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_BAR_CLASSES|ICC_UPDOWN_CLASS}; InitCommonControlsEx(&icc);
-   solverChild(h,L"STATIC",L"Sprawdź po upływie:",SS_LEFT,x0,y+8,146,18,0);
-   u.slider=solverChild(h,TRACKBAR_CLASSW,L"",TBS_HORZ|TBS_AUTOTICKS|WS_TABSTOP,x0+146,y,w-146-60,32,IDC_SV_SLIDER);
-   SendMessageW(u.slider,TBM_SETRANGE,TRUE,MAKELPARAM(1,10));
-   SendMessageW(u.slider,TBM_SETPAGESIZE,0,1);
-   SendMessageW(u.slider,TBM_SETPOS,TRUE,g_solverStageMin);
-   u.val=solverChild(h,L"STATIC",L"",SS_LEFT,x0+w-52,y+8,52,18,0);
-   { wchar_t v[16]; swprintf(v,16,L"%d min",g_solverStageMin); SetWindowTextW(u.val,v); }
-   u.chk=solverChild(h,L"BUTTON",L"Po upływie czasu przejdź do następnego",BS_AUTOCHECKBOX|WS_TABSTOP,x0,y+40,w,22,IDC_SV_NEXT);
-   SendMessageW(u.chk,BM_SETCHECK,g_solverAutoNext?BST_CHECKED:BST_UNCHECKED,0);
-
-   // Worker threads: 1 .. (logical processors - 2), spin button on an edit box.
+static void solverApplyLive();    // pushes the settings into the stage that is running (defined with the search state)
+static float g_svSliderX=0, g_svSliderW=1;
+static float solverStageDraw(float x,float y,float w){      // returns the height used
+   ovLabel(L"Sprawdź po upływie:",x,y,176,36);
+   g_svSliderX=x+190.f; g_svSliderW=w-190.f-84.f;
+   ovRect(g_svSliderX,y+15,g_svSliderW,6,3,1,1,1,0.20f);
+   ovRect(g_svSliderX,y+15,g_svSliderW*(g_solverStageMin-1)/9.f,6,3,1.f,0.86f,0.30f,0.95f);
+   for(int k=0;k<10;k++){ float sx=g_svSliderX+g_svSliderW*k/9.f; ovRect(sx-1.f,y+11,2,14,1,1,1,1,k+1<=g_solverStageMin?0.7f:0.35f); }
+   ovKnob(g_svSliderX+g_svSliderW*(g_solverStageMin-1)/9.f,y+18);
+   ovHit(g_svSliderX-12,y,g_svSliderW+24,36,OH_SV_SLIDER);
+   ovText(std::to_wstring(g_solverStageMin)+L" min",x+w-76,y,76,36,15,1,1,1,1.f,true,DWRITE_TEXT_ALIGNMENT_TRAILING);
+   ovCheck(x,y+44,w,L"Po upływie czasu przejdź do następnego",g_solverAutoNext,OH_SV_NEXT);
    const int maxThr=solver::maxThreads();
-   solverChild(h,L"STATIC",L"Liczba wątków:",SS_LEFT,x0,y+72,146,18,0);
-   u.thr=solverChild(h,L"EDIT",L"",WS_BORDER|ES_NUMBER|ES_AUTOHSCROLL|WS_TABSTOP,x0+146,y+68,64,24,IDC_SV_THREADS);
-   SendMessageW(u.thr,EM_SETLIMITTEXT,3,0);
-   u.thrSpin=CreateWindowExW(0,UPDOWN_CLASSW,L"",WS_CHILD|WS_VISIBLE|UDS_SETBUDDYINT|UDS_ALIGNRIGHT|UDS_ARROWKEYS|UDS_NOTHOUSANDS,
-      0,0,0,0,h,(HMENU)(INT_PTR)IDC_SV_THREADS_SPIN,GetModuleHandleW(nullptr),nullptr);
-   SendMessageW(u.thrSpin,UDM_SETBUDDY,(WPARAM)u.thr,0);
-   SendMessageW(u.thrSpin,UDM_SETRANGE32,1,maxThr);
-   SendMessageW(u.thrSpin,UDM_SETPOS32,0,g_solverThreads);
-   wchar_t info[96];
-   swprintf(info,96,L"z %d możliwych",maxThr);
-   solverChild(h,L"STATIC",info,SS_LEFT,x0+146+74,y+72,w-146-74,18,0);
+   ovLabel(L"Liczba wątków:",x,y+82,176,36);
+   ovButton(x+190,y+82,36,36,L"−",OH_SV_THR,0,false,g_solverThreads>1,18);
+   ovText(std::to_wstring(g_solverThreads),x+228,y+82,50,36,16,1,1,1,1.f,true);
+   ovButton(x+280,y+82,36,36,L"+",OH_SV_THR,1,false,g_solverThreads<maxThr,18);
+   ovNote(L"z "+std::to_wstring(maxThr)+L" możliwych",x+332,y+90,220,22);
+   return 120.f;
 }
-// WM_COMMAND from the thread-count edit box: remember a valid number; once the
-// box loses focus rewrite whatever is in it as the (clamped) value in use.
-static bool solverThreadsCommand(const SolverStageUi& u,WPARAM wp){
-   if(LOWORD(wp)!=IDC_SV_THREADS||!u.thr) return false;
-   const int maxThr=solver::maxThreads();
-   if(HIWORD(wp)==EN_CHANGE){
-      wchar_t t[8]={}; GetWindowTextW(u.thr,t,8);
-      int v=_wtoi(t);
-      if(t[0]&&v>=1){
-         if(v>maxThr) v=maxThr;
-         if(v!=g_solverThreads){ g_solverThreads=v; saveSolverUiSettings(); }
-      }
-   } else if(HIWORD(wp)==EN_KILLFOCUS){
-      SendMessageW(u.thrSpin,UDM_SETPOS32,0,g_solverThreads);
+static void solverSetStage(float mx){
+   int v=(int)std::lround(1.0+(double)(mx-g_svSliderX)/std::max(1.f,g_svSliderW)*9.0);
+   v=std::max(1,std::min(10,v));
+   if(v!=g_solverStageMin){ g_solverStageMin=v; saveSolverUiSettings(); solverApplyLive(); invalidateGame(); }
+}
+// A click on one of the stage controls; true if it was one.
+static bool solverStageClick(const OvHit& h,float mx){
+   switch(h.kind){
+   case OH_SV_SLIDER: g_ovDragSv=true; SetCapture(g_gameHwnd); solverSetStage(mx); return true;
+   case OH_SV_NEXT:   g_solverAutoNext=!g_solverAutoNext; saveSolverUiSettings(); return true;
+   case OH_SV_THR:{
+      int nt=g_solverThreads+(h.a?1:-1); nt=std::max(1,std::min(solver::maxThreads(),nt));
+      if(nt!=g_solverThreads){ g_solverThreads=nt; saveSolverUiSettings(); solverApplyLive(); }
+      return true;}
    }
-   return true;
-}
-// WM_HSCROLL: true if `ctl` is this slider (the setting is updated and remembered).
-static bool solverStageHScroll(const SolverStageUi& u,HWND ctl){
-   if(!u.slider||ctl!=u.slider) return false;
-   int pos=(int)SendMessageW(u.slider,TBM_GETPOS,0,0);
-   if(pos<1) pos=1;
-   if(pos>10) pos=10;
-   g_solverStageMin=pos;
-   wchar_t v[16]; swprintf(v,16,L"%d min",pos); SetWindowTextW(u.val,v);
-   saveSolverUiSettings();
-   return true;
-}
-// WM_COMMAND: true if it was a click on this checkbox.
-static bool solverStageCommand(const SolverStageUi& u,int id){
-   if(id!=IDC_SV_NEXT||!u.chk) return false;
-   g_solverAutoNext=(SendMessageW(u.chk,BM_GETCHECK,0,0)==BST_CHECKED);
-   saveSolverUiSettings();
-   return true;
+   return false;
 }
 
 // ── 1. picking deals ─────────────────────────────────────────────────────────
 // The list shows the deals of LostNumbers.csv and, in red, those already moved to
 // Unsolvable.csv; a seed can also be typed in by hand.
-static const int IDC_PICK_LIST=3001, IDC_PICK_ALL=3002, IDC_PICK_SEED=3003, IDC_PICK_MODE=3004, IDC_PICK_ADD=3005;
-struct SolverPick { std::vector<NumEntry> all; std::vector<int> kind; /* 0 lost, 1 unsolvable, 2 typed in */ std::vector<NumEntry> chosen; bool ok=false; HWND list=nullptr, edit=nullptr, combo=nullptr; SolverStageUi stage; };
+struct SolverPick { std::vector<NumEntry> all; std::vector<int> kind; /* 0 lost, 1 unsolvable, 2 typed in */ std::vector<char> sel;
+                    std::vector<NumEntry> chosen; bool ok=false; std::wstring seed, msg; int mode=0, anchor=-1; float scroll=0; };
 static SolverPick g_pick;
 
 static std::wstring solverPickText(const NumEntry& e,int kind){
@@ -4193,179 +4378,13 @@ static std::wstring solverPickText(const NumEntry& e,int kind){
    else if(kind==2) s+=L"   [wpisane ręcznie]";
    return s;
 }
-static void solverPickAccept(HWND dlg){
-   int n=(int)SendMessageW(g_pick.list,LB_GETSELCOUNT,0,0);
-   if(n<=0) return;
-   std::vector<int> idx((size_t)n);
-   SendMessageW(g_pick.list,LB_GETSELITEMS,(WPARAM)n,(LPARAM)idx.data());
-   g_pick.chosen.clear();
-   for(int i: idx) if(i>=0 && i<(int)g_pick.all.size()) g_pick.chosen.push_back(g_pick.all[(size_t)i]);
-   g_pick.ok=!g_pick.chosen.empty();
-   DestroyWindow(dlg);
-}
-// Adds the typed seed to the list (or just selects it if it is already there).
-static void solverPickAddTyped(HWND dlg){
-   wchar_t t[32]={}; GetWindowTextW(g_pick.edit,t,32);
-   wchar_t* end=nullptr; long long v=_wcstoi64(t,&end,10);
-   if(t[0]==0 || (end && *end) || v<0 || v>4294967295LL){
-      MessageBoxW(dlg,L"Ziarno to liczba całkowita od 0 do 4294967295.",L"Solver",MB_OK|MB_ICONWARNING);
-      SetFocus(g_pick.edit); return;
-   }
-   int mode=(int)SendMessageW(g_pick.combo,CB_GETCURSEL,0,0); if(mode<0) mode=0;
-   int at=-1;
-   for(size_t i=0;i<g_pick.all.size();i++) if(g_pick.all[i].num==v){ at=(int)i; break; }
-   if(at<0){
-      g_pick.all.push_back({v,mode}); g_pick.kind.push_back(2);
-      std::wstring s=solverPickText(g_pick.all.back(),2);
-      at=(int)SendMessageW(g_pick.list,LB_ADDSTRING,0,(LPARAM)s.c_str());
-   }
-   SendMessageW(g_pick.list,LB_SETSEL,TRUE,at);
-   SendMessageW(g_pick.list,LB_SETTOPINDEX,at,0);
-   SetWindowTextW(g_pick.edit,L"");
-   SetFocus(g_pick.edit);
-}
-static LRESULT CALLBACK SolverPickProc(HWND h,UINT m,WPARAM w,LPARAM l){
-   switch(m){
-   case WM_CREATE:{
-      solverChild(h,L"STATIC",L"Zaznacz rozdania (Ctrl/Shift – kilka). Na czerwono: nierozwiązywalne.",SS_LEFT,12,10,436,20,0);
-      g_pick.list=solverChild(h,L"LISTBOX",L"",WS_BORDER|WS_VSCROLL|LBS_EXTENDEDSEL|LBS_NOTIFY|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS|WS_TABSTOP,12,34,436,268,IDC_PICK_LIST);
-      for(size_t i=0;i<g_pick.all.size();i++){
-         std::wstring s=solverPickText(g_pick.all[i],g_pick.kind[i]);
-         SendMessageW(g_pick.list,LB_ADDSTRING,0,(LPARAM)s.c_str());
-      }
-      for(size_t i=0;i<g_pick.all.size();i++) if(g_pick.kind[i]==0){ SendMessageW(g_pick.list,LB_SETSEL,TRUE,(LPARAM)i); break; }
-      solverChild(h,L"STATIC",L"Ziarno:",SS_LEFT,12,313,50,20,0);
-      g_pick.edit=solverChild(h,L"EDIT",L"",WS_BORDER|ES_NUMBER|ES_AUTOHSCROLL|WS_TABSTOP,64,309,130,24,IDC_PICK_SEED);
-      SendMessageW(g_pick.edit,EM_SETLIMITTEXT,10,0);
-      g_pick.combo=solverChild(h,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,204,309,150,120,IDC_PICK_MODE);
-      SendMessageW(g_pick.combo,CB_ADDSTRING,0,(LPARAM)L"Tylko król");
-      SendMessageW(g_pick.combo,CB_ADDSTRING,0,(LPARAM)L"Dowolna karta");
-      SendMessageW(g_pick.combo,CB_SETCURSEL,g_freeColMode?1:0,0);
-      solverChild(h,L"BUTTON",L"Dodaj do listy",BS_PUSHBUTTON|WS_TABSTOP,364,308,84,26,IDC_PICK_ADD);
-      solverMakeStageControls(h,12,346,436,g_pick.stage);
-      solverChild(h,L"BUTTON",L"Rozwiąż wybrane",BS_DEFPUSHBUTTON|WS_TABSTOP,12,452,160,30,IDOK);
-      solverChild(h,L"BUTTON",L"Zaznacz wszystkie",BS_PUSHBUTTON|WS_TABSTOP,180,452,140,30,IDC_PICK_ALL);
-      solverChild(h,L"BUTTON",L"Anuluj",BS_PUSHBUTTON|WS_TABSTOP,328,452,120,30,IDCANCEL);
-      return 0;}
-   case WM_HSCROLL:
-      if(solverStageHScroll(g_pick.stage,(HWND)l)) return 0;
-      break;
-   case WM_MEASUREITEM:{
-      MEASUREITEMSTRUCT* mi=(MEASUREITEMSTRUCT*)l;
-      if(mi->CtlID==(UINT)IDC_PICK_LIST){ mi->itemHeight=20; return TRUE; }
-      break;}
-   case WM_DRAWITEM:{
-      DRAWITEMSTRUCT* di=(DRAWITEMSTRUCT*)l;
-      if(di->CtlID!=(UINT)IDC_PICK_LIST || (int)di->itemID<0) break;
-      bool sel=(di->itemState&ODS_SELECTED)!=0;
-      int kind=((size_t)di->itemID<g_pick.kind.size())?g_pick.kind[(size_t)di->itemID]:0;
-      COLORREF fg = sel ? GetSysColor(COLOR_HIGHLIGHTTEXT)
-                  : kind==1 ? RGB(190,30,30)      // unsolvable: red
-                  : kind==2 ? RGB(30,90,170)      // typed in: blue
-                  : GetSysColor(COLOR_WINDOWTEXT);
-      FillRect(di->hDC,&di->rcItem,GetSysColorBrush(sel?COLOR_HIGHLIGHT:COLOR_WINDOW));
-      wchar_t txt[160]={}; SendMessageW(di->hwndItem,LB_GETTEXT,di->itemID,(LPARAM)txt);
-      SetBkMode(di->hDC,TRANSPARENT); SetTextColor(di->hDC,fg);
-      HFONT old=(HFONT)SelectObject(di->hDC,solverFont(kind==1));
-      RECT tr=di->rcItem; tr.left+=6;
-      DrawTextW(di->hDC,txt,-1,&tr,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
-      SelectObject(di->hDC,old);
-      return TRUE;}
-   case WM_COMMAND:
-      if(solverStageCommand(g_pick.stage,LOWORD(w))) return 0;
-      if(solverThreadsCommand(g_pick.stage,w)) return 0;
-      switch(LOWORD(w)){
-      case IDOK:
-         if(GetFocus()==g_pick.edit){ solverPickAddTyped(h); return 0; } // Enter in the seed box adds it
-         solverPickAccept(h); return 0;
-      case IDC_PICK_ADD: solverPickAddTyped(h); return 0;
-      case IDC_PICK_ALL: SendMessageW(g_pick.list,LB_SETSEL,TRUE,-1); return 0;
-      case IDCANCEL: DestroyWindow(h); return 0;
-      case IDC_PICK_LIST: if(HIWORD(w)==LBN_DBLCLK) solverPickAccept(h); return 0;
-      }
-      break;
-   case WM_CLOSE: DestroyWindow(h); return 0;
-   }
-   return DefWindowProcW(h,m,w,l);
-}
-static bool pickSolverGames(HWND parent,const std::vector<NumEntry>& lost,const std::vector<NumEntry>& unsolvable,std::vector<NumEntry>& out){
-   static bool reg=false;
-   if(!reg){
-      WNDCLASSEXW wc={sizeof(wc)}; wc.lpfnWndProc=SolverPickProc; wc.hInstance=GetModuleHandleW(nullptr);
-      wc.lpszClassName=L"PasjansSolverPick"; wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
-      wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1); RegisterClassExW(&wc); reg=true;
-   }
-   g_pick=SolverPick();
-   for(auto& e: lost){ g_pick.all.push_back(e); g_pick.kind.push_back(0); }
-   for(auto& e: unsolvable){
-      bool dup=false; for(auto& x: g_pick.all) if(x.num==e.num){ dup=true; break; }
-      if(!dup){ g_pick.all.push_back(e); g_pick.kind.push_back(1); }
-   }
-   loadSolverUiSettings();
-   // WS_EX_DLGMODALFRAME: no icon in the title bar
-   RECT r={0,0,460,496}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_DLGMODALFRAME);
-   HWND dlg=CreateWindowExW(WS_EX_DLGMODALFRAME,L"PasjansSolverPick",L"Solver – wybór rozdań",st,CW_USEDEFAULT,CW_USEDEFAULT,
-      r.right-r.left,r.bottom-r.top,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
-   if(!dlg) return false;
-   solverCenterOn(dlg,parent);
-   solverModalLoop(dlg,parent);
-   if(g_pick.ok) out=g_pick.chosen;
-   return g_pick.ok;
-}
 
 // ── 2. "keep searching?" question with a 10 s countdown ──────────────────────
 // Asked when a stage ends and the "przejdź do następnego" checkbox is not ticked.
 // No answer means: keep searching (the default button is "Tak").
-struct SolverAsk { int secs=0; bool yes=true; HWND lbl=nullptr; long long seed=0; };
+struct SolverAsk { ULONGLONG endAt=0; bool yes=true; long long seed=0; };
 static SolverAsk g_ask;
-static void solverAskLabel(){
-   wchar_t b[128]; swprintf(b,128,L"Bez odpowiedzi za %d s kontynuuję poszukiwania.",g_ask.secs);
-   SetWindowTextW(g_ask.lbl,b);
-}
-static LRESULT CALLBACK SolverAskProc(HWND h,UINT m,WPARAM w,LPARAM l){
-   switch(m){
-   case WM_CREATE:{
-      wchar_t b[256];
-      swprintf(b,256,L"Nie znalazłem rozwiązania rozdania nr %lld w ciągu %d min. Czy kontynuować poszukiwania?",g_ask.seed,g_solverStageMin);
-      solverChild(h,L"STATIC",b,SS_LEFT,14,14,492,44,0,true);   // wraps by itself, two lines fit
-      g_ask.lbl=solverChild(h,L"STATIC",L"",SS_LEFT,14,66,492,20,0);
-      solverAskLabel();
-      solverChild(h,L"BUTTON",L"Tak, szukaj dalej",BS_DEFPUSHBUTTON|WS_TABSTOP,110,98,150,30,IDYES);
-      solverChild(h,L"BUTTON",L"Nie, następne",BS_PUSHBUTTON|WS_TABSTOP,270,98,150,30,IDNO);
-      SetTimer(h,1,1000,nullptr);
-      return 0;}
-   case WM_TIMER:
-      if(--g_ask.secs<=0){ g_ask.yes=true; DestroyWindow(h); }   // no answer: carry on searching
-      else solverAskLabel();
-      return 0;
-   case WM_COMMAND:
-      if(LOWORD(w)==IDYES){ g_ask.yes=true; DestroyWindow(h); return 0; }
-      if(LOWORD(w)==IDNO||LOWORD(w)==IDCANCEL){ g_ask.yes=false; DestroyWindow(h); return 0; }
-      break;
-   case WM_CLOSE: g_ask.yes=false; DestroyWindow(h); return 0;
-   case WM_DESTROY: KillTimer(h,1); return 0;
-   }
-   return DefWindowProcW(h,m,w,l);
-}
-static bool solverAskContinue(HWND parent,long long seed){
-   static bool reg=false;
-   if(!reg){
-      WNDCLASSEXW wc={sizeof(wc)}; wc.lpfnWndProc=SolverAskProc; wc.hInstance=GetModuleHandleW(nullptr);
-      wc.lpszClassName=L"PasjansSolverAsk"; wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
-      wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1); RegisterClassExW(&wc); reg=true;
-   }
-   g_ask=SolverAsk(); g_ask.secs=SOLVER_ASK_SECONDS; g_ask.seed=seed;
-   // WS_EX_DLGMODALFRAME: no icon in the title bar, like the other Solver windows
-   RECT r={0,0,520,144}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_TOPMOST|WS_EX_DLGMODALFRAME);
-   HWND dlg=CreateWindowExW(WS_EX_TOPMOST|WS_EX_DLGMODALFRAME,L"PasjansSolverAsk",L"Solver",st,CW_USEDEFAULT,CW_USEDEFAULT,
-      r.right-r.left,r.bottom-r.top,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
-   if(!dlg) return true;
-   solverCenterOn(dlg,parent);
-   MessageBeep(MB_ICONQUESTION);
-   solverModalLoop(dlg,parent);
-   return g_ask.yes;
-}
-
+static bool solverAskContinue(long long seed);
 // ── 2b. remembered search state (SolverState.csv) ────────────────────────────
 // What survives between sessions is the search's *bookkeeping*: how many attempts
 // were already made, positions searched, time spent and the best progress. The
@@ -4440,9 +4459,9 @@ static bool saveSolvedFile(const NumEntry& e,const GameState& start,const std::v
 // ── 4. the progress window and the batch driver ──────────────────────────────
 struct SolverRun {
    std::vector<NumEntry> list; size_t idx=0;
-   HWND hwnd=nullptr, lblTitle=nullptr, lblTime=nullptr, lblAttempts=nullptr, lblCurrent=nullptr, lblBest=nullptr, lblNodes=nullptr;
-   HWND barTime=nullptr, barCurrent=nullptr, barBest=nullptr, btnStop=nullptr;
-   SolverStageUi stageUi;
+   // what the progress window shows (built by solverUpdateUI)
+   std::wstring sTitle, sTime, sAttempts, sCurrent, sBest, sNodes; float fTime=0, fCurrent=0, fBest=0;
+   bool stopping=false;           // "Przerwij" was pressed: the search is ending
    std::unique_ptr<solver::Progress> P;
    std::atomic<bool> cancel{false};
    std::atomic<bool> threadDone{false};
@@ -4457,7 +4476,6 @@ struct SolverRun {
    std::wstring log;
 };
 static SolverRun g_sv;
-static const int IDC_SV_STOP=3101;
 
 static DWORD WINAPI solverCtlProc(LPVOID){
    g_sv.result=solver::solveDeal(g_sv.start,g_sv.freeMode,*g_sv.P,g_sv.cancel,g_sv.deadline,
@@ -4488,7 +4506,7 @@ static void solverStartCurrent(){
    }
    g_sv.deadline=g_sv.stageStart+solverStageMs(); g_sv.stage=1;
    g_sv.lastTick=g_sv.stageStart; g_sv.lastNodes=0; g_sv.speed=0;
-   if(g_sv.btnStop) EnableWindow(g_sv.btnStop,TRUE);
+   g_sv.stopping=false;
    solverLaunchThread();
 }
 static void solverLog(const std::wstring& line){ g_sv.log+=line+L"\r\n"; }
@@ -4498,31 +4516,31 @@ static void solverUpdateUI(){
    solver::Progress& P=*g_sv.P;
    wchar_t b[320];
    swprintf(b,320,L"Rozdanie %d z %d  –  nr %lld  (%ls)",(int)g_sv.idx+1,(int)g_sv.list.size(),g_sv.seed,solverModeName(g_sv.freeMode?1:0));
-   SetWindowTextW(g_sv.lblTitle,b);
+   g_sv.sTitle=b;
 
    ULONGLONG st=now-g_sv.stageStart, tot=now-g_sv.gameStart;
    if(st>solverStageMs()) st=solverStageMs();
    swprintf(b,320,L"Czas etapu %d: %d:%02d z %d:00     (łącznie dla tego rozdania %d:%02d)",g_sv.stage,
       (int)(st/60000),(int)((st/1000)%60),g_solverStageMin,(int)(tot/60000),(int)((tot/1000)%60));
-   SetWindowTextW(g_sv.lblTime,b);
-   SendMessageW(g_sv.barTime,PBM_SETPOS,(WPARAM)(st*1000/solverStageMs()),0);
+   g_sv.sTime=b;
+   g_sv.fTime=(float)((double)st/(double)solverStageMs());
 
    if(g_sv.resumedAttempts>0)
       swprintf(b,320,L"Próby: rozpoczęto %d, zakończono %d   (równolegle: %d wątków; wznowione po %d próbach)",P.attemptsStarted.load(),P.attemptsFinished.load(),P.threads.load(),g_sv.resumedAttempts);
    else
       swprintf(b,320,L"Próby: rozpoczęto %d, zakończono %d   (równolegle: %d wątków)",P.attemptsStarted.load(),P.attemptsFinished.load(),P.threads.load());
-   SetWindowTextW(g_sv.lblAttempts,b);
+   g_sv.sAttempts=b;
 
    int la=P.leadAttempt.load(); long long ln=P.leadNodes.load(), lb=P.leadBudget.load();
    if(la>0 && lb>0){
       std::wstring n1=solverNum(ln), n2=solverNum(lb);
       swprintf(b,320,L"Bieżąca próba nr %d: ruch %d (najgłębiej %d), przeszukano %ls z %ls węzłów",la,P.leadDepth.load(),P.leadMaxDepth.load(),n1.c_str(),n2.c_str());
-      SendMessageW(g_sv.barCurrent,PBM_SETPOS,(WPARAM)(std::min<long long>(1000,ln*1000/lb)),0);
+      g_sv.fCurrent=(float)std::min(1.0,(double)ln/(double)lb);
    } else {
       swprintf(b,320,L"Bieżąca próba: uruchamianie…");
-      SendMessageW(g_sv.barCurrent,PBM_SETPOS,0,0);
+      g_sv.fCurrent=0.f;
    }
-   SetWindowTextW(g_sv.lblCurrent,b);
+   g_sv.sCurrent=b;
 
    int bk=P.bestKings.load(), bp=P.bestPlaced.load(), bpl=P.bestPrefixLen.load();
    if(P.solutionFound.load()){
@@ -4537,8 +4555,8 @@ static void solverUpdateUI(){
       swprintf(b,320,L"Najlepszy dotychczasowy postęp: króle na miejscu %d z 8, ułożone karty %d ze 104 (próby budują dalej na linii %d ruchów)",bk,bp,bpl);
    else
       swprintf(b,320,L"Najlepszy dotychczasowy postęp: króle na miejscu %d z 8, ułożone karty %d ze 104",bk,bp);
-   SetWindowTextW(g_sv.lblBest,b);
-   SendMessageW(g_sv.barBest,PBM_SETPOS,(WPARAM)(bp*1000/104),0);
+   g_sv.sBest=b;
+   g_sv.fBest=(float)bp/104.f;
 
    long long nodes=P.totalNodes.load();
    if(now-g_sv.lastTick>=1000){
@@ -4547,13 +4565,11 @@ static void solverUpdateUI(){
    }
    std::wstring n1=solverNum(nodes), n2=solverNum((long long)g_sv.speed);
    swprintf(b,320,L"Przeszukano łącznie %ls pozycji  (ok. %ls na sekundę)",n1.c_str(),n2.c_str());
-   SetWindowTextW(g_sv.lblNodes,b);
+   g_sv.sNodes=b;
 }
 
 static void solverFinish(){
    g_sv.finished=true;
-   KillTimer(g_sv.hwnd,1);
-   DestroyWindow(g_sv.hwnd);
 }
 static void solverNext(){
    g_sv.idx++;
@@ -4609,7 +4625,7 @@ static void solverHandleResult(){
       // deal at once, otherwise ask whether to keep searching this one
       solverUpdateUI();
       solverSaveProgress();
-      bool again=!g_solverAutoNext && solverAskContinue(g_sv.hwnd,e.num);
+      bool again=!g_solverAutoNext && solverAskContinue(e.num);
       if(again){
          g_sv.stage++;
          g_sv.stageStart=GetTickCount64();
@@ -4631,81 +4647,327 @@ static void solverPoll(){
    if(g_sv.threadDone.load()) solverHandleResult();
    g_sv.busy=false;
 }
-static LRESULT CALLBACK SolverProgProc(HWND h,UINT m,WPARAM w,LPARAM l){
-   switch(m){
-   case WM_CREATE:{
-      INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_PROGRESS_CLASS|ICC_BAR_CLASSES}; InitCommonControlsEx(&icc);
-      SolverRun& S=g_sv;
-      S.lblTitle   =solverChild(h,L"STATIC",L"",SS_LEFT,14,12,492,22,0,true);
-      S.lblTime    =solverChild(h,L"STATIC",L"",SS_LEFT,14,44,492,18,0);
-      S.barTime    =solverChild(h,PROGRESS_CLASSW,L"",PBS_SMOOTH,14,64,492,14,0);
-      S.lblAttempts=solverChild(h,L"STATIC",L"",SS_LEFT,14,92,492,18,0);
-      S.lblCurrent =solverChild(h,L"STATIC",L"",SS_LEFT,14,118,492,18,0);
-      S.barCurrent =solverChild(h,PROGRESS_CLASSW,L"",PBS_SMOOTH,14,138,492,14,0);
-      // 36px (not the usual 18px one-line height): both messages this label can
-      // show — the "(próby budują dalej...)" suffix and the "Rozwiązanie
-      // znalezione..." polish-phase message below — routinely wrap to a second
-      // line at this dialog's width, and a STATIC control with SS_LEFT word-
-      // wraps automatically but simply clips any line past its own height, so
-      // a too-short control silently ate the wrapped second line.
-      S.lblBest    =solverChild(h,L"STATIC",L"",SS_LEFT,14,164,492,36,0);
-      S.barBest    =solverChild(h,PROGRESS_CLASSW,L"",PBS_SMOOTH,14,202,492,14,0);
-      S.lblNodes   =solverChild(h,L"STATIC",L"",SS_LEFT,14,228,492,18,0);
-      // Stage length (1-10 min, whole minutes) and what to do when a stage ends.
-      solverMakeStageControls(h,14,256,492,S.stageUi);
-      S.btnStop    =solverChild(h,L"BUTTON",L"Przerwij",BS_PUSHBUTTON|WS_TABSTOP,210,364,100,30,IDC_SV_STOP);
-      for(HWND bar: {S.barTime,S.barCurrent,S.barBest}) SendMessageW(bar,PBM_SETRANGE32,0,1000);
-      SetTimer(h,1,250,nullptr);
-      return 0;}
-   case WM_TIMER: if(w==1) solverPoll(); return 0;
-   case WM_HSCROLL:
-      if(solverStageHScroll(g_sv.stageUi,(HWND)l)){
-         // takes effect at once, also for the stage already running (the search re-reads its deadline)
-         g_sv.deadline=g_sv.stageStart+solverStageMs();
-         if(g_sv.P) g_sv.P->deadline.store(g_sv.deadline);
-         return 0;
-      }
-      break;
-   case WM_COMMAND:
-      if(solverStageCommand(g_sv.stageUi,LOWORD(w))) return 0;
-      if(solverThreadsCommand(g_sv.stageUi,w)){
-         // applies to the stage already running: the workers re-read the live count within ~50 ms
-         if(g_sv.P) g_sv.P->threads.store(std::max(1,std::min(g_solverThreads,solver::maxThreads())));
-         return 0;
-      }
-      if(LOWORD(w)==IDC_SV_STOP || LOWORD(w)==IDCANCEL){ g_sv.cancel.store(true); EnableWindow(g_sv.btnStop,FALSE); return 0; }
-      break;
-   case WM_CLOSE: g_sv.cancel.store(true); EnableWindow(g_sv.btnStop,FALSE); return 0; // the worker ends, solverPoll() then closes the window
-   }
-   return DefWindowProcW(h,m,w,l);
+// pushes the stage length / thread count the player changed into the stage that is running
+static void solverApplyLive(){
+   if(g_ov!=OV_SOLVER_RUN||!g_sv.P) return;
+   g_sv.deadline=g_sv.stageStart+solverStageMs();            // the search re-reads its deadline ...
+   g_sv.P->deadline.store(g_sv.deadline);
+   g_sv.P->threads.store(std::max(1,std::min(g_solverThreads,solver::maxThreads())));   // ... and the workers re-read the live count within ~50 ms
 }
-static void runSolverBatch(HWND parent,const std::vector<NumEntry>& picked){
-   static bool reg=false;
-   if(!reg){
-      WNDCLASSEXW wc={sizeof(wc)}; wc.lpfnWndProc=SolverProgProc; wc.hInstance=GetModuleHandleW(nullptr);
-      wc.lpszClassName=L"PasjansSolverProg"; wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
-      wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1); RegisterClassExW(&wc); reg=true;
+
+// ── the Solver windows: drawing, mouse, keys ─────────────────────────────────
+static void ovBar(float x,float y,float w,float h,float f){
+   f=std::max(0.f,std::min(1.f,f));
+   ovRect(x,y,w,h,h/2,1,1,1,0.14f);
+   if(f>0.f) ovRect(x,y,std::max(h,w*f),h,h/2,1.f,0.86f,0.30f,0.95f);
+}
+static float ovMeasure(const std::wstring& s,float px,float w){
+   if(!g_dwFactory||s.empty()) return 0.f;
+   IDWriteTextFormat* f=nullptr;
+   g_dwFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,px,L"",&f);
+   if(!f) return 0.f;
+   f->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+   IDWriteTextLayout* l=nullptr; g_dwFactory->CreateTextLayout(s.c_str(),(UINT32)s.size(),f,w,100000.f,&l); f->Release();
+   float h=0.f; if(l){ DWRITE_TEXT_METRICS m{}; l->GetMetrics(&m); h=m.height; l->Release(); }
+   return h;
+}
+// the scroll bar of the list / the result text, as last drawn
+static float g_svTrackX=0, g_svTrackY=0, g_svTrackH=0, g_svViewH=0, g_svContentH=0; static float* g_svScrollPtr=nullptr;
+static float g_svResScroll=0; static std::wstring g_svResText;
+static void svClampScroll(){ if(g_svScrollPtr) *g_svScrollPtr=std::max(0.f,std::min(*g_svScrollPtr,std::max(0.f,g_svContentH-g_svViewH))); }
+static void svScrollBar(float x,float y,float h,float view,float content,float* scroll,bool dragging){
+   g_svTrackX=x; g_svTrackY=y; g_svTrackH=h; g_svViewH=view; g_svContentH=content; g_svScrollPtr=scroll; svClampScroll();
+   if(content<=view+1.f) return;
+   float th=std::max(30.f,h*view/content), ty=y+(h-th)*(*scroll/std::max(1.f,content-view));
+   ovRect(x,y,8,h,4,1,1,1,0.10f);
+   ovRect(x,ty,8,th,4,1.f,0.86f,0.30f,dragging?0.95f:0.70f);
+}
+static const float SV_ROW_H=30.f;
+
+static void solverPanelRect(float& px,float& py,float& pw,float& ph){
+   switch(g_ov){
+   case OV_SOLVER_PICK:   pw=std::min(760.f,g_ovW-30.f); ph=std::min(720.f,g_ovH-30.f); break;
+   case OV_SOLVER_RUN:    pw=std::min(780.f,g_ovW-30.f); ph=std::min(590.f,g_ovH-30.f); break;
+   case OV_SOLVER_ASK:    pw=std::min(640.f,g_ovW-30.f); ph=std::min(280.f,g_ovH-30.f); break;
+   default:               pw=std::min(720.f,g_ovW-30.f); ph=std::min(560.f,g_ovH-30.f); break;
    }
+   px=std::floor((g_ovW-pw)/2.f); py=std::floor((g_ovH-ph)/2.f);
+}
+// the picker's list box
+static void svPickList(float& x,float& ly,float& w,float& lh,float& seedY,float& stageY,float& btnY){
+   float px,py,pw,ph; solverPanelRect(px,py,pw,ph);
+   x=px+28; w=pw-56; ly=py+114; btnY=py+ph-64; stageY=btnY-14-120; seedY=stageY-10-36; lh=std::max(60.f,seedY-8-ly);
+}
+static void svPickReveal(int at){
+   float x,ly,w,lh,sy,sg,by; svPickList(x,ly,w,lh,sy,sg,by);
+   float top=at*SV_ROW_H, bot=top+SV_ROW_H+8.f;
+   if(top<g_pick.scroll) g_pick.scroll=top;
+   else if(bot>g_pick.scroll+lh) g_pick.scroll=bot-lh;
+   g_pick.scroll=std::max(0.f,g_pick.scroll);
+}
+static void solverPickAccept(){
+   g_pick.chosen.clear();
+   for(size_t i=0;i<g_pick.all.size();i++) if(g_pick.sel[i]) g_pick.chosen.push_back(g_pick.all[i]);
+   if(g_pick.chosen.empty()) return;
+   g_pick.ok=true; ovClose();
+}
+// Adds the typed seed to the list (or just selects it if it is already there).
+static void solverPickAddTyped(){
+   const std::wstring& t=g_pick.seed;
+   long long v=t.empty()?-1:_wcstoi64(t.c_str(),nullptr,10);
+   if(t.empty()||v<0||v>4294967295LL){ g_pick.msg=L"Ziarno to liczba całkowita od 0 do 4294967295."; return; }
+   int at=-1;
+   for(size_t i=0;i<g_pick.all.size();i++) if(g_pick.all[i].num==v){ at=(int)i; break; }
+   if(at<0){ g_pick.all.push_back({v,g_pick.mode}); g_pick.kind.push_back(2); g_pick.sel.push_back(0); at=(int)g_pick.all.size()-1; }
+   g_pick.sel[(size_t)at]=1; g_pick.anchor=at; svPickReveal(at);
+   g_pick.seed.clear(); g_pick.msg.clear();
+}
+
+static void solverPickDraw(){
+   float px,py,pw,ph; solverPanelRect(px,py,pw,ph);
+   ovPanel(px,py,pw,ph,L"Solver",L"Wybór rozdań do rozwiązania",false);
+   float x,ly,w,lh,seedY,stageY,btnY; svPickList(x,ly,w,lh,seedY,stageY,btnY);
+   if(g_pick.msg.empty()) ovNote(L"Kliknięcie zaznacza lub odznacza, Shift – zakres. Na czerwono: nierozwiązywalne, na niebiesko: wpisane ręcznie.",x,py+84,w,22);
+   else ovText(g_pick.msg,x,py+84,w,22,13.5f,1.f,0.55f,0.55f,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+   // the list
+   ovRect(x,ly,w,lh,8,0,0,0,0.30f); ovRect(x,ly,w,lh,8,1,1,1,0.18f,false,1.f);
+   const int n=(int)g_pick.all.size(); const float content=n*SV_ROW_H+8.f; const bool bar=content>lh+1.f;
+   svScrollBar(x+w-14,ly+4,lh-8,lh,content,&g_pick.scroll,g_svDragThumb);
+   g_d2dRT->PushAxisAlignedClip(D2D1::RectF(x+1,ly+1,x+w-1,ly+lh-1),D2D1_ANTIALIAS_MODE_ALIASED);
+   const float rw=w-(bar?24.f:8.f);
+   for(int i=0;i<n;i++){
+      float top=ly+4+i*SV_ROW_H-g_pick.scroll;
+      if(top+SV_ROW_H<ly||top>ly+lh) continue;
+      const bool sel=g_pick.sel[(size_t)i]!=0; const int kind=g_pick.kind[(size_t)i];
+      if(sel) ovRect(x+4,top,rw,SV_ROW_H-2,5,1,1,1,0.13f);
+      ovRect(x+12,top+5,18,18,4,1,1,1,0.14f); ovRect(x+12,top+5,18,18,4,1,1,1,0.50f,false,1.3f);
+      if(sel){ g_renderer.drawLine(x+16,top+14,x+20,top+18,2.4f,255,220,80,255); g_renderer.drawLine(x+20,top+18,x+27,top+9,2.4f,255,220,80,255); }
+      float cr=LIT_R,cg=LIT_G,cb=LIT_B; if(kind==1){ cr=1.f; cg=0.55f; cb=0.55f; } else if(kind==2){ cr=0.62f; cg=0.80f; cb=1.f; }
+      ovText(solverPickText(g_pick.all[(size_t)i],kind),x+42,top,rw-40,SV_ROW_H-2,15,cr,cg,cb,1.f,kind==1,DWRITE_TEXT_ALIGNMENT_LEADING);
+      float y0=std::max(top,ly+1), y1=std::min(top+SV_ROW_H,ly+lh-1);
+      if(y1>y0) ovHit(x+4,y0,rw,y1-y0,OH_SVP_ROW,i);
+   }
+   g_d2dRT->PopAxisAlignedClip();
+   // the seed typed by hand, with the mode it is played in
+   ovLabel(L"Ziarno:",x,seedY,70,36);
+   ovRect(x+74,seedY,170,36,7,0,0,0,0.35f); ovRect(x+74,seedY,170,36,7,1.f,0.86f,0.30f,0.60f,false,1.5f);
+   const bool caret=(GetTickCount()/500)%2==0;
+   if(g_pick.seed.empty()) ovText(caret?L"│":L"wpisz numer",x+84,seedY,150,36,caret?16.f:13.5f,DIM_R,DIM_G,DIM_B,caret?1.f:0.7f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+   else ovText(g_pick.seed+(caret?L"│":L""),x+84,seedY,150,36,16,1,1,1,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+   ovButton(x+256,seedY,112,36,L"Tylko król",OH_SVP_MODE,0,g_pick.mode==0);
+   ovButton(x+372,seedY,132,36,L"Dowolna karta",OH_SVP_MODE,1,g_pick.mode==1);
+   ovButton(x+w-130,seedY,130,36,L"Dodaj do listy",OH_SVP_ADD,0);
+   solverStageDraw(x,stageY,w);
+   int cnt=0; for(char c:g_pick.sel) if(c) cnt++;
+   ovButton(x,btnY,210,40,L"Rozwiąż wybrane ("+std::to_wstring(cnt)+L")",OH_SVP_OK,0,cnt>0,cnt>0,15);
+   ovButton(x+218,btnY,170,40,L"Zaznacz wszystkie",OH_SVP_ALL,0,false,true,15);
+   ovButton(x+396,btnY,110,40,L"Odznacz",OH_SVP_NONE,0,false,cnt>0,15);
+   ovButton(x+w-120,btnY,120,40,L"Anuluj",OH_SVP_CANCEL,0,false,true,15);
+}
+
+static void solverRunDraw(){
+   float px,py,pw,ph; solverPanelRect(px,py,pw,ph);
+   ovPanel(px,py,pw,ph,L"Solver",L"Szukanie rozwiązań",false);
+   const float x=px+28, w=pw-56; float y=py+90;
+   ovText(g_sv.sTitle,x,y,w,28,17,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_LEADING); y+=34;
+   ovText(g_sv.sTime,x,y,w,24,14,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING); y+=26;
+   ovBar(x,y,w,12,g_sv.fTime); y+=26;
+   ovText(g_sv.sAttempts,x,y,w,24,14,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING); y+=30;
+   ovText(g_sv.sCurrent,x,y,w,24,14,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING); y+=26;
+   ovBar(x,y,w,12,g_sv.fCurrent); y+=26;
+   ovWrap(g_sv.sBest,x,y,w,44,14,LIT_R,LIT_G,LIT_B,1.f); y+=46;
+   ovBar(x,y,w,12,g_sv.fBest); y+=26;
+   ovText(g_sv.sNodes,x,y,w,24,14,DIM_R,DIM_G,DIM_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING); y+=34;
+   y+=solverStageDraw(x,y,w)+10.f;
+   ovButton(x+w/2-80,y,160,40,g_sv.stopping?L"Kończę…":L"Przerwij",OH_SVR_STOP,0,false,!g_sv.stopping,15);
+}
+
+static void solverAskDraw(){
+   float px,py,pw,ph; solverPanelRect(px,py,pw,ph);
+   ovPanel(px,py,pw,ph,L"Solver",L"Etap zakończony bez rozwiązania",false);
+   const float x=px+32, w=pw-64;
+   wchar_t b[256];
+   swprintf(b,256,L"Nie znalazłem rozwiązania rozdania nr %lld w ciągu %d min. Czy kontynuować poszukiwania?",g_ask.seed,g_solverStageMin);
+   ovWrap(b,x,py+92,w,64,18,LIT_R,LIT_G,LIT_B,1.f,true);
+   ULONGLONG now=GetTickCount64(); int secs=g_ask.endAt>now?(int)((g_ask.endAt-now+999)/1000):0;
+   swprintf(b,256,L"Bez odpowiedzi za %d s kontynuuję poszukiwania.",secs);
+   ovText(b,x,py+160,w,24,14,DIM_R,DIM_G,DIM_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+   const float by=py+ph-72;
+   ovButton(px+pw/2-216,by,208,42,L"Tak, szukaj dalej",OH_SVA_YES,0,true,true,15);
+   ovButton(px+pw/2+8,by,208,42,L"Nie, następne",OH_SVA_NO,0,false,true,15);
+}
+
+static void solverResultDraw(){
+   float px,py,pw,ph; solverPanelRect(px,py,pw,ph);
+   ovPanel(px,py,pw,ph,L"Solver",L"Wynik",false);
+   const float x=px+28, w=pw-56, y=py+92, h=ph-92-24-56;
+   const float tw=w-18.f; const float content=ovMeasure(g_svResText,15,tw)+8.f;
+   svScrollBar(x+w-8,y,h,h,content,&g_svResScroll,g_svDragThumb);
+   g_d2dRT->PushAxisAlignedClip(D2D1::RectF(x,y,x+w,y+h),D2D1_ANTIALIAS_MODE_ALIASED);
+   ovWrap(g_svResText,x,y-g_svResScroll,tw,content+40,15,LIT_R,LIT_G,LIT_B,1.f);
+   g_d2dRT->PopAxisAlignedClip();
+   ovButton(px+pw/2-70,py+ph-64,140,40,L"OK",OH_SVX_OK,0,true,true,15);
+}
+
+static void solverOverlayDraw(){
+   g_svScrollPtr=nullptr;
+   switch(g_ov){
+   case OV_SOLVER_PICK:   solverPickDraw(); break;
+   case OV_SOLVER_RUN:    solverRunDraw(); break;
+   case OV_SOLVER_ASK:    solverAskDraw(); break;
+   case OV_SOLVER_RESULT: solverResultDraw(); break;
+   }
+}
+
+static void solverStopRun(){ if(g_sv.stopping) return; g_sv.cancel.store(true); g_sv.stopping=true; }
+static void solverAskAnswer(bool yes){ g_ask.yes=yes; g_ov=OV_SOLVER_RUN; invalidateGame(); }
+
+static void solverOverlayClick(const OvHit& h,float mx,float){
+   if(g_ov==OV_SOLVER_PICK || g_ov==OV_SOLVER_RUN){ if(solverStageClick(h,mx)) return; }
+   switch(h.kind){
+   case OH_SVP_ROW:{
+      size_t i=(size_t)h.a; if(i>=g_pick.sel.size()) break;
+      if((GetKeyState(VK_SHIFT)&0x8000) && g_pick.anchor>=0){
+         int a=std::min(g_pick.anchor,h.a), b=std::max(g_pick.anchor,h.a);
+         for(int k=a;k<=b;k++) g_pick.sel[(size_t)k]=1;
+      } else { g_pick.sel[i]=!g_pick.sel[i]; g_pick.anchor=h.a; }
+      break;}
+   case OH_SVP_ALL:    for(auto& c:g_pick.sel) c=1; break;
+   case OH_SVP_NONE:   for(auto& c:g_pick.sel) c=0; break;
+   case OH_SVP_OK:     solverPickAccept(); break;
+   case OH_SVP_CANCEL: g_pick.ok=false; ovClose(); break;
+   case OH_SVP_ADD:    solverPickAddTyped(); break;
+   case OH_SVP_MODE:   g_pick.mode=h.a; break;
+   case OH_SVR_STOP:   solverStopRun(); break;
+   case OH_SVA_YES:    solverAskAnswer(true); break;
+   case OH_SVA_NO:     solverAskAnswer(false); break;
+   case OH_SVX_OK:     ovClose(); break;
+   }
+}
+// a click that hit no control: the scroll bar of the list / result text
+static void solverOverlayDown(float mx,float my){
+   if(!g_svScrollPtr||g_svContentH<=g_svViewH+1.f) return;
+   if(mx<g_svTrackX-6||mx>g_svTrackX+14||my<g_svTrackY||my>g_svTrackY+g_svTrackH) return;
+   float th=std::max(30.f,g_svTrackH*g_svViewH/g_svContentH), ty=g_svTrackY+(g_svTrackH-th)*(*g_svScrollPtr/std::max(1.f,g_svContentH-g_svViewH));
+   if(my>=ty&&my<=ty+th){ g_svDragThumb=true; g_svGrabDy=my-ty; SetCapture(g_gameHwnd); }
+   else { *g_svScrollPtr+=(my<ty?-1.f:1.f)*g_svViewH*0.9f; svClampScroll(); }
+}
+static void solverOverlayMove(float mx,float my){
+   if(g_ovDragSv){ solverSetStage(mx); return; }
+   if(g_svDragThumb && g_svScrollPtr){
+      float th=std::max(30.f,g_svTrackH*g_svViewH/std::max(1.f,g_svContentH)), track=g_svTrackH-th; if(track<1.f) return;
+      *g_svScrollPtr=((my-g_svGrabDy-g_svTrackY)/track)*(g_svContentH-g_svViewH); svClampScroll(); invalidateGame();
+   }
+}
+static void solverOverlayUp(){
+   g_ovSwallowUp=false;
+   if(g_ovDragSv||g_svDragThumb){ g_ovDragSv=g_svDragThumb=false; ReleaseCapture(); invalidateGame(); }
+}
+static void solverOverlayWheel(int delta){
+   if(!g_svScrollPtr) return;
+   *g_svScrollPtr-=(float)delta/120.f*60.f; svClampScroll(); invalidateGame();
+}
+static void solverOverlayKey(WPARAM k){
+   switch(g_ov){
+   case OV_SOLVER_PICK:{
+      if(k==VK_ESCAPE){ g_pick.ok=false; ovClose(); return; }
+      if(k==VK_RETURN){ if(!g_pick.seed.empty()) solverPickAddTyped(); else solverPickAccept(); }
+      else if(k==VK_BACK){ if(!g_pick.seed.empty()) g_pick.seed.pop_back(); g_pick.msg.clear(); }
+      else if((k>='0'&&k<='9')||(k>=VK_NUMPAD0&&k<=VK_NUMPAD9)){
+         if(g_pick.seed.size()<10) g_pick.seed.push_back((wchar_t)(k>='0'&&k<='9'?k:k-VK_NUMPAD0+'0'));
+         g_pick.msg.clear();
+      }
+      else if(k=='A'&&(GetKeyState(VK_CONTROL)&0x8000)){ for(auto& c:g_pick.sel) c=1; }
+      else if(g_svScrollPtr){
+         switch(k){
+         case VK_UP:    *g_svScrollPtr-=SV_ROW_H; break;
+         case VK_DOWN:  *g_svScrollPtr+=SV_ROW_H; break;
+         case VK_PRIOR: *g_svScrollPtr-=g_svViewH*0.9f; break;
+         case VK_NEXT:  *g_svScrollPtr+=g_svViewH*0.9f; break;
+         default: break;
+         }
+         svClampScroll();
+      }
+      break;}
+   case OV_SOLVER_RUN:    if(k==VK_ESCAPE) solverStopRun(); break;
+   case OV_SOLVER_ASK:    if(k==VK_ESCAPE) solverAskAnswer(false); else if(k==VK_RETURN) solverAskAnswer(true); break;
+   case OV_SOLVER_RESULT:
+      if(k==VK_ESCAPE||k==VK_RETURN) ovClose();
+      else if(g_svScrollPtr){
+         switch(k){
+         case VK_UP:    *g_svScrollPtr-=40; break;
+         case VK_DOWN:  *g_svScrollPtr+=40; break;
+         case VK_PRIOR: *g_svScrollPtr-=g_svViewH*0.9f; break;
+         case VK_NEXT:  *g_svScrollPtr+=g_svViewH*0.9f; break;
+         default: break;
+         }
+         svClampScroll();
+      }
+      break;
+   }
+   invalidateGame();
+}
+
+// ── the three questions the batch asks ───────────────────────────────────────
+static bool pickSolverGames(HWND,const std::vector<NumEntry>& lost,const std::vector<NumEntry>& unsolvable,std::vector<NumEntry>& out){
+   g_pick=SolverPick();
+   for(auto& e: lost){ g_pick.all.push_back(e); g_pick.kind.push_back(0); }
+   for(auto& e: unsolvable){
+      bool dup=false; for(auto& x: g_pick.all) if(x.num==e.num){ dup=true; break; }
+      if(!dup){ g_pick.all.push_back(e); g_pick.kind.push_back(1); }
+   }
+   g_pick.sel.assign(g_pick.all.size(),0);
+   for(size_t i=0;i<g_pick.all.size();i++) if(g_pick.kind[i]==0){ g_pick.sel[i]=1; g_pick.anchor=(int)i; break; }
+   g_pick.mode=g_freeColMode?1:0;
+   loadSolverUiSettings();
+   g_svQuit=false;
+   solverOverlayOpen(OV_SOLVER_PICK);
+   ULONGLONG lastDraw=0;
+   solverOverlayLoop([]{ return g_ov==OV_SOLVER_PICK; },[&]{ ULONGLONG n=GetTickCount64(); if(n-lastDraw>=250){ lastDraw=n; invalidateGame(); } });
+   if(g_ov==OV_SOLVER_PICK) ovClose();
+   if(g_pick.ok) out=g_pick.chosen;
+   return g_pick.ok;
+}
+static bool solverAskContinue(long long seed){
+   g_ask=SolverAsk(); g_ask.endAt=GetTickCount64()+(ULONGLONG)SOLVER_ASK_SECONDS*1000ULL; g_ask.seed=seed;
+   MessageBeep(MB_ICONQUESTION);
+   solverOverlayOpen(OV_SOLVER_ASK);
+   ULONGLONG lastDraw=0;
+   solverOverlayLoop([]{ return g_ov==OV_SOLVER_ASK; },[&]{
+      ULONGLONG n=GetTickCount64();
+      if(n>=g_ask.endAt){ g_ask.yes=true; g_ov=OV_SOLVER_RUN; invalidateGame(); return; }     // no answer: carry on searching
+      if(n-lastDraw>=200){ lastDraw=n; invalidateGame(); } });
+   if(g_ov==OV_SOLVER_ASK) g_ov=OV_SOLVER_RUN;
+   return g_ask.yes;
+}
+static void runSolverBatch(HWND,const std::vector<NumEntry>& picked){
    g_sv.list=picked; g_sv.idx=0; g_sv.finished=false; g_sv.busy=false;
    g_sv.solvedCount=g_sv.unsolvableCount=g_sv.abortedCount=0; g_sv.log.clear();
    loadSolverUiSettings();
-   RECT r={0,0,520,408}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_DLGMODALFRAME);
-   g_sv.hwnd=CreateWindowExW(WS_EX_DLGMODALFRAME,L"PasjansSolverProg",L"Solver – szukanie rozwiązań",st,CW_USEDEFAULT,CW_USEDEFAULT,
-      r.right-r.left,r.bottom-r.top,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
-   if(!g_sv.hwnd) return;
-   solverCenterOn(g_sv.hwnd,parent);
+   g_svQuit=false;
    g_sv.P.reset(new solver::Progress());
+   solverOverlayOpen(OV_SOLVER_RUN);
    solverStartCurrent();
    solverUpdateUI();
-   solverModalLoop(g_sv.hwnd,parent);
+   ULONGLONG lastPoll=0;
+   solverOverlayLoop([]{ return !g_sv.finished; },[&]{
+      ULONGLONG n=GetTickCount64();
+      if(n-lastPoll>=250){ lastPoll=n; solverPoll(); invalidateGame(); } });
+   if(!g_sv.finished && g_sv.thread){       // the program is closing: stop the search first
+      g_sv.cancel.store(true); WaitForSingleObject(g_sv.thread,INFINITE); CloseHandle(g_sv.thread); g_sv.thread=nullptr;
+   }
+   if(g_svQuit){ ovClose(); return; }
    // summary
    std::wstring msg=L"Rozwiązane: "+std::to_wstring(g_sv.solvedCount)+L"   Nierozwiązane: "+std::to_wstring(g_sv.unsolvableCount);
    if(g_sv.abortedCount) msg+=L"   Przerwane: "+std::to_wstring(g_sv.abortedCount);
-   msg+=L"\r\n\r\n"+g_sv.log;
-   if(g_sv.solvedCount) msg+=L"\r\nRozwiązania (folder Solved) wczytasz przez Akcje → Wczytaj grę; kolejne kroki przechodzi przycisk „Ponów”.";
-   MessageBoxW(parent,msg.c_str(),L"Solver – wynik",MB_OK|(g_sv.solvedCount?MB_ICONINFORMATION:MB_ICONWARNING));
+   msg+=L"\n\n"+g_sv.log;
+   if(g_sv.solvedCount) msg+=L"\nRozwiązania (folder Solved) wczytasz przez Akcje → Wczytaj grę; kolejne kroki przechodzi przycisk „Ponów”.";
+   for(size_t k=0;(k=msg.find(L"\r\n",k))!=std::wstring::npos;) msg.erase(k,1);     // the log lines end in \r\n
+   g_svResText=msg; g_svResScroll=0;
+   solverOverlayOpen(OV_SOLVER_RESULT);
+   solverOverlayLoop([]{ return g_ov==OV_SOLVER_RESULT; },[]{});
+   if(g_ov==OV_SOLVER_RESULT) ovClose();
 }
-
 // ── 5. the toolbar button ────────────────────────────────────────────────────
 static void showSolver(HWND hwnd){
    std::vector<NumEntry> lost=readNumberFile(getLostNumbersPath());
@@ -4973,8 +5235,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       addTip(hBStats, L"Statystyki (S)");
       addTip(hBSett,  L"Ustawienia");
 
-      // Icons only (no captions under the buttons); hover highlight comes from a small subclass.
+      // Hover highlight comes from a small subclass; the caption of each button is a small label under it.
       for(HWND b:{hBNew,hBHint,hBSamo,hBSolv,hBUndo,hBRedo,hBStats,hBSett}) SetWindowSubclass(b,BtnHoverProc,1,0);
+      {
+         HFONT hCapFont=CreateFontW(-MulDiv(9,GetDeviceCaps(GetDC(nullptr),LOGPIXELSY),72),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,
+            DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
+         const int xs[8]={BX_NEW,BX_HINT,BX_SAMO,BX_SOLV,BX_UNDO,BX_REDO,BX_STATS,BX_SETT};
+         const wchar_t* caps[8]={L"Nowa gra",L"Podpowiedź",L"Samograj",L"Solver",L"Cofnij",L"Ponów",L"Statystyki",L"Ustawienia"};
+         for(int i=0;i<8;i++){
+            g_hBtnCap[i]=CreateWindowW(L"STATIC",caps[i],WS_CHILD|WS_VISIBLE|SS_CENTER|SS_NOPREFIX,
+               xs[i]-BTN_GAP/2,BTN_Y+BTN_H+3,BTN_W+BTN_GAP,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
+            SendMessageW(g_hBtnCap[i],WM_SETFONT,(WPARAM)hCapFont,TRUE);
+         }
+      }
 
       // Auto-play scoreboard: three lines, one under the other, right of the
       // Settings button (hidden until auto-play is used — see updateAutoStatsUI).
@@ -4984,10 +5257,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,
             DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
-         const int SX=BX_SETT+BTN_W+BTN_GAP+12;
+         const int SX=BX_SETT+BTN_W+BTN_GAP+12;                 // after the last button: the deal number, moves and the clock
          for(int i=0;i<3;i++){
+            g_hStat[i]=CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,
+               SX,4+i*21,150,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
+            SendMessageW(g_hStat[i],WM_SETFONT,(WPARAM)hStatFont,TRUE);
+         }
+         for(int i=0;i<3;i++){                                   // the Samograj scoreboard, further right
             g_hAutoStat[i]=CreateWindowW(L"STATIC",L"",WS_CHILD|SS_LEFT|SS_NOPREFIX,
-               SX,4+i*21,190,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
+               SX+166,4+i*21,190,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
             SendMessageW(g_hAutoStat[i],WM_SETFONT,(WPARAM)hStatFont,TRUE);
          }
          updateAutoStatsUI(false);
@@ -5022,6 +5300,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       return 0;}
 
    case WM_COMMAND:
+      if(ovSolver()) return 0;     // a Solver window is open (modal): the toolbar and the menu are off
       // Restore keyboard focus to main window whenever a control sends WM_COMMAND
       // (buttons steal focus when clicked — this ensures shortcuts keep working)
       SetFocus(hwnd);
@@ -5114,11 +5393,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
          if(g_gameHwnd) GetClientRect(g_gameHwnd,&rc);
          else { GetClientRect(hwnd,&rc); rc.bottom-=Layout::TOOLBAR_H; }
          double now=timeGetTime()/1000.0;
+         g_fw.P.totalS=g_fwTotalS;
          g_fw.update((float)(now-g_fwLast),rc.right,rc.bottom); g_fwLast=now;
          fireworksSounds(now);
          { float el=(float)(timeGetTime()-g_fwStart)/1000.f;
-           if(el>=FW_TOTAL_S) stopFireworks();
-           else if(el>=FW_TOTAL_S-2.5f) g_fw.stopLaunching(); }
+           if(el>=g_fwTotalS){
+              if(g_devFwLoop){ g_fw.start(rc.right,rc.bottom); g_fwStart=timeGetTime(); g_fwLast=timeGetTime()/1000.0; }   // developer: the show starts over
+              else stopFireworks();
+           } }
          invalidateGame();
       } else if(wp==TIMER_SMOOTH){
          // Legacy path — now driven by PeekMessage loop; keep as no-op safety net
@@ -5564,7 +5846,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int nShow){
       // Tick smooth overlap animation, card flight animations, and the
       // "Myślę" thinking pulse (all three want the same fast, low-latency
       // tick loop instead of waiting on WM_TIMER).
-      bool anyAnim = g_smoothActive || g_animating || g_previewAnimating || g_thinking || g_ngPhase;
+      bool anyAnim = g_smoothActive || g_animating || g_previewAnimating || g_thinking || g_ngPhase || g_devRowLoop;
       if(anyAnim){
          DWORD now=timeGetTime();
          if(now-lastAnimTick>=ANIM_INTERVAL_MS){
@@ -5574,6 +5856,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int nShow){
             ngTick();
             if(g_animating || g_previewAnimating)
                tickCardAnims();
+            devTick();
             if(g_thinking){
                tickThinking();
                invalidateGame(); // repaint so the pulse animates smoothly
