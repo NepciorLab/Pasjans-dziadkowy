@@ -48,7 +48,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.1.4";
+static const wchar_t* APP_VERSION = L"1.1.5";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -70,6 +70,7 @@ static const UINT TIMER_DEAL=1, TIMER_FW=2, TIMER_BLINK=3;
 static const int  ID_NEW=201,ID_HINT=202,ID_FS=203,ID_UNDO=204,ID_REDO=205;
 static const int  ID_SAMOGRAJ=213;
 static const int  ID_SOLVER  =240;
+static const int  ID_SCOREBTN =241;      // "Pokaż szczegóły wyniku", on the toolbar next to the score
 
 // ============================================================================
 // Card flight animation
@@ -437,9 +438,10 @@ static bool           g_moveLabelDragging = false;
 static float          g_moveLabelDragOffX = 0.f;
 static float          g_moveLabelDragOffY = 0.f;
 static D2D1_RECT_F    g_moveLabelDrawnRect = {0,0,0,0}; // last drawn bounds (game coords)
-static D2D1_RECT_F    g_scoreBtn = {-1,-1,-1,-1};       // the "Pokaż szczegóły wyniku" button after a win (game coords)
 static bool           g_won=false, g_noMoves=false;
-static std::wstring   g_congratsMsg;  // non-empty = show after animation
+static std::wstring   g_congratsMsg;  // non-empty = show the record window after the animation
+struct RecLine{ std::wstring name, value, prev; };
+static std::vector<RecLine> g_recLines; static int g_recMode=0;   // what the record window lists
 static bool           g_noMovesDialogOpen=false; // prevent showing dialog twice
 static bool           g_isFS=false;
 static RECT           g_winRect;
@@ -682,209 +684,12 @@ static const int NM_CLOSE   = 104; // closed via X / Escape — do nothing
 static const int NM_RETRY   = 105; // replay the same deal from scratch
 static const int NM_CONTINUE= 106; // "Kontynuuj układ" — same as NM_CLOSE, just an explicit button
 static void showStats(HWND parent); // forward declaration
-
-static INT_PTR CALLBACK noMovesDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM){
-   switch(msg){
-   case WM_INITDIALOG:
-      return TRUE;
-   case WM_COMMAND:
-      switch(LOWORD(wp)){
-      case NM_NEW:     EndDialog(dlg, NM_NEW);     return TRUE;
-      case NM_QUIT:    EndDialog(dlg, NM_QUIT);    return TRUE;
-      case NM_STATS:   EndDialog(dlg, NM_STATS);   return TRUE;
-      case NM_RETRY:   EndDialog(dlg, NM_RETRY);   return TRUE;
-      case NM_CONTINUE:EndDialog(dlg, NM_CONTINUE);return TRUE;
-      case IDCANCEL:   EndDialog(dlg, NM_CLOSE);   return TRUE; // Esc key
-      }
-      break;
-   case WM_CLOSE:
-      EndDialog(dlg, NM_CLOSE);
-      return TRUE;
-   }
-   return FALSE;
-}
-
-// Write a WCHAR string (including null terminator) into buf, return new position
-static BYTE* writeDlgStr(BYTE* p, const wchar_t* s){
-   while(*s){ *(WCHAR*)p=*s++; p+=2; }
-   *(WCHAR*)p=0; p+=2;
-   return p;
-}
-
-// Align pointer to DWORD boundary
-static BYTE* dwordAlign(BYTE* p){
-   ULONG_PTR v=(ULONG_PTR)p;
-   return (BYTE*)((v+3)&~(ULONG_PTR)3);
-}
-
-// Append a dialog item (button or static) to buffer, return new position
-static BYTE* appendDlgItem(BYTE* p, DWORD style, short x, short y,
-                           short cx, short cy, WORD id,
-                           WORD clsAtom, const wchar_t* text){
-   p=dwordAlign(p);
-   DLGITEMTEMPLATE* it=(DLGITEMTEMPLATE*)p;
-   it->style          =style;
-   it->dwExtendedStyle=0;
-   it->x=x; it->y=y; it->cx=cx; it->cy=cy;
-   it->id=id;
-   p+=sizeof(DLGITEMTEMPLATE);
-   *(WORD*)p=0xFFFF; p+=2;   // class by atom
-   *(WORD*)p=clsAtom; p+=2;
-   p=writeDlgStr(p,text);
-   *(WORD*)p=0; p+=2;         // no creation data
-   return p;
-}
-
-static wchar_t g_playNumBuf[16]={};
-
-static INT_PTR CALLBACK playNumDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM){
-   switch(msg){
-   case WM_INITDIALOG:
-      SetFocus(GetDlgItem(dlg,101));
-      SendDlgItemMessageW(dlg,101,EM_SETLIMITTEXT,10,0); // max 10 digits (fits in 32-bit seed)
-      return FALSE; // we set focus ourselves
-   case WM_COMMAND:
-      switch(LOWORD(wp)){
-      case IDOK:
-         GetDlgItemTextW(dlg,101,g_playNumBuf,16);
-         EndDialog(dlg, IDOK);
-         return TRUE;
-      case IDCANCEL:
-         EndDialog(dlg, IDCANCEL);
-         return TRUE;
-      }
-      break;
-   case WM_CLOSE:
-      EndDialog(dlg, IDCANCEL);
-      return TRUE;
-   }
-   return FALSE;
-}
-
-// "Zagraj pasjans numer..." — prompts for a number, then starts that exact deal
-static void showPlayNumberDialog(HWND hwnd){
-   const wchar_t* dlgTitle=L"Zagraj pasjans numer";
-   const wchar_t* dlgFace =L"Segoe UI";
-   const WORD     dlgPt   =9;
-
-   const int BUFSZ=1024;
-   BYTE* buf=(BYTE*)GlobalAlloc(GPTR,BUFSZ);
-   if(!buf) return;
-
-   DLGTEMPLATE* tmpl=(DLGTEMPLATE*)buf;
-   tmpl->style          =DS_MODALFRAME|DS_CENTER|DS_SHELLFONT|
-                         WS_POPUP|WS_CAPTION|WS_SYSMENU;
-   tmpl->dwExtendedStyle=0;
-   tmpl->cdit           =4; // label + edit + OK + Cancel
-   tmpl->x=0; tmpl->y=0; tmpl->cx=200; tmpl->cy=70;
-
-   BYTE* p=buf+sizeof(DLGTEMPLATE);
-   *(WORD*)p=0; p+=2;   // no menu
-   *(WORD*)p=0; p+=2;   // default dialog class
-   p=writeDlgStr(p,dlgTitle);
-   *(WORD*)p=dlgPt; p+=2;
-   p=writeDlgStr(p,dlgFace);
-
-   p=appendDlgItem(p, WS_CHILD|WS_VISIBLE, 8,10,184,12,
-      (WORD)0xFFFF,0x0082, L"Podaj numer pasjansa (cyfry):");
-   p=appendDlgItem(p, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP|ES_NUMBER|ES_AUTOHSCROLL,
-      8,26,184,14, 101,0x0081, L"");
-   p=appendDlgItem(p, WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON,
-      36,46,60,16, IDOK,0x0080, L"OK");
-   p=appendDlgItem(p, WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,
-      104,46,60,16, IDCANCEL,0x0080, L"Anuluj");
-
-   g_playNumBuf[0]=0;
-   INT_PTR res=DialogBoxIndirectW(
-      GetModuleHandle(nullptr), (DLGTEMPLATE*)buf, hwnd, playNumDlgProc);
-   GlobalFree(buf);
-
-   if(res==IDOK && g_playNumBuf[0]){
-      unsigned long long n=0;
-      for(const wchar_t* c=g_playNumBuf; *c; c++)
-         if(*c>=L'0' && *c<=L'9') n=n*10+(*c-L'0');
-      newGame(false,(long long)(unsigned int)n); // wraps into the 32-bit seed range
-   }
-}
-
-static void showNoMovesDialog(HWND hwnd){
-   if(g_noMovesDialogOpen) return; // already shown — ignore duplicate call
-   g_noMovesDialogOpen=true;
-   g_noMovesDialogShown=true;
-   // Cut off anything already playing (e.g. the "nono" sound from the failed
-   // move attempt that revealed this no-moves state) so it doesn't overlap
-   // with the dialog's own sound.
-   SoundSystem::instance().fadeOutAll(0);
-   playSound("koniec",g_volume);
-
-   // Build dialog template in memory
-   // Header layout (DS_SHELLFONT variant):
-   //   DLGTEMPLATE, menu=0, cls=0, title, pointSize, faceName
-   const wchar_t* dlgTitle=L"Brak ruch\u00f3w";
-   const wchar_t* dlgFace =L"Segoe UI";
-   const WORD     dlgPt   =9;
-
-   const int BUFSZ=2048;
-   BYTE* buf=(BYTE*)GlobalAlloc(GPTR,BUFSZ);
-   if(!buf) return;
-
-   // Fill DLGTEMPLATE
-   DLGTEMPLATE* tmpl=(DLGTEMPLATE*)buf;
-   tmpl->style         =DS_MODALFRAME|DS_CENTER|DS_SHELLFONT|
-                        WS_POPUP|WS_CAPTION|WS_SYSMENU;
-   tmpl->dwExtendedStyle=0;
-   tmpl->cdit          =6;   // 1 static + 5 buttons
-   tmpl->x=0; tmpl->y=0; tmpl->cx=220; tmpl->cy=108;
-
-   BYTE* p=buf+sizeof(DLGTEMPLATE);
-   *(WORD*)p=0; p+=2;   // no menu
-   *(WORD*)p=0; p+=2;   // default dialog class
-   p=writeDlgStr(p,dlgTitle);
-   // DS_SHELLFONT: point size + face name
-   *(WORD*)p=dlgPt; p+=2;
-   p=writeDlgStr(p,dlgFace);
-
-   // Item 0: static text (atom 0x0082)
-   p=appendDlgItem(p,
-      WS_CHILD|WS_VISIBLE|SS_CENTER,
-      8,10,204,20,
-      (WORD)0xFFFF,0x0082,
-      L"Brak sensownych ruch\u00f3w. Co teraz?");
-
-   // Buttons (atom 0x0080): "Kontynuuj układ" full-width on its own row,
-   // then the rest in a 2×2 grid below
-   struct { short x,y,cx; WORD id; const wchar_t* label; } btns[]={
-      {  8,34,204, NM_CONTINUE,L"Kontynuuj uk\u0142ad"     },
-      {  8,56,100, NM_NEW,     L"Nowa gra"           },
-      {112,56,100, NM_RETRY,   L"Spr\u00f3buj jeszcze raz" },
-      {  8,78,130, NM_QUIT,    L"Zamknij pasjansa"   },
-      {142,78, 70, NM_STATS,   L"Statystyki"         }
-   };
-   for(auto& b:btns){
-      p=appendDlgItem(p,
-         WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,
-         b.x,b.y,b.cx,14,
-         b.id,0x0080,b.label);
-   }
-
-   INT_PTR res=DialogBoxIndirectW(
-      GetModuleHandle(nullptr),
-      (DLGTEMPLATE*)buf,
-      hwnd,
-      noMovesDlgProc);
-
-   GlobalFree(buf);
-   g_noMovesDialogOpen=false;
-   SoundSystem::instance().fadeOutAll(300);
-
-   if(res==NM_NEW){ g_noMoves=false; newGame(); }
-   if(res==NM_RETRY){ g_noMoves=false; newGameRetry(); }
-   if(res==NM_QUIT) DestroyWindow(hwnd);
-   if(res==NM_STATS) showStats(hwnd);
-   // NM_CLOSE (X/Escape) and NM_CONTINUE ("Kontynuuj układ"): do nothing,
-   // leave the no-moves state as is — g_noMovesDialogShown keeps this dialog
-   // from popping up again until a new deal starts.
-}
+// The message boxes, questions and small windows of the game are overlays in the game window (see the Solver section):
+// styledBox() is a drop-in replacement of MessageBoxW (OK and Tak/Nie boxes).
+static int styledBox(HWND parent,const wchar_t* text,const wchar_t* title,UINT type);
+static void showPlayNumberDialog(HWND hwnd);
+static void showNoMovesDialog(HWND hwnd);
+static void showPlayFailedDialog(HWND hwnd);
 
 static BYTE bgR(){ return BG_COLORS[g_bgIndex].r; }
 static BYTE bgG(){ return BG_COLORS[g_bgIndex].g; }
@@ -1040,7 +845,7 @@ static void playRandomWinningNumber(HWND hwnd){
    FILE* f=nullptr;
    _wfopen_s(&f,path.c_str(),L"rb");
    if(!f){
-      MessageBoxW(hwnd,L"Nie zapisano jeszcze żadnej wygranej gry.",
+      styledBox(hwnd,L"Nie zapisano jeszcze żadnej wygranej gry.",
          L"Zagraj wygrywający",MB_OK|MB_ICONINFORMATION);
       return;
    }
@@ -1054,7 +859,7 @@ static void playRandomWinningNumber(HWND hwnd){
    }
    fclose(f);
    if(nums.empty()){
-      MessageBoxW(hwnd,L"Nie zapisano jeszcze żadnej wygranej gry.",
+      styledBox(hwnd,L"Nie zapisano jeszcze żadnej wygranej gry.",
          L"Zagraj wygrywający",MB_OK|MB_ICONINFORMATION);
       return;
    }
@@ -1319,7 +1124,7 @@ static ScoreInfo computeScore(bool won,int seconds,int moves,int mode,bool final
       if(!fd.empty()&&fd.back().rank==King){ s.kings++; if(fd.size()==13) s.suits++; }
    }
    s.reserve=(int)g_game.reserve.size();
-   s.B=15.0*s.kings; s.C=10.0*s.suits; s.D=60.0*std::min(104,s.ordered)/104.0;
+   s.B=15.0*s.kings; s.C=0.0; s.D=60.0*std::min(104,s.ordered)/104.0;     // (no points for complete suits)
    s.undoPen = s.undos>5 ? 20.0*((s.undos-5+4)/5) : 0.0;
    double sum;
    if(won){
@@ -1336,7 +1141,12 @@ static ScoreInfo computeScore(bool won,int seconds,int moves,int mode,bool final
    s.total = s.samo ? 0 : std::max(0,(int)std::lround(sum));
    return s;
 }
-static int liveScore(){ return computeScore(g_won,g_gameSeconds,g_moveCount,(int)g_freeColMode,false).total; }
+static ScoreInfo g_winInfo; static bool g_winInfoValid=false;    // the breakdown of the recorded win (it no longer changes)
+static int liveScore(){
+   if(g_winCounted && g_outcomeScore>=0) return g_outcomeScore;        // a win is recorded: the score is final
+   return computeScore(g_won,g_gameSeconds,g_moveCount,(int)g_freeColMode,false).total;
+}
+static ScoreInfo winScoreInfo(){ return g_winInfoValid ? g_winInfo : computeScore(true,g_outcomeSeconds,g_outcomeMoveCount,g_outcomeMode,false); }
 // the result of a finished game goes into the statistics
 static void creditScore(int m,int score,bool won,bool samo){
    if(samo||score<0) return;
@@ -1508,7 +1318,7 @@ static bool readGameFromFile(FILE* f){
       g_game.redoStack.clear();
    }
    // ver 1/2: freeColMode not stored — leave current setting unchanged
-   g_undoCount=0; g_hintCount=0; g_samoUsed=false; g_outcomeScore=-1;
+   g_undoCount=0; g_hintCount=0; g_samoUsed=false; g_outcomeScore=-1; g_winInfoValid=false;
    if(ver>=13){
       WORD uc=0,hc=0; BYTE su=0; int os=-1;
       if(fread(&uc,2,1,f)==1&&fread(&hc,2,1,f)==1&&fread(&su,1,1,f)==1&&fread(&os,4,1,f)==1){ g_undoCount=uc; g_hintCount=hc; g_samoUsed=(su!=0); g_outcomeScore=os; }
@@ -1533,7 +1343,7 @@ static void saveGameAs(HWND hwnd){
    if(!GetSaveFileNameW(&ofn)) return; // user cancelled
    FILE* f=_wfopen(filePath,L"wb");
    if(!f){
-      MessageBoxW(hwnd,L"Nie można zapisać pliku.",L"Błąd zapisu",MB_OK|MB_ICONERROR);
+      styledBox(hwnd,L"Nie można zapisać pliku.",L"Błąd zapisu",MB_OK|MB_ICONERROR);
       return;
    }
    writeGameToFile(f);
@@ -1621,13 +1431,13 @@ static void loadGameFrom(HWND hwnd){
 
    FILE* f=_wfopen(filePath,L"rb");
    if(!f){
-      MessageBoxW(hwnd,L"Nie można otworzyć pliku.",L"Błąd odczytu",MB_OK|MB_ICONERROR);
+      styledBox(hwnd,L"Nie można otworzyć pliku.",L"Błąd odczytu",MB_OK|MB_ICONERROR);
       return;
    }
    bool ok=readGameFromFile(f);
    fclose(f);
    if(!ok){
-      MessageBoxW(hwnd,L"Plik nie jest prawidłowym zapisem gry.",L"Błąd odczytu",MB_OK|MB_ICONERROR);
+      styledBox(hwnd,L"Plik nie jest prawidłowym zapisem gry.",L"Błąd odczytu",MB_OK|MB_ICONERROR);
       return;
    }
    // A finished save (won, or stuck with no moves left) used to be discarded
@@ -1640,7 +1450,7 @@ static void loadGameFrom(HWND hwnd){
    // as any other save — only the credit-then-bail early return is gone.
    bool finished = g_game.checkWin() || !g_game.hasAnyMove();
    if(finished){
-      MessageBoxW(hwnd,
+      styledBox(hwnd,
          g_game.checkWin()
             ? L"Wczytany zapis jest już wygraną grą. Wczytuję go mimo to — Cofnij pozwoli prześledzić rozegrane ruchy."
             : L"Wczytany zapis jest już zakończoną grą (brak ruchów). Wczytuję go mimo to — Cofnij pozwoli prześledzić rozegrane ruchy.",
@@ -2062,9 +1872,12 @@ static void ngDrawGather(float W,float H){
 
 // The deal number, the number of moves and the clock: three lines on the toolbar, after the last button (STATIC controls).
 static HWND g_hStat[3]={nullptr,nullptr,nullptr};
-static HWND g_hScoreCap=nullptr, g_hScore=nullptr;     // "Punkty" and the score of the game, in a big font, right of the three lines
+static HWND g_hScoreCap=nullptr, g_hScore=nullptr, g_hScoreBtn=nullptr;     // "Punkty" and the score of the game, in a big font, right of the three lines
 static void updateStatusUI(){
    if(!g_hStat[0]) return;
+   if(g_hScoreBtn){                               // the details of the score can be asked for once the game is won
+      const bool show=g_won&&!g_samoUsed; if(IsWindowVisible(g_hScoreBtn)!=(show?TRUE:FALSE)) ShowWindow(g_hScoreBtn,show?SW_SHOWNA:SW_HIDE);
+   }
    if(g_hScore){
       wchar_t sb[16]; swprintf(sb,16,L"%d",g_samoUsed?0:liveScore());
       wchar_t cur[16]={}; GetWindowTextW(g_hScore,cur,16);
@@ -2259,15 +2072,7 @@ static void drawScene(){
                               g_thinking,thinkAlpha,
                               mlx,mly,g_currentGameNumber,&moveLabelRect,false);   // false: the counters live on the toolbar now
    g_moveLabelDrawnRect={-1.f,-1.f,-1.f,-1.f};                                   // (the label can no longer be dragged)
-   g_scoreBtn={-1.f,-1.f,-1.f,-1.f};
-   if(g_won && !ovActive()){                                                       // after a win: the details of the score on request
-      const float resLeft=(float)g_layout.reservePos().x;
-      const float bw=std::max(100.f,std::min(230.f,resLeft-mlx-18.f)), bh=bw>=200.f?34.f:52.f, bx=mlx, by=mly+2.f;
-      ovRect(bx,by,bw,bh,8,1,1,1,0.20f); ovRect(bx,by,bw,bh,8,1.f,0.86f,0.30f,0.90f,false,1.8f);
-      if(bw>=200.f) ovText(L"Pokaż szczegóły wyniku",bx,by,bw,bh,14,1,1,1,1.f,true);
-      else{ ovText(L"Pokaż szczegóły",bx,by+2,bw,bh/2,13,1,1,1,1.f,true); ovText(L"wyniku",bx,by+bh/2-2,bw,bh/2,13,1,1,1,1.f,true); }
-      g_scoreBtn={bx,by,bx+bw,by+bh};
-   }
+
    overlaysDraw(fw,fh);   // Settings / Statistics / Help, on top of everything (no-op when none is open)
 }
 
@@ -2497,9 +2302,11 @@ void onStateChanged(){
          // symmetrically with the no-moves case below — nothing is counted
          // until the player is truly done with this deal.
          g_outcomeMode=m; g_outcomeMoveCount=g_moveCount; g_outcomeSeconds=g_gameSeconds;
-         g_outcomeScore=computeScore(true,g_outcomeSeconds,g_outcomeMoveCount,m,false).total;
-         bool newMoves=false, newTime=false;
+         g_winInfo=computeScore(true,g_outcomeSeconds,g_outcomeMoveCount,m,false); g_winInfoValid=true;
+         g_outcomeScore=g_winInfo.total;
+         bool newMoves=false, newTime=false, newScore=false;
          if(!g_statsExcluded){
+            newScore = (!g_samoUsed && g_outcomeScore>g_statsScoreBest[m]);
             // Preview whether this would be a new record, for the
             // congratulations message below — the actual record values
             // aren't updated until newGame() commits this outcome.
@@ -2518,22 +2325,13 @@ void onStateChanged(){
             g_fwLast=timeGetTime()/1000.0; g_fwStart=timeGetTime();
             SetTimer(g_hwnd,TIMER_FW,16,nullptr);
             // Show record-breaking congratulations after a short delay
-            if(newMoves || newTime){
-               // Build message
-               std::wstring msg=L"Nowy rekord";
-               if(newMoves && newTime)
-                  msg+=L"!\n\nPobito oba rekordy:\n"
-                       L"  • Najmniej ruchów: "+std::to_wstring(g_moveCount)+L"\n"
-                       L"  • Najkrótszy czas: "+fmtTime(g_gameSeconds);
-               else if(newMoves)
-                  msg+=L"!\n\nPobito rekord liczby ruchów:\n"
-                       L"  • Najmniej ruchów: "+std::to_wstring(g_moveCount);
-               else
-                  msg+=L"!\n\nPobito rekord czasu:\n"
-                       L"  • Najkrótszy czas: "+fmtTime(g_gameSeconds);
-               msg+=L"\n\nTryb: ";
-               msg+=(m==0?L"Tylko król":L"Dowolna karta");
-               g_congratsMsg=msg; // show after animation completes
+            if(newMoves || newTime || newScore){
+               g_recLines.clear();
+               if(newMoves) g_recLines.push_back({L"Najmniej ruchów",std::to_wstring(g_moveCount),g_statsRecordMoves[m]<0?L"":std::to_wstring(g_statsRecordMoves[m])});
+               if(newTime)  g_recLines.push_back({L"Najkrótszy czas",fmtTime(g_gameSeconds),g_statsRecordTime[m]<0?L"":fmtTime(g_statsRecordTime[m])});
+               if(newScore) g_recLines.push_back({L"Najwyższy wynik",std::to_wstring(g_outcomeScore)+L" pkt",g_statsScoreBest[m]<0?L"":std::to_wstring(g_statsScoreBest[m])+L" pkt"});
+               g_recMode=m;
+               g_congratsMsg=L"rekord"; // the record window is shown after the animation completes
             }
          }
       }
@@ -2638,7 +2436,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
 
    deleteSaveFile();
    g_gameStartTick=timeGetTime(); g_gameSeconds=0; g_congratsMsg.clear();
-   g_moveCount=0; g_undoCount=0; g_hintCount=0; g_samoUsed=false; g_outcomeScore=-1;
+   g_moveCount=0; g_undoCount=0; g_hintCount=0; g_samoUsed=false; g_outcomeScore=-1; g_winInfoValid=false;
    g_gameStarted=false;
    g_winCounted=false;
    g_autoDealCounted=false;
@@ -3380,7 +3178,6 @@ void onLDown(int mx, int my){
    // my is in main-window coords; label rect is in game-window coords (OY subtracted)
    const float OY=(float)Layout::TOOLBAR_H;
    float gmx=(float)mx, gmy=(float)my-OY;
-   if(g_won && gmx>=g_scoreBtn.left && gmx<=g_scoreBtn.right && gmy>=g_scoreBtn.top && gmy<=g_scoreBtn.bottom){ ovOpen(OV_SCORE); return; }
    auto& lr=g_moveLabelDrawnRect;
    if(gmx>=lr.left&&gmx<=lr.right&&gmy>=lr.top&&gmy<=lr.bottom){
       if(!g_moveLabelCustom){
@@ -4194,6 +3991,7 @@ static void toolbarRefresh(){
    for(int i=0;i<BTN_ICON_COUNT;i++){ HWND b=GetDlgItem(g_hwnd,BTN_ICON_IDS[i]); if(b) InvalidateRect(b,nullptr,FALSE); }
    for(HWND c:g_hBtnCap) if(c) InvalidateRect(c,nullptr,TRUE);
    for(HWND c:g_hStat) if(c) InvalidateRect(c,nullptr,TRUE);
+   if(g_hScoreBtn) InvalidateRect(g_hScoreBtn,nullptr,FALSE);
    if(g_hScoreCap) InvalidateRect(g_hScoreCap,nullptr,TRUE);
    if(g_hScore) InvalidateRect(g_hScore,nullptr,TRUE);
    invalidateGame();
@@ -4209,6 +4007,23 @@ static LRESULT CALLBACK BtnHoverProc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DW
 }
 
 static void drawIconButton(DRAWITEMSTRUCT* dis){
+   if((int)dis->CtlID==ID_SCOREBTN){                     // a plate with a two-line caption instead of an icon
+      HDC hdc=dis->hDC; RECT& rc=dis->rcItem;
+      const bool pressed=(dis->itemState&ODS_SELECTED)!=0, hover=((int)dis->CtlID==g_hoverBtn);
+      FillRect(hdc,&rc,toolbarBrush());
+      { Graphics g(hdc); g.SetSmoothingMode(SmoothingModeAntiAlias);
+        const float x=rc.left+1.5f, y=rc.top+1.5f, w=(float)(rc.right-rc.left)-3.f, h=(float)(rc.bottom-rc.top)-3.f, r=9.f;
+        GraphicsPath path; path.AddArc(x,y,2*r,2*r,180,90); path.AddArc(x+w-2*r,y,2*r,2*r,270,90);
+        path.AddArc(x+w-2*r,y+h-2*r,2*r,2*r,0,90); path.AddArc(x,y+h-2*r,2*r,2*r,90,90); path.CloseFigure();
+        SolidBrush fill(Color((BYTE)((pressed?0.30f:hover?0.28f:0.14f)*255.f),255,255,255)); g.FillPath(&fill,&path);
+        Pen pen(Color(230,255,220,77),1.5f); g.DrawPath(&pen,&path); }
+      static HFONT f=CreateFontW(-MulDiv(10,96,72),0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
+      HGDIOBJ old=SelectObject(hdc,f); SetBkMode(hdc,TRANSPARENT); SetTextColor(hdc,RGB(255,236,150));
+      RECT tr=rc; if(pressed){ tr.left++; tr.top++; }
+      DrawTextW(hdc,L"Pokaż szczegóły\nwyniku",-1,&tr,DT_CENTER|DT_VCENTER|DT_NOPREFIX);
+      SelectObject(hdc,old);
+      return;
+   }
    int idx=-1;
    for(int i=0;i<BTN_ICON_COUNT;i++) if(BTN_ICON_IDS[i]==(int)dis->CtlID){idx=i;break;}
    HDC hdc=dis->hDC;
@@ -4327,9 +4142,8 @@ static bool tickCardAnims(){
       for(int _i=0;_i<NUM_COLS;_i++) g_hideDealCol[_i]=-1;
       // Show deferred congratulations if any
       if(!g_congratsMsg.empty()){
-         std::wstring msg=g_congratsMsg; g_congratsMsg.clear();
-         invalidateGame(); UpdateWindow(g_gameHwnd?g_gameHwnd:g_hwnd);
-         MessageBoxW(g_hwnd,msg.c_str(),L"Gratulacje!",MB_OK|MB_ICONINFORMATION);
+         g_congratsMsg.clear();
+         if(!ovActive() && !g_recLines.empty()) ovOpen(OV_RECORD);
       }
    }
 
@@ -4391,45 +4205,12 @@ static void saveSolverUiSettings(){
 // real "nie znaleziono rozwiązania".
 static const ULONGLONG SOLVER_ABSOLUTE_MAX_MS = 2ULL*60ULL*60ULL*1000ULL; // 2h
 
-static HFONT solverFont(bool bold){
-   static HFONT f[2]={nullptr,nullptr};
-   if(!f[bold?1:0]){
-      HDC dc=GetDC(nullptr);
-      f[bold?1:0]=CreateFontW(-MulDiv(9,96,72),0,0,0,bold?FW_SEMIBOLD:FW_NORMAL,
-         FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
-         DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
-      ReleaseDC(nullptr,dc);
-   }
-   return f[bold?1:0];
-}
 static std::wstring solverNum(long long v){ // 1234567 -> "1 234 567"
    std::wstring s=std::to_wstring(v);
    for(int i=(int)s.size()-3;i>0;i-=3) s.insert((size_t)i,L" ");
    return s;
 }
 static const wchar_t* solverModeName(int mode){ return mode==0?L"Tylko król":L"Dowolna karta"; }
-
-static void solverCenterOn(HWND dlg,HWND parent){
-   RECT rp,rd; GetWindowRect(parent,&rp); GetWindowRect(dlg,&rd);
-   int x=rp.left+((rp.right-rp.left)-(rd.right-rd.left))/2, y=rp.top+((rp.bottom-rp.top)-(rd.bottom-rd.top))/2;
-   SetWindowPos(dlg,nullptr,x<0?0:x,y<0?0:y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
-}
-static void solverModalLoop(HWND dlg,HWND parent){
-   EnableWindow(parent,FALSE);
-   ShowWindow(dlg,SW_SHOW);
-   MSG m;
-   while(IsWindow(dlg)&&GetMessage(&m,nullptr,0,0)){
-      if(m.message==WM_QUIT){ PostQuitMessage((int)m.wParam); break; }
-      if(!IsDialogMessage(dlg,&m)){ TranslateMessage(&m); DispatchMessage(&m); }
-   }
-   EnableWindow(parent,TRUE);
-   SetForegroundWindow(parent);
-}
-static HWND solverChild(HWND parent,const wchar_t* cls,const wchar_t* text,DWORD style,int x,int y,int w,int h,int id,bool bold=false){
-   HWND c=CreateWindowExW(0,cls,text,WS_CHILD|WS_VISIBLE|style,x,y,w,h,parent,(HMENU)(INT_PTR)id,GetModuleHandleW(nullptr),nullptr);
-   SendMessageW(c,WM_SETFONT,(WPARAM)solverFont(bold),TRUE);
-   return c;
-}
 
 // ── Solver windows ───────────────────────────────────────────────────────────
 // The picker, the progress window, the "keep searching?" question and the result are overlays in the game
@@ -4815,8 +4596,25 @@ static void svScrollBar(float x,float y,float h,float view,float content,float* 
 }
 static const float SV_ROW_H=30.f;
 
+// ── the other windows of the game: a message / question (optionally with a number to type) and the "Zagraj nieudany" list
+struct MsgBtn{ int id; std::wstring label; };
+struct MsgState{ std::wstring title, sub, text, inBuf, hint; std::vector<MsgBtn> btns; int defId=IDOK, cancelId=IDCANCEL, result=0; bool input=false, done=false; };
+static MsgState g_msg;
+struct PfState{ std::vector<NumEntry> all; std::vector<int> shown; std::wstring filter; int sel=-1; float scroll=0; bool ok=false, done=false; long long chosen=-1; int mode=0; };
+static PfState g_pfs;
+static void msgGeom(float& px,float& py,float& pw,float& ph,float& textH,float& btnTop,float& btnW,bool& vertical){
+   pw=std::min(g_msg.input?520.f:(g_msg.btns.size()>3?460.f:600.f),g_ovW-30.f);
+   textH=g_msg.text.empty()?0.f:ovMeasure(g_msg.text,16,pw-64)+6.f;
+   const int n=(int)g_msg.btns.size(); vertical=n>3;
+   btnTop=96.f+textH+(g_msg.input?62.f:0.f)+18.f;                                  // relative to the top of the panel
+   btnW= vertical ? pw-64.f : std::min(190.f,(pw-64.f-(n-1)*12.f)/(float)std::max(1,n));
+   ph=std::min(g_ovH-30.f,btnTop+(vertical?n*52.f:42.f)+30.f);
+   px=std::floor((g_ovW-pw)/2.f); py=std::floor((g_ovH-ph)/2.f);
+}
 static void solverPanelRect(float& px,float& py,float& pw,float& ph){
+   if(g_ov==OV_MSG){ float a,b,c; bool v; msgGeom(px,py,pw,ph,a,b,c,v); return; }
    switch(g_ov){
+   case OV_PLAYFAILED:    pw=std::min(640.f,g_ovW-30.f); ph=std::min(700.f,g_ovH-30.f); break;
    case OV_SOLVER_PICK:   pw=std::min(760.f,g_ovW-30.f); ph=std::min(720.f,g_ovH-30.f); break;
    case OV_SOLVER_RUN:    pw=std::min(780.f,g_ovW-30.f); ph=std::min(590.f,g_ovH-30.f); break;
    case OV_SOLVER_ASK:    pw=std::min(640.f,g_ovW-30.f); ph=std::min(280.f,g_ovH-30.f); break;
@@ -4883,7 +4681,7 @@ static void solverPickDraw(){
    ovLabel(L"Ziarno:",x,seedY,70,36);
    ovRect(x+74,seedY,170,36,7,0,0,0,0.35f); ovRect(x+74,seedY,170,36,7,1.f,0.86f,0.30f,0.60f,false,1.5f);
    const bool caret=(GetTickCount()/500)%2==0;
-   if(g_pick.seed.empty()) ovText(caret?L"│":L"wpisz numer",x+84,seedY,150,36,caret?16.f:13.5f,DIM_R,DIM_G,DIM_B,caret?1.f:0.7f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+   if(g_pick.seed.empty()) ovText(L"wpisz numer",x+84,seedY,150,36,13.5f,DIM_R,DIM_G,DIM_B,0.7f,false,DWRITE_TEXT_ALIGNMENT_LEADING);      // only the hint until the first digit is typed
    else ovText(g_pick.seed+(caret?L"│":L""),x+84,seedY,150,36,16,1,1,1,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
    ovButton(x+256,seedY,112,36,L"Tylko król",OH_SVP_MODE,0,g_pick.mode==0);
    ovButton(x+372,seedY,132,36,L"Dowolna karta",OH_SVP_MODE,1,g_pick.mode==1);
@@ -4940,9 +4738,132 @@ static void solverResultDraw(){
    ovButton(px+pw/2-70,py+ph-64,140,40,L"OK",OH_SVX_OK,0,true,true,15);
 }
 
+// ── message / question window
+static void msgOverlayDraw(){
+   float px,py,pw,ph,tH,bt,bw; bool vert; msgGeom(px,py,pw,ph,tH,bt,bw,vert);
+   ovPanel(px,py,pw,ph,g_msg.title,g_msg.sub,false);
+   if(!g_msg.text.empty()) ovWrap(g_msg.text,px+32,py+92,pw-64,tH,16,LIT_R,LIT_G,LIT_B,1.f);
+   if(g_msg.input){
+      const float fy=py+92+tH+8.f, fx=px+32.f;
+      ovRect(fx,fy,260,40,7,0,0,0,0.35f); ovRect(fx,fy,260,40,7,1.f,0.86f,0.30f,0.60f,false,1.5f);
+      if(g_msg.inBuf.empty()) ovText(g_msg.hint,fx+12,fy,236,40,14,DIM_R,DIM_G,DIM_B,0.7f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+      else ovText(g_msg.inBuf+(((GetTickCount()/500)%2==0)?L"│":L""),fx+12,fy,236,40,18,1,1,1,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+   }
+   const int n=(int)g_msg.btns.size();
+   if(vert){ for(int i=0;i<n;i++) ovButton(px+32,py+bt+i*52.f,bw,42,g_msg.btns[i].label,OH_MSGBTN,g_msg.btns[i].id,g_msg.btns[i].id==g_msg.defId,true,16); }
+   else{
+      const float total=n*bw+(n-1)*12.f, x0=px+(pw-total)/2.f;
+      for(int i=0;i<n;i++) ovButton(x0+i*(bw+12.f),py+bt,bw,42,g_msg.btns[i].label,OH_MSGBTN,g_msg.btns[i].id,g_msg.btns[i].id==g_msg.defId,true,16);
+   }
+}
+static void msgPress(int id){
+   if(g_msg.input && id==IDOK && g_msg.inBuf.empty()) return;       // a number is needed
+   g_msg.result=id; g_msg.done=true;
+}
+static void msgKey(WPARAM k){
+   if(k==VK_ESCAPE){ g_msg.result=g_msg.cancelId; g_msg.done=true; return; }
+   if(k==VK_RETURN){ msgPress(g_msg.defId); return; }
+   if(!g_msg.input) return;
+   if((k>='0'&&k<='9')||(k>=VK_NUMPAD0&&k<=VK_NUMPAD9)){ if(g_msg.inBuf.size()<10) g_msg.inBuf.push_back((wchar_t)(k>='0'&&k<='9'?k:k-VK_NUMPAD0+'0')); }
+   else if(k==VK_BACK){ if(!g_msg.inBuf.empty()) g_msg.inBuf.pop_back(); }
+}
+
+// ── "Zagraj nieudany": the list of lost deals with a filter
+// Folds the handful of Polish diacritics in "Tylko król"/"Dowolna karta" down to the plain letter, so typing "krol" matches "król".
+static void foldPolish(wchar_t* s){
+   static const wchar_t from[]=L"ąćęłńóśźż";
+   static const wchar_t to[]  =L"acelnoszz";
+   for(; *s; ++s){ const wchar_t* q=wcschr(from,*s); if(q) *s=to[q-from]; }
+}
+static void pfRebuild(){
+   std::wstring f=g_pfs.filter; { std::vector<wchar_t> b(f.begin(),f.end()); b.push_back(0); CharLowerW(b.data()); foldPolish(b.data()); f=b.data(); }
+   const int prevNum= (g_pfs.sel>=0&&g_pfs.sel<(int)g_pfs.shown.size()) ? g_pfs.shown[(size_t)g_pfs.sel] : -1;
+   g_pfs.shown.clear(); g_pfs.sel=-1;
+   for(size_t i=0;i<g_pfs.all.size();i++){
+      wchar_t b[64]; swprintf(b,64,L"%lld   –   %ls",g_pfs.all[i].num,solverModeName(g_pfs.all[i].mode));
+      CharLowerW(b); foldPolish(b);
+      if(!f.empty() && !wcsstr(b,f.c_str())) continue;
+      if((int)i==prevNum) g_pfs.sel=(int)g_pfs.shown.size();
+      g_pfs.shown.push_back((int)i);
+   }
+   g_pfs.scroll=0;
+}
+static void pfAccept(){
+   if(g_pfs.sel<0||g_pfs.sel>=(int)g_pfs.shown.size()) return;
+   const NumEntry& e=g_pfs.all[(size_t)g_pfs.shown[(size_t)g_pfs.sel]];
+   g_pfs.chosen=e.num; g_pfs.mode=e.mode; g_pfs.ok=true; g_pfs.done=true;
+}
+static void pfListGeom(float& x,float& ly,float& w,float& lh){
+   float px,py,pw,ph; solverPanelRect(px,py,pw,ph);
+   x=px+28; w=pw-56; ly=py+138; lh=std::max(60.f,ph-138-84);
+}
+static void pfReveal(){
+   if(g_pfs.sel<0) return;
+   float x,ly,w,lh; pfListGeom(x,ly,w,lh);
+   float top=g_pfs.sel*SV_ROW_H, bot=top+SV_ROW_H+8.f;
+   if(top<g_pfs.scroll) g_pfs.scroll=top; else if(bot>g_pfs.scroll+lh) g_pfs.scroll=bot-lh;
+   g_pfs.scroll=std::max(0.f,g_pfs.scroll);
+}
+static void pfOverlayDraw(){
+   float px,py,pw,ph; solverPanelRect(px,py,pw,ph);
+   ovPanel(px,py,pw,ph,L"Zagraj nieudany",L"Rozdania zakończone brakiem ruchów lub utknięciem automatu (LostNumbers.csv)",false);
+   float x,ly,w,lh; pfListGeom(x,ly,w,lh);
+   ovLabel(L"Filtruj:",x,py+90,80,38);
+   ovRect(x+84,py+90,w-84,38,7,0,0,0,0.35f); ovRect(x+84,py+90,w-84,38,7,1.f,0.86f,0.30f,0.60f,false,1.5f);
+   if(g_pfs.filter.empty()) ovText(L"numer albo tryb (np. krol)",x+96,py+90,w-110,38,13.5f,DIM_R,DIM_G,DIM_B,0.7f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+   else ovText(g_pfs.filter+(((GetTickCount()/500)%2==0)?L"│":L""),x+96,py+90,w-110,38,16,1,1,1,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+   ovRect(x,ly,w,lh,8,0,0,0,0.30f); ovRect(x,ly,w,lh,8,1,1,1,0.18f,false,1.f);
+   const int n=(int)g_pfs.shown.size(); const float content=n*SV_ROW_H+8.f; const bool bar=content>lh+1.f;
+   svScrollBar(x+w-14,ly+4,lh-8,lh,content,&g_pfs.scroll,g_svDragThumb);
+   g_d2dRT->PushAxisAlignedClip(D2D1::RectF(x+1,ly+1,x+w-1,ly+lh-1),D2D1_ANTIALIAS_MODE_ALIASED);
+   const float rw=w-(bar?24.f:8.f);
+   for(int i=0;i<n;i++){
+      float top=ly+4+i*SV_ROW_H-g_pfs.scroll;
+      if(top+SV_ROW_H<ly||top>ly+lh) continue;
+      const NumEntry& e=g_pfs.all[(size_t)g_pfs.shown[(size_t)i]];
+      if(i==g_pfs.sel){ ovRect(x+4,top,rw,SV_ROW_H-2,5,1,1,1,0.18f); ovRect(x+4,top,rw,SV_ROW_H-2,5,1.f,0.86f,0.30f,0.90f,false,1.5f); }
+      wchar_t b[96]; swprintf(b,96,L"%lld   –   %ls",e.num,solverModeName(e.mode));
+      ovText(b,x+16,top,rw-24,SV_ROW_H-2,15,LIT_R,LIT_G,LIT_B,1.f,i==g_pfs.sel,DWRITE_TEXT_ALIGNMENT_LEADING);
+      float y0=std::max(top,ly+1), y1=std::min(top+SV_ROW_H,ly+lh-1);
+      if(y1>y0) ovHit(x+4,y0,rw,y1-y0,OH_PFROW,i);
+   }
+   g_d2dRT->PopAxisAlignedClip();
+   if(n==0) ovText(L"Żadne rozdanie nie pasuje do filtra.",x,ly+10,w,30,14,DIM_R,DIM_G,DIM_B,1.f);
+   ovButton(x,py+ph-64,220,42,L"Zagraj wybrany",OH_PFOK,0,g_pfs.sel>=0,g_pfs.sel>=0,16);
+   ovButton(x+w-150,py+ph-64,150,42,L"Anuluj",OH_PFCANCEL,0,false,true,16);
+}
+static void pfKey(WPARAM k){
+   if(k==VK_ESCAPE){ g_pfs.ok=false; g_pfs.done=true; return; }
+   if(k==VK_RETURN){ pfAccept(); return; }
+   const int n=(int)g_pfs.shown.size();
+   if(k==VK_DOWN){ if(n){ g_pfs.sel=std::min(n-1,g_pfs.sel+1); pfReveal(); } return; }
+   if(k==VK_UP){ if(n){ g_pfs.sel=std::max(0,g_pfs.sel<0?0:g_pfs.sel-1); pfReveal(); } return; }
+   if(k==VK_BACK){ if(!g_pfs.filter.empty()){ g_pfs.filter.pop_back(); pfRebuild(); } return; }
+   wchar_t c=0;
+   if(k>='0'&&k<='9') c=(wchar_t)k;
+   else if(k>='A'&&k<='Z') c=(wchar_t)(k-'A'+'a');
+   else if(k>=VK_NUMPAD0&&k<=VK_NUMPAD9) c=(wchar_t)(k-VK_NUMPAD0+'0');
+   else if(k==VK_SPACE) c=L' ';
+   if(c && g_pfs.filter.size()<40){ g_pfs.filter.push_back(c); pfRebuild(); }
+}
+static void pfClick(const OvHit& h){
+   static DWORD lastT=0; static int lastRow=-1;
+   switch(h.kind){
+   case OH_PFROW:{
+      const DWORD now=GetTickCount();
+      const bool dbl=(lastRow==h.a && now-lastT<450);
+      g_pfs.sel=h.a; lastT=now; lastRow=h.a;
+      if(dbl) pfAccept();
+      break;}
+   case OH_PFOK:     pfAccept(); break;
+   case OH_PFCANCEL: g_pfs.ok=false; g_pfs.done=true; break;
+   }
+}
 static void solverOverlayDraw(){
    g_svScrollPtr=nullptr;
    switch(g_ov){
+   case OV_MSG:           msgOverlayDraw(); break;
+   case OV_PLAYFAILED:    pfOverlayDraw(); break;
    case OV_SOLVER_PICK:   solverPickDraw(); break;
    case OV_SOLVER_RUN:    solverRunDraw(); break;
    case OV_SOLVER_ASK:    solverAskDraw(); break;
@@ -4954,6 +4875,8 @@ static void solverStopRun(){ if(g_sv.stopping) return; g_sv.cancel.store(true); 
 static void solverAskAnswer(bool yes){ g_ask.yes=yes; g_ov=OV_SOLVER_RUN; invalidateGame(); }
 
 static void solverOverlayClick(const OvHit& h,float mx,float){
+   if(g_ov==OV_MSG){ if(h.kind==OH_MSGBTN) msgPress(h.a); return; }
+   if(g_ov==OV_PLAYFAILED){ pfClick(h); return; }
    if(g_ov==OV_SOLVER_PICK || g_ov==OV_SOLVER_RUN){ if(solverStageClick(h,mx)) return; }
    switch(h.kind){
    case OH_SVP_ROW:{
@@ -5000,6 +4923,8 @@ static void solverOverlayWheel(int delta){
 }
 static void solverOverlayKey(WPARAM k){
    switch(g_ov){
+   case OV_MSG:        msgKey(k); break;
+   case OV_PLAYFAILED: pfKey(k); break;
    case OV_SOLVER_PICK:{
       if(k==VK_ESCAPE){ g_pick.ok=false; ovClose(); return; }
       if(k==VK_RETURN){ if(!g_pick.seed.empty()) solverPickAddTyped(); else solverPickAccept(); }
@@ -5105,126 +5030,88 @@ static void showSolver(HWND hwnd){
    std::vector<NumEntry> unsolvable=readNumberFile(getUnsolvablePath());
    std::vector<NumEntry> sel;
    if(!pickSolverGames(hwnd,lost,unsolvable,sel) || sel.empty()) return;
-   // the first picked deal is put on the table (in its own mode), as a practice game
-   g_freeColMode=(sel[0].mode!=0);
-   newGame(false,sel[0].num,false,true); // silent: no "new deal" sound
-   g_statsExcluded=true;
-   runSolverBatch(hwnd,sel);   // and the search starts right away
+   // the table stays as it is (the search works on its own copy of each deal) and nothing reaches the statistics
+   runSolverBatch(hwnd,sel);   // the search starts right away
 }
 
 // ============================================================================
-// "Zagraj nieudany" (Akcje menu, under "Zagraj wygrywający") — pick one deal
-// from LostNumbers.csv (the same list the Solver works through: deals that
-// ended in "no moves" or the auto-player getting stuck — see LostNumbers.csv's
-// own comment) and load it onto the table, same as "Zagraj wygrywający" does
-// for WonNumbers.csv. Reuses the Solver picker's small dialog helpers
-// (solverChild/solverCenterOn/solverModalLoop/solverModeName), defined above.
+// Running the windows above (each one is modal: a message loop of its own until it is answered)
 // ============================================================================
-static const int IDC_PF_LIST=3201, IDC_PF_FILTER=3202;
-struct PlayFailedPick {
-   std::vector<NumEntry> all;
-   std::vector<int> shown;      // indices into `all` for each row currently in the listbox
-   long long chosen=-1; int chosenMode=0; bool ok=false;
-   HWND list=nullptr, filter=nullptr, btnPlay=nullptr;
-};
-static PlayFailedPick g_pf;
-
-// In-place, case-already-lowered-by-caller: folds the handful of Polish
-// diacritics that show up in "Tylko król"/"Dowolna karta" down to their plain
-// ASCII letter, so someone filtering by typing "krol" (no diacritic — the
-// common case when a keyboard layout or habit skips them) still matches
-// "król". Deliberately tiny/hand-rolled rather than a full Unicode
-// normalization table — this dialog only ever displays the mode name and a
-// plain decimal number, so that's the entire alphabet it needs to cover.
-static void foldPolish(wchar_t* s){
-   static const wchar_t from[]=L"ąćęłńóśźż";
-   static const wchar_t to[]  =L"acelnoszz";
-   for(; *s; ++s){
-      const wchar_t* p = wcschr(from,*s);
-      if(p) *s = to[p-from];
+// -1 when the window cannot be shown (before the game window exists, closing): the caller then uses a system box.
+static int runMsgWindow(){
+   if(!g_d2dRT||!g_hwnd||g_svQuit) return -1;
+   g_msg.done=false; g_msg.result=g_msg.cancelId;
+   const int prev=g_ov;
+   solverOverlayOpen(OV_MSG);
+   ULONGLONG lastDraw=0;
+   solverOverlayLoop([]{ return !g_msg.done; },[&]{ ULONGLONG n=GetTickCount64(); if(n-lastDraw>=250){ lastDraw=n; invalidateGame(); } });
+   g_ov=prev; invalidateGame();
+   return g_svQuit?-1:g_msg.result;
+}
+static int styledBox(HWND parent,const wchar_t* text,const wchar_t* title,UINT type){
+   g_msg=MsgState(); g_msg.title=title; g_msg.text=text;
+   if((type&0xF)==MB_YESNO){
+      g_msg.btns={{IDYES,L"Tak"},{IDNO,L"Nie"}}; g_msg.defId=(type&MB_DEFBUTTON2)?IDNO:IDYES; g_msg.cancelId=IDNO;
+   } else { g_msg.btns={{IDOK,L"OK"}}; g_msg.defId=IDOK; g_msg.cancelId=IDOK; }
+   const int r=runMsgWindow();
+   return r<0 ? MessageBoxW(parent,text,title,type) : r;
+}
+// "Zagraj pasjans numer..." — prompts for a number, then starts that exact deal
+static void showPlayNumberDialog(HWND){
+   g_msg=MsgState(); g_msg.title=L"Zagraj pasjans numer"; g_msg.sub=L"Ten sam numer zawsze daje ten sam układ kart";
+   g_msg.text=L"Podaj numer pasjansa (cyfry):"; g_msg.input=true; g_msg.hint=L"numer";
+   g_msg.btns={{IDOK,L"Zagraj"},{IDCANCEL,L"Anuluj"}}; g_msg.defId=IDOK; g_msg.cancelId=IDCANCEL;
+   if(runMsgWindow()==IDOK && !g_msg.inBuf.empty()){
+      unsigned long long n=0;
+      for(wchar_t c:g_msg.inBuf) if(c>=L'0'&&c<=L'9') n=n*10+(c-L'0');
+      newGame(false,(long long)(unsigned int)n); // wraps into the 32-bit seed range
    }
 }
-// Rebuilds the visible listbox from `g_pf.all`, keeping only the rows whose
-// text contains the filter box's text (case/diacritic-insensitive substring —
-// matches against the game number and the mode name both, so typing e.g.
-// "krol" narrows to king-only deals). Called once up front and on every
-// EN_CHANGE.
-static void pfRebuildList(){
-   wchar_t f[64]={}; GetWindowTextW(g_pf.filter,f,64); CharLowerW(f); foldPolish(f);
-   SendMessageW(g_pf.list,LB_RESETCONTENT,0,0);
-   g_pf.shown.clear();
-   for(size_t i=0;i<g_pf.all.size();i++){
-      wchar_t b[64]; swprintf(b,64,L"%lld   –   %ls",g_pf.all[i].num,solverModeName(g_pf.all[i].mode));
-      wchar_t low[64]; wcscpy_s(low,b); CharLowerW(low); foldPolish(low);
-      if(f[0] && !wcsstr(low,f)) continue;
-      SendMessageW(g_pf.list,LB_ADDSTRING,0,(LPARAM)b);
-      g_pf.shown.push_back((int)i);
-   }
-   EnableWindow(g_pf.btnPlay,FALSE); // filtering (or first build) always drops any prior selection
+static void showNoMovesDialog(HWND hwnd){
+   if(g_noMovesDialogOpen) return; // already shown — ignore duplicate call
+   g_noMovesDialogOpen=true;
+   g_noMovesDialogShown=true;
+   // Cut off anything already playing (e.g. the "nono" sound from the failed move attempt that revealed this
+   // no-moves state) so it doesn't overlap with the window's own sound.
+   SoundSystem::instance().fadeOutAll(0);
+   playSound("koniec",g_volume);
+   g_msg=MsgState(); g_msg.title=L"Brak ruchów"; g_msg.text=L"Brak sensownych ruchów. Co teraz?";
+   g_msg.btns={{NM_CONTINUE,L"Kontynuuj układ"},{NM_NEW,L"Nowa gra"},{NM_RETRY,L"Spróbuj jeszcze raz"},{NM_STATS,L"Statystyki"},{NM_QUIT,L"Zamknij pasjansa"}};
+   g_msg.defId=NM_CONTINUE; g_msg.cancelId=NM_CLOSE;
+   int res=runMsgWindow(); if(res<0) res=NM_CLOSE;
+   g_noMovesDialogOpen=false;
+   SoundSystem::instance().fadeOutAll(300);
+   if(res==NM_NEW){ g_noMoves=false; newGame(); }
+   if(res==NM_RETRY){ g_noMoves=false; newGameRetry(); }
+   if(res==NM_QUIT) DestroyWindow(hwnd);
+   if(res==NM_STATS) showStats(hwnd);
+   // NM_CLOSE (Esc) and NM_CONTINUE ("Kontynuuj układ"): do nothing, leave the no-moves state as is — g_noMovesDialogShown
+   // keeps this window from popping up again until a new deal starts.
 }
-static void pfAccept(HWND dlg){
-   int sel=(int)SendMessageW(g_pf.list,LB_GETCURSEL,0,0);
-   if(sel<0 || sel>=(int)g_pf.shown.size()) return; // "Zagraj wybrany" is disabled with nothing selected, but LBN_DBLCLK can still race an empty list
-   const NumEntry& e = g_pf.all[g_pf.shown[(size_t)sel]];
-   g_pf.chosen=e.num; g_pf.chosenMode=e.mode; g_pf.ok=true;
-   DestroyWindow(dlg);
-}
-static LRESULT CALLBACK PlayFailedProc(HWND h,UINT m,WPARAM w,LPARAM l){
-   switch(m){
-   case WM_CREATE:{
-      solverChild(h,L"STATIC",L"Filtruj:",SS_LEFT,12,14,56,20,0);
-      g_pf.filter=solverChild(h,L"EDIT",L"",WS_BORDER|ES_AUTOHSCROLL|WS_TABSTOP,72,11,326,24,IDC_PF_FILTER);
-      g_pf.list=solverChild(h,L"LISTBOX",L"",WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_HASSTRINGS|WS_TABSTOP,12,44,386,266,IDC_PF_LIST);
-      g_pf.btnPlay=solverChild(h,L"BUTTON",L"Zagraj wybrany",BS_DEFPUSHBUTTON|WS_TABSTOP|WS_DISABLED,12,320,180,30,IDOK);
-      solverChild(h,L"BUTTON",L"Anuluj",BS_PUSHBUTTON|WS_TABSTOP,248,320,150,30,IDCANCEL);
-      pfRebuildList();
-      SetFocus(g_pf.filter);
-      return 0;}
-   case WM_COMMAND:
-      switch(LOWORD(w)){
-      case IDC_PF_FILTER: if(HIWORD(w)==EN_CHANGE) pfRebuildList(); return 0;
-      case IDC_PF_LIST:
-         if(HIWORD(w)==LBN_SELCHANGE)
-            EnableWindow(g_pf.btnPlay, SendMessageW(g_pf.list,LB_GETCURSEL,0,0)!=LB_ERR);
-         else if(HIWORD(w)==LBN_DBLCLK) pfAccept(h);
-         return 0;
-      case IDOK: pfAccept(h); return 0;
-      case IDCANCEL: DestroyWindow(h); return 0;
-      }
-      break;
-   case WM_CLOSE: DestroyWindow(h); return 0;
-   }
-   return DefWindowProcW(h,m,w,l);
-}
+// "Zagraj nieudany" (Akcje menu) — pick one deal from LostNumbers.csv and load it onto the table
+// (the same list the Solver works through: deals that ended in "no moves" or the auto-player getting stuck).
+// In every case here "foldPolish" lets the filter "krol" match "król".
 static void showPlayFailedDialog(HWND hwnd){
    std::vector<NumEntry> lost=readNumberFile(getLostNumbersPath());
    if(lost.empty()){
-      MessageBoxW(hwnd,L"Lista LostNumbers.csv jest pusta.\r\n\r\nDo pliku trafiają rozdania zakończone brakiem ruchów lub utknięciem automatu.",
-         L"Zagraj nieudany",MB_OK|MB_ICONINFORMATION);
+      styledBox(hwnd,L"Lista LostNumbers.csv jest pusta.\n\nDo pliku trafiają rozdania zakończone brakiem ruchów lub utknięciem automatu.",L"Zagraj nieudany",MB_OK|MB_ICONINFORMATION);
       return;
    }
-   static bool reg=false;
-   if(!reg){
-      WNDCLASSEXW wc={sizeof(wc)}; wc.lpfnWndProc=PlayFailedProc; wc.hInstance=GetModuleHandleW(nullptr);
-      wc.lpszClassName=L"PasjansPlayFailedPick"; wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
-      wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1); RegisterClassExW(&wc); reg=true;
-   }
-   g_pf=PlayFailedPick(); g_pf.all=lost;
-   RECT r={0,0,410,364}; DWORD st=WS_POPUP|WS_CAPTION|WS_SYSMENU; AdjustWindowRectEx(&r,st,FALSE,WS_EX_DLGMODALFRAME);
-   HWND dlg=CreateWindowExW(WS_EX_DLGMODALFRAME,L"PasjansPlayFailedPick",L"Zagraj nieudany",st,CW_USEDEFAULT,CW_USEDEFAULT,
-      r.right-r.left,r.bottom-r.top,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
-   if(!dlg) return;
-   solverCenterOn(dlg,hwnd);
-   solverModalLoop(dlg,hwnd);
-   if(g_pf.ok){
-      g_freeColMode=(g_pf.chosenMode!=0);
-      newGame(false,g_pf.chosen);
-      // Replaying an already-lost deal is practice/review, not a fresh
-      // attempt — never counted towards statistics (mirrors "Zagraj wygrywający").
+   if(!g_d2dRT||g_svQuit) return;
+   g_pfs=PfState(); g_pfs.all=lost; pfRebuild();
+   const int prev=g_ov;
+   solverOverlayOpen(OV_PLAYFAILED);
+   ULONGLONG lastDraw=0;
+   solverOverlayLoop([]{ return !g_pfs.done; },[&]{ ULONGLONG n=GetTickCount64(); if(n-lastDraw>=250){ lastDraw=n; invalidateGame(); } });
+   g_ov=prev; invalidateGame();
+   if(g_pfs.ok){
+      g_freeColMode=(g_pfs.mode!=0);
+      newGame(false,g_pfs.chosen);
+      // Replaying an already-lost deal is practice/review, not a fresh attempt —
+      // never counted towards statistics (mirrors "Zagraj wygrywający").
       g_statsExcluded=true;
    }
 }
-
 // ============================================================================
 // Auto-update (GitHub Releases) — see update.h for the network/version/
 // self-replace mechanics. Everything here is just the UI glue: kick off the
@@ -5274,14 +5161,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             if(notes.size()>500) notes=notes.substr(0,500)+L"…";
             msg2+=L"\n\nCo nowego:\n"+notes;
          }
-         if(MessageBoxW(hwnd,msg2.c_str(),L"Aktualizacja dostępna",MB_YESNO|MB_ICONINFORMATION)==IDYES)
+         if(styledBox(hwnd,msg2.c_str(),L"Aktualizacja dostępna",MB_YESNO|MB_ICONINFORMATION)==IDYES)
             beginUpdateDownload(hwnd,info->downloadUrl);
       }
       return 0;}
    case WM_UPDATE_DOWNLOAD_DONE:{
       std::unique_ptr<UpdateDownloadJob> job((UpdateDownloadJob*)lp);
       if(!job->ok){
-         MessageBoxW(hwnd,L"Nie udało się pobrać aktualizacji. Spróbuj ponownie później.",
+         styledBox(hwnd,L"Nie udało się pobrać aktualizacji. Spróbuj ponownie później.",
             L"Aktualizacja",MB_OK|MB_ICONERROR);
          DeleteFileW(job->destPath.c_str());
          return 0;
@@ -5291,7 +5178,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       if(update::launchSelfUpdate(job->destPath,exePath)){
          DestroyWindow(hwnd); // release the exe's file lock so the helper .bat can swap it in
       } else {
-         MessageBoxW(hwnd,L"Pobrano aktualizację, ale nie udało się jej zainstalować automatycznie.",
+         styledBox(hwnd,L"Pobrano aktualizację, ale nie udało się jej zainstalować automatycznie.",
             L"Aktualizacja",MB_OK|MB_ICONERROR);
       }
       return 0;}
@@ -5401,9 +5288,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             g_hScore=CreateWindowW(L"STATIC",L"0",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,SX+166,22,170,46,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
             SendMessageW(g_hScore,WM_SETFONT,(WPARAM)hBig,TRUE);
          }
+         g_hScoreBtn=CreateWindowW(L"BUTTON",L"",WS_CHILD|BS_OWNERDRAW,SX+166+112,22,168,44,hwnd,(HMENU)(INT_PTR)ID_SCOREBTN,((CREATESTRUCT*)lp)->hInstance,nullptr);   // shown after a win
+         SetWindowSubclass(g_hScoreBtn,BtnHoverProc,1,0);
          for(int i=0;i<3;i++){                                   // the Samograj scoreboard, further right
             g_hAutoStat[i]=CreateWindowW(L"STATIC",L"",WS_CHILD|SS_LEFT|SS_NOPREFIX,
-               SX+356,4+i*21,190,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
+               SX+166+112+168+14,4+i*21,190,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
             SendMessageW(g_hAutoStat[i],WM_SETFONT,(WPARAM)hStatFont,TRUE);
          }
          updateAutoStatsUI(false);
@@ -5460,6 +5349,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       case ID_SETTINGS: showSettings(hwnd); return 0;
       case ID_SOLVER:   showSolver(hwnd); return 0;
       case ID_STATS:    showStats(hwnd);    return 0;
+      case ID_SCOREBTN: if(g_won) ovOpen(OV_SCORE); return 0;
       case ID_SAVE_AS:   saveGameAs(hwnd);   return 0;
       case ID_LOAD_FROM: loadGameFrom(hwnd); return 0;
       case ID_SAMOGRAJ:
@@ -5552,7 +5442,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
          KillTimer(hwnd,TIMER_NOMOVES);
          // Only show dialog if still in no-moves state and not dealing/animating
          if(g_noMoves && !g_dealing && !g_animating && !g_samogranoMarathon){
-            showNoMovesDialog(hwnd);
+            if(ovActive()) SetTimer(hwnd,TIMER_NOMOVES,1000,nullptr);       // another window is open: try again in a second
+            else showNoMovesDialog(hwnd);
          }
       } else if(wp==TIMER_BLINK){
          // Blink sequence: 3 pairs of (src visible / dst visible)

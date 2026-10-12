@@ -9,13 +9,13 @@
 // uses the globals declared above that point (settings, statistics, sounds, key bindings, the D2D target).
 // ============================================================================
 
-enum { OV_NONE=0, OV_SETTINGS, OV_STATS, OV_HELP, OV_SCORE,
-       OV_SOLVER_PICK, OV_SOLVER_RUN, OV_SOLVER_ASK, OV_SOLVER_RESULT };     // the Solver windows (modal: they keep the table, the toolbar and the menu to themselves)
+enum { OV_NONE=0, OV_SETTINGS, OV_STATS, OV_HELP, OV_SCORE, OV_RECORD,
+       OV_SOLVER_PICK, OV_SOLVER_RUN, OV_SOLVER_ASK, OV_SOLVER_RESULT, OV_MSG, OV_PLAYFAILED };     // the Solver windows (modal: they keep the table, the toolbar and the menu to themselves)
 struct OvHit{ float x,y,w,h; int kind,a; };
 enum { OH_CLOSE=1, OH_GROUP, OH_BG, OH_FREE, OH_HILITE, OH_DEPTH, OH_ANIM, OH_UPDATES, OH_VOL, OH_SBROWSE, OH_SPLAY, OH_SMUTE,
        OH_SDEF, OH_KEY, OH_KEYCLR, OH_KEYDEF, OH_STATRESET,
        OH_SVP_ROW, OH_SVP_ALL, OH_SVP_NONE, OH_SVP_OK, OH_SVP_CANCEL, OH_SVP_ADD, OH_SVP_MODE, OH_SV_SLIDER, OH_SV_NEXT, OH_SV_THR,
-       OH_SVR_STOP, OH_SVA_YES, OH_SVA_NO, OH_SVX_OK, OH_NEWDEAL, OH_TORNADO, OH_DEVFIELD, OH_DEVSL, OH_DEVBTN, OH_DEVRESET };
+       OH_SVR_STOP, OH_SVA_YES, OH_SVA_NO, OH_SVX_OK, OH_NEWDEAL, OH_TORNADO, OH_DEVFIELD, OH_DEVSL, OH_DEVBTN, OH_DEVRESET, OH_RECOK, OH_MSGBTN, OH_PFROW, OH_PFOK, OH_PFCANCEL };
 
 static int   g_ov=OV_NONE;                       // which overlay is open
 static std::vector<OvHit> g_ovHits;
@@ -52,6 +52,7 @@ static void ovClose();
 static void invalidateGame();
 static void devRunRow(); static void devRunDealAll(); static void devRunTornado(); static void devRunFireworks();
 static void devSave(); static bool devFileExists(); static void devStopLoops();
+static int styledBox(HWND parent,const wchar_t* text,const wchar_t* title,UINT type);
 static std::wstring buildDateText();
 
 // ---- drawing helpers (the target is the game window's Direct2D target)
@@ -424,14 +425,13 @@ static std::wstring scDec(double v,int d=1){ wchar_t b[32]; swprintf(b,32,d==2?L
 static std::wstring scPts(double v,bool sign=true){ wchar_t b[32]; int r=(int)std::lround(v); if(sign) swprintf(b,32,r>0?L"+%d":L"%d",r); else swprintf(b,32,L"%d",r); std::wstring s=b; if(r<0) s.replace(0,1,L"−"); return s; }
 static void scoreOverlayDraw(){
    const float pw=std::min(700.f,g_ovW-30.f), ph=std::min(640.f,g_ovH-30.f), px=std::floor((g_ovW-pw)/2.f), py=std::floor((g_ovH-ph)/2.f);
-   const ScoreInfo s=computeScore(true,g_gameSeconds,g_moveCount,(int)g_freeColMode,false);
-   ovPanel(px,py,pw,ph,L"Wynik partii",g_freeColMode?L"Tryb: dowolna karta":L"Tryb: tylko król");
+   const ScoreInfo s=winScoreInfo();                     // the recorded win: it does not change any more
+   ovPanel(px,py,pw,ph,L"Wynik partii",g_outcomeMode?L"Tryb: dowolna karta":L"Tryb: tylko król");
    const float x0=px+30, w=pw-60; float y=py+92;
    struct Row{ std::wstring name, how; double pts; bool minus; };
    const Row rows[]={
       {L"Wygrana",L"",s.A,false},
       {L"Króle na miejscu",std::to_wstring(s.kings)+L" × 15",s.B,false},
-      {L"Kompletne kolory",std::to_wstring(s.suits)+L" × 10 (K→A w kolumnie lub A→K na fundacji)",s.C,false},
       {L"Porządek kart",std::to_wstring(std::min(104,s.ordered))+L" z 104 kart w sekwencjach i na fundacjach",s.D,false},
       {L"Czas",fmtTime(s.seconds)+(s.seconds<=600?L" – szybciej niż 10:00, premia":L" – powyżej 10:00 punkty maleją"),s.E,false},
       {L"Ruchy",std::to_wstring(s.moves)+(s.moves<=120?L" – nie więcej niż 120, premia":L" – powyżej 120 punkty maleją"),s.F,false},
@@ -460,6 +460,23 @@ static void scoreOverlayDraw(){
    else ovNote(L"Pozycje są zaokrąglane do całych punktów; suma jest liczona z dokładnych wartości.",x0,y+54,w,22);
 }
 
+// ============================================================================
+// "Nowy rekord": what was broken in the won game
+// ============================================================================
+static void recordOverlayDraw(){
+   const int n=(int)g_recLines.size();
+   const float pw=std::min(600.f,g_ovW-30.f), ph=std::min(g_ovH-30.f,200.f+62.f*n), px=std::floor((g_ovW-pw)/2.f), py=std::floor((g_ovH-ph)/2.f);
+   ovPanel(px,py,pw,ph,n>1?L"Nowe rekordy!":L"Nowy rekord!",g_recMode?L"Tryb: dowolna karta":L"Tryb: tylko król");
+   const float x0=px+32, w=pw-64; float y=py+96;
+   for(const RecLine& r:g_recLines){
+      ovText(r.name,x0,y,w-200,32,18,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+      ovText(r.value,x0+w-210,y-2,210,36,28,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_TRAILING);
+      ovText(r.prev.empty()?std::wstring(L"pierwszy zapisany wynik"):L"poprzedni rekord: "+r.prev,x0,y+30,w,22,13,DIM_R,DIM_G,DIM_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+      y+=62;
+   }
+   ovButton(px+pw/2-70,py+ph-68,140,42,L"OK",OH_RECOK,0,true,true,16);
+}
+
 static void ovSetVolume(float mx){
    float v=(mx-g_ovVolX)/std::max(1.f,g_ovVolW);
    g_volume=std::max(0.f,std::min(1.f,std::round(v*100.f)/100.f)); invalidateGame();
@@ -481,7 +498,7 @@ static void settingsOverlayClick(const OvHit& h,float mx){
       bool nf=(h.a==1);
       if(nf==g_freeColMode) break;
       if(g_gameStarted && !g_won && g_moveCount>0 &&
-         MessageBoxW(g_hwnd,L"Zmiana trybu rozpocznie nową grę. Kontynuować?",L"Wolne miejsce",MB_YESNO|MB_ICONQUESTION)!=IDYES) break;
+         styledBox(g_hwnd,L"Zmiana trybu rozpocznie nową grę. Kontynuować?",L"Wolne miejsce",MB_YESNO|MB_ICONQUESTION)!=IDYES) break;
       bool restart=(g_gameStarted && !g_won && g_moveCount>0);
       g_freeColMode=nf; saveSettings();
       if(restart) newGame();
@@ -579,7 +596,7 @@ static void statsOverlayDraw(){
    ovButton(x0,py+ph-60,190,36,L"Wyzeruj statystyki",OH_STATRESET,0);
 }
 static void statsReset(){
-   if(MessageBoxW(g_hwnd,L"Wyzerować wszystkie statystyki i rekordy? Tego nie można cofnąć.",L"Statystyki",MB_YESNO|MB_ICONQUESTION)!=IDYES) return;
+   if(styledBox(g_hwnd,L"Wyzerować wszystkie statystyki i rekordy? Tego nie można cofnąć.",L"Statystyki",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES) return;
    for(int m=0;m<2;m++){
       g_statsGames[m]=g_statsWins[m]=0;
       g_statsMoveSum[m][0]=g_statsMoveSum[m][1]=0;
@@ -628,8 +645,8 @@ static const HelpItem HELP_DOC[]={
  {HK_P,nullptr,L"Pasjans rozwiązany przez Ciebie zapisuje się w folderze Solved jako SolvedUser<numer>.dat. Wczytasz go przez Wczytaj grę i przejdziesz ruch po ruchu przyciskiem Ponów."},
 
  {HK_H,nullptr,L"Punktacja"},
- {HK_P,nullptr,L"Na pasku widać punkty bieżącej partii (za króle, kompletne kolory i porządek kart). Wygrana dodaje: 440 punktów za samo zwycięstwo, premię za czas (pełna do 10:00, potem punkty maleją) i za ruchy (pełna do 120, potem maleją), 1,5 punktu za każdą nierozdaną kartę z rezerwy, po 5 za puste kolumny (do 4) oraz 30 punktów za grę bez podpowiedzi (każda podpowiedź −10). Cofnięcia są wliczane do ruchów; powyżej 5 cofnięć odejmowane jest 20 punktów za każde rozpoczęte 5. Kolejne wygrane z rzędu w tym samym trybie mnożą wynik (do +10%)."},
- {HK_P,nullptr,L"Porażka (też porzucona partia) daje tylko punkty za króle, kolory i porządek, pomniejszone o 1 punkt za każdą kartę, która została w rezerwie. Użycie Samograju unieważnia punktację partii. Po wygranej przycisk „Pokaż szczegóły wyniku” rozpisuje wynik; średni i najlepszy wynik są w Statystykach."},
+ {HK_P,nullptr,L"Na pasku widać punkty bieżącej partii (za króle i porządek kart). Wygrana dodaje: 440 punktów za samo zwycięstwo, premię za czas (pełna do 10:00, potem punkty maleją) i za ruchy (pełna do 120, potem maleją), 1,5 punktu za każdą nierozdaną kartę z rezerwy, po 5 za puste kolumny (do 4) oraz 30 punktów za grę bez podpowiedzi (każda podpowiedź −10). Cofnięcia są wliczane do ruchów; powyżej 5 cofnięć odejmowane jest 20 punktów za każde rozpoczęte 5. Kolejne wygrane z rzędu w tym samym trybie mnożą wynik (do +10%)."},
+ {HK_P,nullptr,L"Porażka (też porzucona partia) daje tylko punkty za króle i porządek, pomniejszone o 1 punkt za każdą kartę, która została w rezerwie. Użycie Samograju unieważnia punktację partii. Po wygranej obok punktów pojawia się przycisk „Pokaż szczegóły wyniku”, który rozpisuje wynik, a wynik zapisany przy wygranej już się nie zmienia; średni i najlepszy wynik są w Statystykach."},
  {HK_H,nullptr,L"Solver"},
  {HK_P,nullptr,L"Przycisk Solver szuka w tle rozwiązań rozdań z listy przegranych (LostNumbers.csv). Wybierasz czas jednego etapu (1–10 min), liczbę wątków i to, czy po upływie czasu przejść do następnego rozdania. Rozwiązania trafiają do folderu Solved."},
 
@@ -740,6 +757,7 @@ static void overlaysDraw(float W,float H){
    case OV_STATS:    statsOverlayDraw(); break;
    case OV_HELP:     helpOverlayDraw(); break;
    case OV_SCORE:    scoreOverlayDraw(); break;
+   case OV_RECORD:   recordOverlayDraw(); break;
    default:          solverOverlayDraw(); break;
    }
 }
@@ -749,6 +767,7 @@ static void ovPanelRect(float& px,float& py,float& pw,float& ph){
    if(g_ov==OV_SETTINGS){ settingsRect(px,py,pw,ph); return; }
    else if(g_ov==OV_STATS){ pw=std::min(780.f,g_ovW-30.f); ph=std::min(620.f,g_ovH-30.f); }
    else if(g_ov==OV_SCORE){ pw=std::min(700.f,g_ovW-30.f); ph=std::min(640.f,g_ovH-30.f); }
+   else if(g_ov==OV_RECORD){ pw=std::min(600.f,g_ovW-30.f); ph=std::min(g_ovH-30.f,200.f+62.f*(float)g_recLines.size()); }
    else { float vx,vy,vw,vh; helpGeom(px,py,pw,ph,vx,vy,vw,vh); return; }
    px=std::floor((g_ovW-pw)/2.f); py=std::floor((g_ovH-ph)/2.f);
 }
@@ -765,6 +784,7 @@ static void ovMouseDown(float mx,float my){
       if(h.kind==OH_CLOSE){ ovClose(); return; }
       if(g_ov==OV_SETTINGS) settingsOverlayClick(h,mx);
       else if(g_ov==OV_STATS && h.kind==OH_STATRESET){ statsReset(); }
+      else if(g_ov==OV_RECORD && h.kind==OH_RECOK){ ovClose(); return; }
       invalidateGame(); return;
    }
    if(ovSolver()){ solverOverlayDown(mx,my); invalidateGame(); return; }                  // modal: a click outside does not close it
@@ -834,7 +854,7 @@ static void ovKey(WPARAM k){
       g_keys[a].shift=(GetKeyState(VK_SHIFT)&0x8000)!=0;
       g_ovCapture=-1; saveSettings(); invalidateGame(); return;
    }
-   if(k==VK_ESCAPE){ ovClose(); return; }
+   if(k==VK_ESCAPE||((g_ov==OV_RECORD||g_ov==OV_SCORE)&&k==VK_RETURN)){ ovClose(); return; }
    if(g_ov==OV_HELP){
       float px,py,pw,ph,vx,vy,vw,vh; helpGeom(px,py,pw,ph,vx,vy,vw,vh);
       switch(k){

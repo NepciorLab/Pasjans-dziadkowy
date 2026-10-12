@@ -465,3 +465,14 @@ tryb Tylko król, seed 4): 2 wątki 1,30 -> 12 wątków 6,20 -> 3 wątki 1,91 ->
 - Statystyki: średni i najlepszy wynik osobno dla każdego trybu (nie liczą się partie z Samograjem, wczytane i powtórki);
   seria wygranych jest zapisywana w pasjans.ini. Zapis gry w wersji 13 pamięta liczbę cofnięć, podpowiedzi i użycie Samograju.
 - Pomoc ma sekcję "Punktacja".
+
+# Wersja 1.1.5
+- Okno "Nowy rekord" jest nakładką w stylu gry (zamiast okna Windows) i uwzględnia rekord punktów w trybie; przy każdym rekordzie
+  pokazuje poprzednią wartość.
+- Solver nie rozdaje już kart: stół zostaje niezmieniony (wyszukiwanie pracuje na własnych kopiach rozdań), więc nic nie trafia do statystyk.
+- Pole ziarna w Solverze pokazuje tylko napis "wpisz numer", dopóki nie wpiszesz pierwszej cyfry (kursor nie miga na przemian z napisem).
+- Punktacja: usunięto punkty za kompletne kolory (maksimum wzorowej wygranej ok. 880); po zapisaniu wygranej wynik nie zmienia się
+  (nawet po dalszych ruchach, cofnięciach i podpowiedziach).
+- "Pokaż szczegóły wyniku" jest przyciskiem na pasku, obok punktów (widocznym po wygranej).
+
+- Wszystkie okna dialogowe gry są nakładkami w stylu gry: pytania Tak/Nie i komunikaty (zerowanie statystyk, zmiana trybu, aktualizacja, błędy zapisu i odczytu, pusta lista), Zagraj numer (pole z klawiatury), Brak ruchów, Zagraj nieudany (lista z filtrem, klawisze góra/dół/Enter, dwuklik) - każde jest modalne. Zostały tylko systemowe okna wyboru pliku (Zapisz / Wczytaj / Wybierz dźwięk) i komunikaty o błędzie przy starcie programu.
