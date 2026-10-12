@@ -301,7 +301,32 @@ public:
    }
    void cancelFaded() { s_fadeGen++; }
 
+   // The sounds of the fireworks (whistles, bangs): kept apart so that they can be cut at the very moment the fireworks go
+   // out — what is not visible must not be heard. (No fade: they just stop.)
+   void playFw(int idx, float volume, float pan) {
+      if(idx < 0 || idx >= SOUND_COUNT || volume < 0.01f || !m_ds) return;
+      SoundSlot& s = m_slots[idx];
+      if(s.muted || !s.primary) return;
+      IDirectSoundBuffer* dup = nullptr;
+      if(FAILED(m_ds->DuplicateSoundBuffer(s.primary, &dup)) || !dup) return;
+      dup->SetVolume(volFracToDs(volume));
+      dup->SetPan((LONG)(std::max(-1.f, std::min(1.f, pan)) * 2500.f));
+      dup->SetCurrentPosition(0);
+      dup->Play(0, 0, 0);
+      for(size_t i = 0; i < m_fwDups.size();) {              // forget the ones that have finished
+         DWORD st = 0;
+         if(FAILED(m_fwDups[i]->GetStatus(&st)) || !(st & DSBSTATUS_PLAYING)) { m_fwDups[i]->Release(); m_fwDups.erase(m_fwDups.begin() + i); }
+         else i++;
+      }
+      m_fwDups.push_back(dup);
+   }
+   void stopFw() {
+      for(auto b : m_fwDups) { b->Stop(); b->Release(); }
+      m_fwDups.clear();
+   }
+
    void shutdown() {
+      stopFw();
       for(auto b : m_dups) b->Release();
       m_dups.clear();
       for(int i = 0; i < SOUND_COUNT; i++) releaseSlot(i);
@@ -406,6 +431,7 @@ private:
    std::wstring        m_exeDir;
    SoundSlot           m_slots[SOUND_COUNT];
    std::vector<IDirectSoundBuffer*> m_dups;
+   std::vector<IDirectSoundBuffer*> m_fwDups;               // the playing sounds of the fireworks (see playFw)
    std::vector<std::wstring> m_mciAliases; // currently-playing MCI (non-WAV) sounds
    CRITICAL_SECTION    m_mciLock = {};
 

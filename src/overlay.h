@@ -9,7 +9,7 @@
 // uses the globals declared above that point (settings, statistics, sounds, key bindings, the D2D target).
 // ============================================================================
 
-enum { OV_NONE=0, OV_SETTINGS, OV_STATS, OV_HELP,
+enum { OV_NONE=0, OV_SETTINGS, OV_STATS, OV_HELP, OV_SCORE,
        OV_SOLVER_PICK, OV_SOLVER_RUN, OV_SOLVER_ASK, OV_SOLVER_RESULT };     // the Solver windows (modal: they keep the table, the toolbar and the menu to themselves)
 struct OvHit{ float x,y,w,h; int kind,a; };
 enum { OH_CLOSE=1, OH_GROUP, OH_BG, OH_FREE, OH_HILITE, OH_DEPTH, OH_ANIM, OH_UPDATES, OH_VOL, OH_SBROWSE, OH_SPLAY, OH_SMUTE,
@@ -113,6 +113,17 @@ static void ovPanel(float px,float py,float pw,float ph,const std::wstring& titl
 static void ovButton(float x,float y,float w,float h,const std::wstring& label,int kind,int a,bool active=false,bool enabled=true,float px=14.f){
    ovRect(x,y,w,h,8,1,1,1,enabled?(active?0.26f:0.14f):0.05f);
    if(active) ovRect(x,y,w,h,8,1.f,0.86f,0.30f,0.95f,false,2.f); else ovRect(x,y,w,h,8,1,1,1,enabled?0.38f:0.12f,false,1.f);
+   if(label==L"↺"){          // "back to default": a circular arrow, drawn (the glyph is missing from the fonts of older Windows)
+      const float cx=x+w/2, cy=y+h/2, r=std::min(w,h)*0.26f; const BYTE al=(BYTE)(enabled?255:100);
+      float px0=0,py0=0;
+      for(int i=0;i<=12;i++){
+         float ang=(40.f+i*25.f)*3.14159265f/180.f, qx=cx+r*cosf(ang), qy=cy-r*sinf(ang);
+         if(i>0) g_renderer.drawLine(px0,py0,qx,qy,1.8f,255,255,255,al);
+         px0=qx; py0=qy;
+      }
+      { float ang=40.f*3.14159265f/180.f, ax=cx+r*cosf(ang), ay=cy-r*sinf(ang);          // the arrow head at the start of the arc
+        g_renderer.drawLine(ax,ay,ax+r*0.8f,ay-r*0.1f,1.8f,255,255,255,al); g_renderer.drawLine(ax,ay,ax+r*0.1f,ay+r*0.85f,1.8f,255,255,255,al); }
+   } else
    ovText(label,x+4,y,w-8,h,px,1,1,1,enabled?1.f:0.4f,active);
    if(enabled) ovHit(x,y,w,h,kind,a);
 }
@@ -169,7 +180,7 @@ static DevSlider devSl(int i){
    case 5: return {L"Czas życia iskier (×)",&P.life.lo,&P.life.hi,0.3f,2.5f,0.05f,0};
    case 6: return {L"Jasność ognia (×)",&P.glow.lo,&P.glow.hi,0.2f,2.f,0.05f,0};
    case 7: return {L"Szansa rozbłysku na końcu",&P.finale,nullptr,0.f,1.f,0.05f,1};
-   case 8: return {L"Czas trwania fajerwerków",&g_fwTotalS,nullptr,5.f,60.f,1.f,3};
+   case 8: return {L"Czas wystrzeliwania fajerwerków",&g_fwTotalS,nullptr,5.f,60.f,1.f,3};
    default:return {L"Podział: stała ilość | zanikanie",&P.split,nullptr,0.f,1.f,0.05f,1};
    }
 }
@@ -348,8 +359,8 @@ static void settingsOverlayDraw(){
          ovText(cur,cx+202,y+2,cw-194-196-16,28,13.5f,mut?0.75f:1.f,mut?0.78f:1.f,mut?0.85f:1.f,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
          float bx=cx+cw-190;
          ovButton(bx,y+1,70,30,L"Wybierz",OH_SBROWSE,i,false,true,13.f);
-         ovButton(bx+76,y+1,36,30,L"▶",OH_SPLAY,i,false,!mut,13.f);
-         ovButton(bx+116,y+1,36,30,L"✕",OH_SMUTE,i,mut,true,13.f);
+         ovButton(bx+76,y+1,36,30,L"►",OH_SPLAY,i,false,!mut,17.f);
+         ovButton(bx+116,y+1,36,30,L"×",OH_SMUTE,i,mut,true,21.f);
          ovButton(bx+156,y+1,36,30,L"↺",OH_SDEF,i,false,mut||!cp.empty(),13.f);
          y+=38;
       }
@@ -390,14 +401,14 @@ static void settingsOverlayDraw(){
          ovText(devSlText(s),cx+cw-88,y,88,24,13.f,1,1,1,1.f,true,DWRITE_TEXT_ALIGNMENT_TRAILING);
       }
       break;}   case 3:{                                                                         // Keys
-      ovNote(L"Kliknij pole skrótu i naciśnij klawisz (z Shiftem, jeśli ma go wymagać). Każda akcja ma dwa skróty; ✕ czyści skrót.",cx,y-4,cw,40); y+=38;
+      ovNote(L"Kliknij pole skrótu i naciśnij klawisz (z Shiftem, jeśli ma go wymagać). Każda akcja ma dwa skróty; × czyści skrót.",cx,y-4,cw,40); y+=38;
       for(int i=0;i<KA_COUNT;i++,y+=32){
          ovText(KA_LABELS[i],cx,y,240,30,14.5f,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
          for(int s=0;s<2;s++){
             float bx=cx+250+s*160; int id=i*2+s; bool cap=(g_ovCapture==id);
             DWORD vk=s==0?g_keys[i].key1:g_keys[i].key2;
             ovButton(bx,y,104,28,cap?std::wstring(L"Naciśnij…"):bindingName(vk,g_keys[i].shift),OH_KEY,id,cap,true,13.5f);
-            ovButton(bx+108,y,28,28,L"✕",OH_KEYCLR,id,false,vk!=0,12.f);
+            ovButton(bx+108,y,28,28,L"×",OH_KEYCLR,id,false,vk!=0,20.f);
          }
       }
       y+=6;
@@ -406,6 +417,49 @@ static void settingsOverlayDraw(){
       break;}
    }
 }
+// ============================================================================
+// The score of a won game, line by line
+// ============================================================================
+static std::wstring scDec(double v,int d=1){ wchar_t b[32]; swprintf(b,32,d==2?L"%.2f":L"%.1f",v); for(wchar_t* p=b;*p;++p) if(*p==L'.') *p=L','; return b; }
+static std::wstring scPts(double v,bool sign=true){ wchar_t b[32]; int r=(int)std::lround(v); if(sign) swprintf(b,32,r>0?L"+%d":L"%d",r); else swprintf(b,32,L"%d",r); std::wstring s=b; if(r<0) s.replace(0,1,L"−"); return s; }
+static void scoreOverlayDraw(){
+   const float pw=std::min(700.f,g_ovW-30.f), ph=std::min(640.f,g_ovH-30.f), px=std::floor((g_ovW-pw)/2.f), py=std::floor((g_ovH-ph)/2.f);
+   const ScoreInfo s=computeScore(true,g_gameSeconds,g_moveCount,(int)g_freeColMode,false);
+   ovPanel(px,py,pw,ph,L"Wynik partii",g_freeColMode?L"Tryb: dowolna karta":L"Tryb: tylko król");
+   const float x0=px+30, w=pw-60; float y=py+92;
+   struct Row{ std::wstring name, how; double pts; bool minus; };
+   const Row rows[]={
+      {L"Wygrana",L"",s.A,false},
+      {L"Króle na miejscu",std::to_wstring(s.kings)+L" × 15",s.B,false},
+      {L"Kompletne kolory",std::to_wstring(s.suits)+L" × 10 (K→A w kolumnie lub A→K na fundacji)",s.C,false},
+      {L"Porządek kart",std::to_wstring(std::min(104,s.ordered))+L" z 104 kart w sekwencjach i na fundacjach",s.D,false},
+      {L"Czas",fmtTime(s.seconds)+(s.seconds<=600?L" – szybciej niż 10:00, premia":L" – powyżej 10:00 punkty maleją"),s.E,false},
+      {L"Ruchy",std::to_wstring(s.moves)+(s.moves<=120?L" – nie więcej niż 120, premia":L" – powyżej 120 punkty maleją"),s.F,false},
+      {L"Niewykorzystana rezerwa",std::to_wstring(s.reserve)+L" kart × 1,5",s.G,false},
+      {L"Puste kolumny",std::to_wstring(std::min(4,s.emptyCols))+L" × 5",s.H,false},
+      {L"Podpowiedzi",s.hints==0?std::wstring(L"bez podpowiedzi"):std::to_wstring(s.hints)+L" × −10 od 30",s.J,false},
+      {L"Cofnięcia",std::to_wstring(s.undos)+(s.undos>5?L" – po 20 za każde rozpoczęte 5 ponad 5":L" (do 5 bez kary)"),-s.undoPen,true},
+   };
+   for(const Row& r:rows){
+      ovText(r.name,x0,y,230,30,15,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+      ovText(r.how,x0+232,y,w-232-90,30,12.5f,DIM_R,DIM_G,DIM_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+      ovText(scPts(r.pts),x0+w-84,y,84,30,16,r.minus&&r.pts<0?1.f:1.f,r.minus&&r.pts<0?0.55f:0.86f,r.minus&&r.pts<0?0.55f:0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_TRAILING);
+      y+=32;
+   }
+   ovRect(x0,y+4,w,1.5f,0,1.f,0.86f,0.30f,0.45f); y+=12;
+   if(s.streak>0){
+      ovText(L"Seria zwycięstw",x0,y,230,30,15,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+      ovText(std::to_wstring(s.streak)+L" z rzędu",x0+232,y,w-232-90,30,12.5f,DIM_R,DIM_G,DIM_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+      ovText(L"× "+scDec(s.mult,2),x0+w-84,y,84,30,16,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_TRAILING);
+      y+=34;
+   }
+   y+=4;
+   ovText(L"Razem",x0,y,200,48,24,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_LEADING);
+   ovText(std::to_wstring(s.total),x0+w-220,y,220,48,34,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_TRAILING);
+   if(s.samo) ovText(L"Samograj grał w tej partii – punktacja unieważniona.",x0,y+54,w,26,14,1.f,0.55f,0.55f,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+   else ovNote(L"Pozycje są zaokrąglane do całych punktów; suma jest liczona z dokładnych wartości.",x0,y+54,w,22);
+}
+
 static void ovSetVolume(float mx){
    float v=(mx-g_ovVolX)/std::max(1.f,g_ovVolW);
    g_volume=std::max(0.f,std::min(1.f,std::round(v*100.f)/100.f)); invalidateGame();
@@ -510,7 +564,9 @@ static void statsOverlayDraw(){
      r.name=L"Śr. czas (wygrane)";       for(int m=0;m<2;m++) r.v[m]=avgTime(g_statsTimeSum[m][1],g_statsWins[m]); rows.push_back(r);
      r.name=L"Śr. czas (przegrane)";     for(int m=0;m<2;m++) r.v[m]=avgTime(g_statsTimeSum[m][0],g_statsGames[m]-g_statsWins[m]); rows.push_back(r);
      r.name=L"Rekord: najmniej ruchów";  for(int m=0;m<2;m++) r.v[m]=g_statsRecordMoves[m]<0?L"–":std::to_wstring(g_statsRecordMoves[m]); r.rule=true; rows.push_back(r); r.rule=false;
-     r.name=L"Rekord: najkrótszy czas";  for(int m=0;m<2;m++) r.v[m]=g_statsRecordTime[m]<0?L"–":fmtTime(g_statsRecordTime[m]); rows.push_back(r); }
+     r.name=L"Rekord: najkrótszy czas";  for(int m=0;m<2;m++) r.v[m]=g_statsRecordTime[m]<0?L"–":fmtTime(g_statsRecordTime[m]); rows.push_back(r);
+     r.name=L"Średni wynik (punkty)";    for(int m=0;m<2;m++) r.v[m]=g_statsScoreN[m]>0?std::to_wstring((int)((double)g_statsScoreSum[m]/g_statsScoreN[m]+0.5)):L"–"; r.rule=true; rows.push_back(r); r.rule=false;
+     r.name=L"Najlepszy wynik (punkty)"; for(int m=0;m<2;m++) r.v[m]=g_statsScoreBest[m]<0?L"–":std::to_wstring(g_statsScoreBest[m]); rows.push_back(r); }
    const float rh=std::min(34.f,(ph-92-38-6-140)/(float)rows.size());
    for(const Row& r:rows){
       if(r.rule){ ovRect(x0,y+2,w,1.2f,0,1,1,1,0.25f); y+=8; }
@@ -529,6 +585,7 @@ static void statsReset(){
       g_statsMoveSum[m][0]=g_statsMoveSum[m][1]=0;
       g_statsTimeSum[m][0]=g_statsTimeSum[m][1]=0;
       g_statsRecordMoves[m]=-1; g_statsRecordTime[m]=-1;
+      g_statsScoreSum[m]=0; g_statsScoreN[m]=0; g_statsScoreBest[m]=-1; g_statsStreak[m]=0;
    }
    g_gameStarted=false; g_moveCount=0; g_gameSeconds=0;
    saveStats(); ovClose(); newGame();
@@ -570,6 +627,9 @@ static const HelpItem HELP_DOC[]={
  {HK_P,nullptr,L"Każde rozdanie ma numer: ten sam numer zawsze daje ten sam układ kart. W menu Akcje: Zagraj numer, Zagraj wygrywający, Zagraj nieudany, Zapisz i Wczytaj grę (folder Saves)."},
  {HK_P,nullptr,L"Pasjans rozwiązany przez Ciebie zapisuje się w folderze Solved jako SolvedUser<numer>.dat. Wczytasz go przez Wczytaj grę i przejdziesz ruch po ruchu przyciskiem Ponów."},
 
+ {HK_H,nullptr,L"Punktacja"},
+ {HK_P,nullptr,L"Na pasku widać punkty bieżącej partii (za króle, kompletne kolory i porządek kart). Wygrana dodaje: 440 punktów za samo zwycięstwo, premię za czas (pełna do 10:00, potem punkty maleją) i za ruchy (pełna do 120, potem maleją), 1,5 punktu za każdą nierozdaną kartę z rezerwy, po 5 za puste kolumny (do 4) oraz 30 punktów za grę bez podpowiedzi (każda podpowiedź −10). Cofnięcia są wliczane do ruchów; powyżej 5 cofnięć odejmowane jest 20 punktów za każde rozpoczęte 5. Kolejne wygrane z rzędu w tym samym trybie mnożą wynik (do +10%)."},
+ {HK_P,nullptr,L"Porażka (też porzucona partia) daje tylko punkty za króle, kolory i porządek, pomniejszone o 1 punkt za każdą kartę, która została w rezerwie. Użycie Samograju unieważnia punktację partii. Po wygranej przycisk „Pokaż szczegóły wyniku” rozpisuje wynik; średni i najlepszy wynik są w Statystykach."},
  {HK_H,nullptr,L"Solver"},
  {HK_P,nullptr,L"Przycisk Solver szuka w tle rozwiązań rozdań z listy przegranych (LostNumbers.csv). Wybierasz czas jednego etapu (1–10 min), liczbę wątków i to, czy po upływie czasu przejść do następnego rozdania. Rozwiązania trafiają do folderu Solved."},
 
@@ -679,6 +739,7 @@ static void overlaysDraw(float W,float H){
    case OV_SETTINGS: settingsOverlayDraw(); break;
    case OV_STATS:    statsOverlayDraw(); break;
    case OV_HELP:     helpOverlayDraw(); break;
+   case OV_SCORE:    scoreOverlayDraw(); break;
    default:          solverOverlayDraw(); break;
    }
 }
@@ -687,6 +748,7 @@ static void ovPanelRect(float& px,float& py,float& pw,float& ph){
    if(ovSolver()){ solverPanelRect(px,py,pw,ph); return; }
    if(g_ov==OV_SETTINGS){ settingsRect(px,py,pw,ph); return; }
    else if(g_ov==OV_STATS){ pw=std::min(780.f,g_ovW-30.f); ph=std::min(620.f,g_ovH-30.f); }
+   else if(g_ov==OV_SCORE){ pw=std::min(700.f,g_ovW-30.f); ph=std::min(640.f,g_ovH-30.f); }
    else { float vx,vy,vw,vh; helpGeom(px,py,pw,ph,vx,vy,vw,vh); return; }
    px=std::floor((g_ovW-pw)/2.f); py=std::floor((g_ovH-ph)/2.f);
 }

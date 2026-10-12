@@ -28,7 +28,16 @@ public:
       float split=0.7f;                        // first `split` of totalS: steady number of rockets and gap, then fewer and fewer
    };
    Params P;
-   void stopLaunching(){ m_spawn=false; }          // no new rockets; the ones in the air still burst
+   void stopLaunching(){ m_spawn=false; }
+   // The show is over when nothing is launched any more (after totalS) and the last rocket has burst and its sparks have gone.
+   bool finished() const { return m_active && m_time>=P.totalS && m_rockets.empty() && m_parts.empty(); }
+   // Seconds until the last spark is gone (large while launching or while a rocket is still flying): the game brightens the
+   // table during the last of them.
+   float remaining() const {
+      if(m_time<P.totalS || !m_rockets.empty()) return 1e9f;
+      float r=0.f; for(const Part& p:m_parts) r=std::max(r,p.maxLife-p.life);
+      return r;
+   }          // no new rockets; the ones in the air still burst
    size_t particles() const { return m_parts.size(); }
    // What the ears have to know: a rocket was launched (kind 0: it flies `flight` seconds, then bursts; x = 0..1 across the
    // window) and a burst happened (kind 1; size = how many sparks). The game plays the whistles and the bangs at those moments.
@@ -233,7 +242,7 @@ private:
    }
    void step(){
       m_time+=STEP;
-      if(m_active&&m_spawn){ m_next-=STEP; if(m_next<=0.f){
+      if(m_active&&m_spawn&&m_time<P.totalS){ m_next-=STEP; if(m_next<=0.f){
             // two stages: a steady number of rockets, and from `split` of the show on fewer and fewer, down to a single one at the end
             const float T=std::max(1.f,P.totalS), s0=P.split*T;
             const float f= m_time<=s0 ? 1.f : std::max(0.f,1.f-(m_time-s0)/std::max(0.01f,T-s0));

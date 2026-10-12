@@ -28,12 +28,27 @@
 #include "sound.h"
 #include "keybindings.h"
 #include "update.h"
-KeyBinding g_keys[KA_COUNT];
+
+// ── Windows 7 ────────────────────────────────────────────────────────────────
+// The C++ library linked into the program calls GetSystemTimePreciseAsFileTime, which exists only from Windows 8: on
+// Windows 7 the program would not even start ("Nie znaleziono punktu wejścia"). This replacement takes its place (both the
+// name and the import slot are defined here, so the linker takes no import of it from kernel32): where the real function
+// exists it is called, otherwise the older GetSystemTimeAsFileTime (precision ~15 ms instead of a microsecond).
+extern "C" {
+   void PasjansPreciseTime(LPFILETIME ft) __asm__("GetSystemTimePreciseAsFileTime");
+   void PasjansPreciseTime(LPFILETIME ft){
+      typedef void (WINAPI *Fn)(LPFILETIME);
+      static Fn real=nullptr; static bool tried=false;
+      if(!tried){ HMODULE k=GetModuleHandleW(L"kernel32.dll"); real=k?(Fn)GetProcAddress(k,"GetSystemTimePreciseAsFileTime"):nullptr; tried=true; }
+      if(real&&real!=PasjansPreciseTime) real(ft); else GetSystemTimeAsFileTime(ft);
+   }
+   void (WINAPI *__imp_GetSystemTimePreciseAsFileTime)(LPFILETIME)=(void (WINAPI*)(LPFILETIME))PasjansPreciseTime;
+}KeyBinding g_keys[KA_COUNT];
 using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.1.3";
+static const wchar_t* APP_VERSION = L"1.1.4";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -401,7 +416,7 @@ static ID2D1Bitmap*   g_fwBmp=nullptr;
 static int            g_fwBw=0, g_fwBh=0;
 static double         g_fwLast=0;
 static DWORD          g_fwStart=0;           // timeGetTime() when the fireworks began
-static float          g_fwTotalS=20.f;       // the fireworks are switched off after this long (no new rockets for the last 2.5 s)
+static float          g_fwTotalS=20.f;       // nothing is launched after this long; the show ends when the last firework has burst and its sparks have gone
 static MoveHint       g_hint;
 static bool           g_hintActive  = false;
 static bool           g_hintBlinking= false;   // true during blink animation
@@ -422,6 +437,7 @@ static bool           g_moveLabelDragging = false;
 static float          g_moveLabelDragOffX = 0.f;
 static float          g_moveLabelDragOffY = 0.f;
 static D2D1_RECT_F    g_moveLabelDrawnRect = {0,0,0,0}; // last drawn bounds (game coords)
+static D2D1_RECT_F    g_scoreBtn = {-1,-1,-1,-1};       // the "Pokaż szczegóły wyniku" button after a win (game coords)
 static bool           g_won=false, g_noMoves=false;
 static std::wstring   g_congratsMsg;  // non-empty = show after animation
 static bool           g_noMovesDialogOpen=false; // prevent showing dialog twice
@@ -1272,11 +1288,67 @@ static bool readSnapshotNoTag(FILE* f, Snapshot& s){
    return true;
 }
 
+// ── Scoring ──────────────────────────────────────────────────────────────────
+// Points of a game. A WIN: 440 + 15/king + 10/complete suit + 60*cards in order/104 + time + moves + 1.5/card left in
+// the reserve + 5/empty column (max 4) + 30 - 10/hint (min 0) - undo penalty, times 1+0.02*streak of wins (max 1.1).
+// Time: 110 up to 600 s (+0.2/s below, max +60), above it halves every 129 s. Moves: 110 up to 120 moves (+1 per move
+// below, max +40), above it halves every 25.9 moves. Undos: free up to 5, then 20 for every started 5. A LOSS (also a
+// game given up): kings + suits + order - 1 per card left in the reserve. Never below 0. Samograj / the single
+// automatic move used in the game: Samograj cancels the score (0), the automatic move counts as a hint.
+static int  g_undoCount=0, g_hintCount=0;      // undos and hints used in the game on the table
+static bool g_samoUsed=false;                  // Samograj played a move in this game: no score
+static int  g_outcomeScore=-1;                 // the score captured when the game was won / ran out of moves (-1 = not captured)
+static long long g_statsScoreSum[2]={0,0};     // statistics: sum / number / best of the scores, per mode, and the streak of wins
+static int  g_statsScoreN[2]={0,0}, g_statsScoreBest[2]={-1,-1}, g_statsStreak[2]={0,0};
+struct ScoreInfo{
+   bool won=false, samo=false;
+   int kings=0, suits=0, ordered=0, reserve=0, emptyCols=0, seconds=0, moves=0, undos=0, hints=0, streak=0;
+   double A=0,B=0,C=0,D=0,E=0,F=0,G=0,H=0,J=0, undoPen=0, resPen=0, mult=1.0;
+   int total=0;
+};
+static ScoreInfo computeScore(bool won,int seconds,int moves,int mode,bool finalLoss){
+   ScoreInfo s; s.won=won; s.samo=g_samoUsed; s.seconds=seconds; s.moves=moves; s.undos=g_undoCount; s.hints=g_hintCount;
+   s.streak=std::max(0,std::min(5,g_statsStreak[mode&1]));
+   for(int c=0;c<NUM_COLS;c++){
+      const auto& col=g_game.cols[c];
+      if(col.empty()){ s.emptyCols++; continue; }
+      if(col[0].rank==King && g_game.validSeqFrom(c,0)){ s.kings++; s.ordered+=(int)col.size(); if(col.size()==13) s.suits++; }
+   }
+   for(int f=0;f<NUM_FOUND;f++){
+      const auto& fd=g_game.found[f]; s.ordered+=(int)fd.size();
+      if(!fd.empty()&&fd.back().rank==King){ s.kings++; if(fd.size()==13) s.suits++; }
+   }
+   s.reserve=(int)g_game.reserve.size();
+   s.B=15.0*s.kings; s.C=10.0*s.suits; s.D=60.0*std::min(104,s.ordered)/104.0;
+   s.undoPen = s.undos>5 ? 20.0*((s.undos-5+4)/5) : 0.0;
+   double sum;
+   if(won){
+      s.A=440.0;
+      s.E = seconds<=600 ? 110.0+std::min(60.0,(600-seconds)*0.2) : 110.0*pow(0.5,(seconds-600)/129.0);
+      s.F = moves<=120 ? 110.0+std::min(40.0,(double)(120-moves)) : 110.0*pow(0.5,(moves-120)/25.9);
+      s.G=1.5*s.reserve; s.H=5.0*std::min(4,s.emptyCols); s.J=std::max(0.0,30.0-10.0*s.hints);
+      s.mult=1.0+0.02*s.streak;
+      sum=(s.A+s.B+s.C+s.D+s.E+s.F+s.G+s.H+s.J-s.undoPen)*s.mult;
+   } else {
+      s.resPen = finalLoss ? 1.0*s.reserve : 0.0;       // cards left in the reserve of a game that is over
+      sum=s.B+s.C+s.D-s.undoPen-s.resPen;
+   }
+   s.total = s.samo ? 0 : std::max(0,(int)std::lround(sum));
+   return s;
+}
+static int liveScore(){ return computeScore(g_won,g_gameSeconds,g_moveCount,(int)g_freeColMode,false).total; }
+// the result of a finished game goes into the statistics
+static void creditScore(int m,int score,bool won,bool samo){
+   if(samo||score<0) return;
+   g_statsScoreSum[m]+=score; g_statsScoreN[m]++;
+   if(score>g_statsScoreBest[m]) g_statsScoreBest[m]=score;
+   g_statsStreak[m]= won ? g_statsStreak[m]+1 : 0;
+}
 // Write game data to an already-open FILE* (shared by auto-save and manual save)
 static void writeGameToFile(FILE* f){
    const char magic[]="PASJ";
    fwrite(magic,1,4,f);
-   BYTE ver=12; fwrite(&ver,1,1,f);  // v11 adds current game number; v12 stores the undo/redo counts as 16-bit (solver replays are long)
+   BYTE ver=13; fwrite(&ver,1,1,f);  // v11 adds current game number; v12 stores the undo/redo counts as 16-bit (solver replays are long); v13 adds the score data
    auto writeVec=[&](const std::vector<Card>& v){
       BYTE n=(BYTE)std::min((int)v.size(),255);
       fwrite(&n,1,1,f);
@@ -1317,6 +1389,9 @@ static void writeGameToFile(FILE* f){
    WORD rn=(WORD)std::min((int)g_game.redoStack.size(),(int)GameState::MAX_UNDO_HISTORY);
    fwrite(&rn,2,1,f);
    { int i=0; for(auto it=g_game.redoStack.begin(); i<rn; ++it,++i) writeSnapshot(f,*it); }
+   // v13: what the score of this game depends on
+   { WORD uc=(WORD)std::min(g_undoCount,65535), hc=(WORD)std::min(g_hintCount,65535); BYTE su=(BYTE)(g_samoUsed?1:0); int os=g_outcomeScore;
+     fwrite(&uc,2,1,f); fwrite(&hc,2,1,f); fwrite(&su,1,1,f); fwrite(&os,4,1,f); }
 }
 
 // Read game data from an already-open FILE* — returns true on success
@@ -1324,7 +1399,7 @@ static bool readGameFromFile(FILE* f){
    char magic[4]={}; fread(magic,1,4,f);
    if(magic[0]!='P'||magic[1]!='A'||magic[2]!='S'||magic[3]!='J') return false;
    BYTE ver=0; fread(&ver,1,1,f);
-   if(ver<1 || ver>12) return false;
+   if(ver<1 || ver>13) return false;
    auto readVec=[&](std::vector<Card>& v)->bool{
       BYTE n=0; if(fread(&n,1,1,f)!=1) return false;
       v.clear(); v.reserve(n);
@@ -1433,6 +1508,11 @@ static bool readGameFromFile(FILE* f){
       g_game.redoStack.clear();
    }
    // ver 1/2: freeColMode not stored — leave current setting unchanged
+   g_undoCount=0; g_hintCount=0; g_samoUsed=false; g_outcomeScore=-1;
+   if(ver>=13){
+      WORD uc=0,hc=0; BYTE su=0; int os=-1;
+      if(fread(&uc,2,1,f)==1&&fread(&hc,2,1,f)==1&&fread(&su,1,1,f)==1&&fread(&os,4,1,f)==1){ g_undoCount=uc; g_hintCount=hc; g_samoUsed=(su!=0); g_outcomeScore=os; }
+   }
    return true;
 }
 
@@ -1471,12 +1551,14 @@ struct PendingOutcomeSnapshot {
    int  moveCount, outcomeMode, outcomeMoveCount, outcomeSeconds, gameSeconds;
    bool freeColMode;
    long long gameNumber;
+   int  outcomeScore, abandonScore; bool samoUsed;     // the score captured at the end of the game / the score of the game given up now
 };
 
 static PendingOutcomeSnapshot capturePendingOutcome(){
    return { g_statsExcluded, g_winCounted, g_noMovesReached,
             g_moveCount, g_outcomeMode, g_outcomeMoveCount, g_outcomeSeconds, g_gameSeconds,
-            g_freeColMode, g_currentGameNumber };
+            g_freeColMode, g_currentGameNumber,
+            g_outcomeScore, computeScore(false,g_gameSeconds,g_moveCount,(int)g_freeColMode,true).total, g_samoUsed };
 }
 
 // Mirrors the "credit the outcome of the deal being replaced" logic in
@@ -1495,6 +1577,7 @@ static void creditOutcome(const PendingOutcomeSnapshot& s){
          g_statsRecordMoves[m]=s.outcomeMoveCount;
       if(g_statsRecordTime[m]<0 || s.outcomeSeconds<g_statsRecordTime[m])
          g_statsRecordTime[m]=s.outcomeSeconds;
+      creditScore(m,s.outcomeScore,true,s.samoUsed);
       saveStats();
       appendWonNumber(s.gameNumber,m);
    } else if(s.noMovesReached){
@@ -1502,12 +1585,14 @@ static void creditOutcome(const PendingOutcomeSnapshot& s){
       g_statsGames[m]++;
       g_statsMoveSum[m][0]+=s.outcomeMoveCount;
       g_statsTimeSum[m][0]+=s.outcomeSeconds;
+      creditScore(m,s.outcomeScore,false,s.samoUsed);
       saveStats();
    } else if(s.moveCount>0){
       int m=(int)s.freeColMode;
       g_statsGames[m]++;
       g_statsMoveSum[m][0]+=s.moveCount;
       g_statsTimeSum[m][0]+=s.gameSeconds;
+      creditScore(m,s.abandonScore,false,s.samoUsed);
       saveStats();
    }
    // else: abandoned with zero moves made — not counted
@@ -1784,7 +1869,7 @@ static bool hitCard(int mx,int my,int x,int y){
 static bool ensureD2DRT(HWND hwnd){
    if(g_d2dRT)return true; if(!g_d2dFactory)return false;
    RECT rc;GetClientRect(hwnd,&rc);if(rc.right<=0||rc.bottom<=0)return false;
-   HRESULT hr=g_d2dFactory->CreateHwndRenderTarget(D2D1::RenderTargetProperties(),
+   HRESULT hr=g_d2dFactory->CreateHwndRenderTarget(D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,D2D1::PixelFormat(),96.f,96.f),   // 96 dpi: one unit = one pixel whatever the system scaling (the layout works in pixels)
       D2D1::HwndRenderTargetProperties(hwnd,D2D1::SizeU((UINT32)rc.right,(UINT32)rc.bottom)),&g_d2dRT);
    if(FAILED(hr)){g_d2dRT=nullptr;return false;}
    g_d2dRT->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -1821,12 +1906,12 @@ static void fireworksSounds(double now){
    }
    if(!g_fw.active()) g_sndQ.clear();
    for(size_t i=0;i<g_sndQ.size();){
-      if(now>=g_sndQ[i].at){ SoundSystem::instance().playIdx(g_sndQ[i].idx,g_sndQ[i].vol*g_volume,g_sndQ[i].pan); g_sndQ.erase(g_sndQ.begin()+i); }
+      if(now>=g_sndQ[i].at){ SoundSystem::instance().playFw(g_sndQ[i].idx,g_sndQ[i].vol*g_volume,g_sndQ[i].pan); g_sndQ.erase(g_sndQ.begin()+i); }
       else i++;
    }
 }
 static void stopFireworks(){
-   g_fw.stop(); g_sndQ.clear(); KillTimer(g_hwnd,TIMER_FW);
+   g_fw.stop(); g_sndQ.clear(); SoundSystem::instance().stopFw(); KillTimer(g_hwnd,TIMER_FW);
 }
 // Lays the fireworks image over the table (alpha 0: the light is added to what is behind it).
 static void drawFireworks(float W,float H){
@@ -1977,8 +2062,14 @@ static void ngDrawGather(float W,float H){
 
 // The deal number, the number of moves and the clock: three lines on the toolbar, after the last button (STATIC controls).
 static HWND g_hStat[3]={nullptr,nullptr,nullptr};
+static HWND g_hScoreCap=nullptr, g_hScore=nullptr;     // "Punkty" and the score of the game, in a big font, right of the three lines
 static void updateStatusUI(){
    if(!g_hStat[0]) return;
+   if(g_hScore){
+      wchar_t sb[16]; swprintf(sb,16,L"%d",g_samoUsed?0:liveScore());
+      wchar_t cur[16]={}; GetWindowTextW(g_hScore,cur,16);
+      if(wcscmp(cur,sb)!=0) SetWindowTextW(g_hScore,sb);
+   }
    wchar_t b0[48]={}, b1[48], b2[24];
    if(g_currentGameNumber>=0) swprintf(b0,48,L"Układ #%lld",g_currentGameNumber);
    swprintf(b1,48,L"Ruchy: %d",g_moveCount);
@@ -2125,7 +2216,7 @@ static void drawScene(){
    ngDrawGather(fw,fh);    // new-game animation: the old cards in the whirlwind (no-op otherwise)
    if(g_fw.active()){      // the table is dimmed by half while the fireworks are on (fades in and out)
       float el=(float)(timeGetTime()-g_fwStart)/1000.f;
-      float k=std::min(1.f,el/0.6f)*std::min(1.f,(g_fwTotalS-el)/1.f);
+      float k=std::min(1.f,el/0.6f)*std::min(1.f,g_fw.remaining()/1.2f);   // the table brightens during the last sparks of the last firework
       if(k>0.f){ ID2D1SolidColorBrush* brD=nullptr; g_d2dRT->CreateSolidColorBrush(D2D1::ColorF(0.f,0.f,0.f,0.5f*k),&brD);
          if(brD){ g_d2dRT->FillRectangle(D2D1::RectF(0,0,fw,fh),brD); brD->Release(); } }
    }
@@ -2168,6 +2259,15 @@ static void drawScene(){
                               g_thinking,thinkAlpha,
                               mlx,mly,g_currentGameNumber,&moveLabelRect,false);   // false: the counters live on the toolbar now
    g_moveLabelDrawnRect={-1.f,-1.f,-1.f,-1.f};                                   // (the label can no longer be dragged)
+   g_scoreBtn={-1.f,-1.f,-1.f,-1.f};
+   if(g_won && !ovActive()){                                                       // after a win: the details of the score on request
+      const float resLeft=(float)g_layout.reservePos().x;
+      const float bw=std::max(100.f,std::min(230.f,resLeft-mlx-18.f)), bh=bw>=200.f?34.f:52.f, bx=mlx, by=mly+2.f;
+      ovRect(bx,by,bw,bh,8,1,1,1,0.20f); ovRect(bx,by,bw,bh,8,1.f,0.86f,0.30f,0.90f,false,1.8f);
+      if(bw>=200.f) ovText(L"Pokaż szczegóły wyniku",bx,by,bw,bh,14,1,1,1,1.f,true);
+      else{ ovText(L"Pokaż szczegóły",bx,by+2,bw,bh/2,13,1,1,1,1.f,true); ovText(L"wyniku",bx,by+bh/2-2,bw,bh/2,13,1,1,1,1.f,true); }
+      g_scoreBtn={bx,by,bx+bw,by+bh};
+   }
    overlaysDraw(fw,fh);   // Settings / Statistics / Help, on top of everything (no-op when none is open)
 }
 
@@ -2397,6 +2497,7 @@ void onStateChanged(){
          // symmetrically with the no-moves case below — nothing is counted
          // until the player is truly done with this deal.
          g_outcomeMode=m; g_outcomeMoveCount=g_moveCount; g_outcomeSeconds=g_gameSeconds;
+         g_outcomeScore=computeScore(true,g_outcomeSeconds,g_outcomeMoveCount,m,false).total;
          bool newMoves=false, newTime=false;
          if(!g_statsExcluded){
             // Preview whether this would be a new record, for the
@@ -2419,17 +2520,17 @@ void onStateChanged(){
             // Show record-breaking congratulations after a short delay
             if(newMoves || newTime){
                // Build message
-               std::wstring msg=L"🏆 Nowy rekord";
+               std::wstring msg=L"Nowy rekord";
                if(newMoves && newTime)
                   msg+=L"!\n\nPobito oba rekordy:\n"
-                       L"  ✦ Najmniej ruchów: "+std::to_wstring(g_moveCount)+L"\n"
-                       L"  ✦ Najkrótszy czas: "+fmtTime(g_gameSeconds);
+                       L"  • Najmniej ruchów: "+std::to_wstring(g_moveCount)+L"\n"
+                       L"  • Najkrótszy czas: "+fmtTime(g_gameSeconds);
                else if(newMoves)
                   msg+=L"!\n\nPobito rekord liczby ruchów:\n"
-                       L"  ✦ Najmniej ruchów: "+std::to_wstring(g_moveCount);
+                       L"  • Najmniej ruchów: "+std::to_wstring(g_moveCount);
                else
                   msg+=L"!\n\nPobito rekord czasu:\n"
-                       L"  ✦ Najkrótszy czas: "+fmtTime(g_gameSeconds);
+                       L"  • Najkrótszy czas: "+fmtTime(g_gameSeconds);
                msg+=L"\n\nTryb: ";
                msg+=(m==0?L"Tylko król":L"Dowolna karta");
                g_congratsMsg=msg; // show after animation completes
@@ -2451,6 +2552,7 @@ void onStateChanged(){
          g_outcomeMode=(int)g_freeColMode;
          g_outcomeMoveCount=g_moveCount;
          g_outcomeSeconds=g_gameSeconds;
+         g_outcomeScore=computeScore(false,g_outcomeSeconds,g_outcomeMoveCount,g_outcomeMode,true).total;
       }
       if(!g_samogranoMarathon && !g_noMovesDialogShown) SetTimer(g_hwnd,TIMER_NOMOVES,600,nullptr);
    } else {
@@ -2507,6 +2609,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
             g_statsRecordMoves[m]=g_outcomeMoveCount;
          if(g_statsRecordTime[m]<0 || g_outcomeSeconds<g_statsRecordTime[m])
             g_statsRecordTime[m]=g_outcomeSeconds;
+         creditScore(m,g_outcomeScore>=0?g_outcomeScore:computeScore(true,g_outcomeSeconds,g_outcomeMoveCount,m,false).total,true,g_samoUsed);
          saveStats();
          appendWonNumber(g_currentGameNumber,m);
       } else if(g_noMovesReached){
@@ -2514,6 +2617,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
          g_statsGames[m]++;
          g_statsMoveSum[m][0]+=g_outcomeMoveCount;
          g_statsTimeSum[m][0]+=g_outcomeSeconds;
+         creditScore(m,g_outcomeScore>=0?g_outcomeScore:computeScore(false,g_outcomeSeconds,g_outcomeMoveCount,m,true).total,false,g_samoUsed);
          saveStats();
       } else if(g_moveCount>0){
          // Abandoned mid-play (moves were still available, so the genuine
@@ -2526,6 +2630,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
          g_statsGames[m]++;
          g_statsMoveSum[m][0]+=g_moveCount;
          g_statsTimeSum[m][0]+=g_gameSeconds;
+         creditScore(m,computeScore(false,g_gameSeconds,g_moveCount,m,true).total,false,g_samoUsed);
          saveStats();
       }
       // else: abandoned with zero moves made — not counted
@@ -2533,7 +2638,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
 
    deleteSaveFile();
    g_gameStartTick=timeGetTime(); g_gameSeconds=0; g_congratsMsg.clear();
-   g_moveCount=0;
+   g_moveCount=0; g_undoCount=0; g_hintCount=0; g_samoUsed=false; g_outcomeScore=-1;
    g_gameStarted=false;
    g_winCounted=false;
    g_autoDealCounted=false;
@@ -3129,6 +3234,7 @@ void doUndo(){
    before.reserve=g_game.reserve;
    if(g_game.undo()){
       if(!g_winCounted) g_moveCount++;
+      g_undoCount++;
       KillTimer(g_hwnd,TIMER_NOMOVES);
       stopFireworks();
       g_won=g_noMoves=false; g_status=L"Cofnięto ruch";
@@ -3182,6 +3288,7 @@ void doRedo(){
 void doUndoDeal(){
    if(g_dealing || g_animating) return;
    if(g_game.undoToDeal()){
+      g_undoCount++;
       KillTimer(g_hwnd,TIMER_NOMOVES);
       stopFireworks();
       g_won=g_noMoves=false; g_status=L"Cofnięto do poprzedniego rozdania";
@@ -3207,19 +3314,26 @@ void doRedoDeal(){
 }
 
 // Build the "Akcje" menu bar — called on creation and after fullscreen exit
+// Windows 7 and older have no emoji font: the little pictures in front of the menu items are left out there.
+static bool isLegacyWindows(){
+   static int v=-1;
+   if(v<0){ HMODULE k=GetModuleHandleW(L"kernel32.dll"); v=(k&&GetProcAddress(k,"GetSystemTimePreciseAsFileTime"))?0:1; }
+   return v==1;
+}
+static std::wstring menuText(const wchar_t* emoji,const wchar_t* text){ return isLegacyWindows()?std::wstring(text):std::wstring(emoji)+L"  "+text; }
 static HMENU buildAkcjeMenu(){
    HMENU hBar  = CreateMenu();
    HMENU hPop  = CreatePopupMenu();
-   AppendMenuW(hPop, MF_STRING,    ID_NEW,       L"🃏  Nowa gra  (F2)");
-   AppendMenuW(hPop, MF_STRING,    ID_RESTART,   L"↺  Zacznij od początku tę grę");
+   AppendMenuW(hPop, MF_STRING,    ID_NEW,       menuText(L"🃏",L"Nowa gra  (F2)").c_str());
+   AppendMenuW(hPop, MF_STRING,    ID_RESTART,   L"Zacznij od początku tę grę");
    AppendMenuW(hPop, MF_STRING,    ID_PLAY_NUM,  L"#  Zagraj pasjans numer\u2026");
-   AppendMenuW(hPop, MF_STRING,    ID_PLAY_WIN,  L"🏆  Zagraj wygrywaj\u0105cy");
-   AppendMenuW(hPop, MF_STRING,    ID_PLAY_LOST, L"💔  Zagraj nieudany\u2026");
+   AppendMenuW(hPop, MF_STRING,    ID_PLAY_WIN,  L"Zagraj wygrywaj\u0105cy");
+   AppendMenuW(hPop, MF_STRING,    ID_PLAY_LOST, menuText(L"💔",L"Zagraj nieudany\u2026").c_str());
    AppendMenuW(hPop, MF_SEPARATOR, 0,            nullptr);
    AppendMenuW(hPop, MF_STRING,    ID_FS,        L"⛶  Pełny ekran  (↑ / F11)");
    AppendMenuW(hPop, MF_SEPARATOR, 0,            nullptr);
-   AppendMenuW(hPop, MF_STRING,    ID_SAVE_AS,   L"💾  Zapisz grę jako...");
-   AppendMenuW(hPop, MF_STRING,    ID_LOAD_FROM, L"📂  Wczytaj grę z pliku...");
+   AppendMenuW(hPop, MF_STRING,    ID_SAVE_AS,   menuText(L"💾",L"Zapisz grę jako...").c_str());
+   AppendMenuW(hPop, MF_STRING,    ID_LOAD_FROM, menuText(L"📂",L"Wczytaj grę z pliku...").c_str());
    AppendMenuW(hPop, MF_SEPARATOR, 0,            nullptr);
    AppendMenuW(hPop, MF_STRING,    ID_HELP,      L"?  Pomoc  (H)");
    AppendMenuW(hBar, MF_POPUP, (UINT_PTR)hPop,   L"Akcje");
@@ -3266,6 +3380,7 @@ void onLDown(int mx, int my){
    // my is in main-window coords; label rect is in game-window coords (OY subtracted)
    const float OY=(float)Layout::TOOLBAR_H;
    float gmx=(float)mx, gmy=(float)my-OY;
+   if(g_won && gmx>=g_scoreBtn.left && gmx<=g_scoreBtn.right && gmy>=g_scoreBtn.top && gmy<=g_scoreBtn.bottom){ ovOpen(OV_SCORE); return; }
    auto& lr=g_moveLabelDrawnRect;
    if(gmx>=lr.left&&gmx<=lr.right&&gmy>=lr.top&&gmy<=lr.bottom){
       if(!g_moveLabelCustom){
@@ -3550,6 +3665,10 @@ static void saveStats(){
    wr(L"RecMovesFree",g_statsRecordMoves[1]);
    wr(L"RecTimeKing", g_statsRecordTime[0]);
    wr(L"RecTimeFree", g_statsRecordTime[1]);
+   wr(L"ScoreSumKing",(int)g_statsScoreSum[0]); wr(L"ScoreSumFree",(int)g_statsScoreSum[1]);
+   wr(L"ScoreNKing",g_statsScoreN[0]); wr(L"ScoreNFree",g_statsScoreN[1]);
+   wr(L"ScoreBestKing",g_statsScoreBest[0]); wr(L"ScoreBestFree",g_statsScoreBest[1]);
+   wr(L"StreakKing",g_statsStreak[0]); wr(L"StreakFree",g_statsStreak[1]);
 }
 
 static void loadStats(){
@@ -3572,6 +3691,14 @@ static void loadStats(){
    g_statsRecordMoves[1]=rd(L"RecMovesFree",-1);
    g_statsRecordTime[0] =rd(L"RecTimeKing", -1);
    g_statsRecordTime[1] =rd(L"RecTimeFree", -1);
+   g_statsScoreSum[0]=rd(L"ScoreSumKing"); g_statsScoreSum[1]=rd(L"ScoreSumFree");
+   g_statsScoreN[0]=rd(L"ScoreNKing"); g_statsScoreN[1]=rd(L"ScoreNFree");
+   g_statsScoreBest[0]=rd(L"ScoreBestKing",-1); g_statsScoreBest[1]=rd(L"ScoreBestFree",-1);
+   g_statsStreak[0]=rd(L"StreakKing"); g_statsStreak[1]=rd(L"StreakFree");
+   for(int m=0;m<2;m++){
+      if(g_statsScoreSum[m]<0||g_statsScoreN[m]<=0){ g_statsScoreSum[m]=0; g_statsScoreN[m]=0; }
+      if(g_statsStreak[m]<0) g_statsStreak[m]=0;
+   }
    for(int m=0;m<2;m++){
       if(g_statsGames[m]<0) g_statsGames[m]=0;
       if(g_statsWins[m]<0||g_statsWins[m]>g_statsGames[m]) g_statsWins[m]=0;
@@ -3939,6 +4066,7 @@ static void samogranoStep(){
       return;
    }
    AutoMoveOutcome r=doAutoMove();
+   if(r!=AM_NONE && r!=AM_BLOCKED) g_samoUsed=true;          // Samograj plays: the score of this game is cancelled
    autoNoteDealEnd(r==AM_NONE);
    // Stop on the engine's own "nothing left to do" signal (stuck, or the
    // anti-loop stall limit), AND also explicitly on g_won/g_noMoves —
@@ -3995,6 +4123,7 @@ static void tickThinking(){
       // nothing left to play, stop the toggle right away instead of leaving
       // samogranoStep() to notice (and retry the same dead end) next tick.
       AutoMoveOutcome r=doAutoMove();
+      if(g_samogranoActive && r!=AM_NONE && r!=AM_BLOCKED) g_samoUsed=true;
       autoNoteDealEnd(r==AM_NONE);
       if(r==AM_NONE) cancelSamograj();
    }
@@ -4065,6 +4194,8 @@ static void toolbarRefresh(){
    for(int i=0;i<BTN_ICON_COUNT;i++){ HWND b=GetDlgItem(g_hwnd,BTN_ICON_IDS[i]); if(b) InvalidateRect(b,nullptr,FALSE); }
    for(HWND c:g_hBtnCap) if(c) InvalidateRect(c,nullptr,TRUE);
    for(HWND c:g_hStat) if(c) InvalidateRect(c,nullptr,TRUE);
+   if(g_hScoreCap) InvalidateRect(g_hScoreCap,nullptr,TRUE);
+   if(g_hScore) InvalidateRect(g_hScore,nullptr,TRUE);
    invalidateGame();
 }
 static LRESULT CALLBACK BtnHoverProc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR){
@@ -4264,7 +4395,7 @@ static HFONT solverFont(bool bold){
    static HFONT f[2]={nullptr,nullptr};
    if(!f[bold?1:0]){
       HDC dc=GetDC(nullptr);
-      f[bold?1:0]=CreateFontW(-MulDiv(9,GetDeviceCaps(dc,LOGPIXELSY),72),0,0,0,bold?FW_SEMIBOLD:FW_NORMAL,
+      f[bold?1:0]=CreateFontW(-MulDiv(9,96,72),0,0,0,bold?FW_SEMIBOLD:FW_NORMAL,
          FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
          DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
       ReleaseDC(nullptr,dc);
@@ -5186,7 +5317,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       SetPropW(hwnd,L"TIPWND",(HANDLE)hTip);
       // Create 12pt bold font for buttons
       HFONT hBtnFont = CreateFontW(
-         -MulDiv(12, GetDeviceCaps(GetDC(nullptr),LOGPIXELSY), 72),
+         -MulDiv(12, 96, 72),
          0,0,0,FW_BOLD,FALSE,FALSE,FALSE,
          DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
          CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
@@ -5238,7 +5369,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       // Hover highlight comes from a small subclass; the caption of each button is a small label under it.
       for(HWND b:{hBNew,hBHint,hBSamo,hBSolv,hBUndo,hBRedo,hBStats,hBSett}) SetWindowSubclass(b,BtnHoverProc,1,0);
       {
-         HFONT hCapFont=CreateFontW(-MulDiv(9,GetDeviceCaps(GetDC(nullptr),LOGPIXELSY),72),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,
+         HFONT hCapFont=CreateFontW(-MulDiv(9,96,72),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,
             DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
          const int xs[8]={BX_NEW,BX_HINT,BX_SAMO,BX_SOLV,BX_UNDO,BX_REDO,BX_STATS,BX_SETT};
          const wchar_t* caps[8]={L"Nowa gra",L"Podpowiedź",L"Samograj",L"Solver",L"Cofnij",L"Ponów",L"Statystyki",L"Ustawienia"};
@@ -5253,7 +5384,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       // Settings button (hidden until auto-play is used — see updateAutoStatsUI).
       {
          HFONT hStatFont=CreateFontW(
-            -MulDiv(10, GetDeviceCaps(GetDC(nullptr),LOGPIXELSY), 72),
+            -MulDiv(10, 96, 72),
             0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,
             DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
@@ -5263,9 +5394,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                SX,4+i*21,150,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
             SendMessageW(g_hStat[i],WM_SETFONT,(WPARAM)hStatFont,TRUE);
          }
+         {                                                       // the score: a caption and a big number
+            HFONT hBig=CreateFontW(-MulDiv(26,96,72),0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
+            g_hScoreCap=CreateWindowW(L"STATIC",L"PUNKTY",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,SX+166,4,170,18,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
+            SendMessageW(g_hScoreCap,WM_SETFONT,(WPARAM)hStatFont,TRUE);
+            g_hScore=CreateWindowW(L"STATIC",L"0",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,SX+166,22,170,46,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
+            SendMessageW(g_hScore,WM_SETFONT,(WPARAM)hBig,TRUE);
+         }
          for(int i=0;i<3;i++){                                   // the Samograj scoreboard, further right
             g_hAutoStat[i]=CreateWindowW(L"STATIC",L"",WS_CHILD|SS_LEFT|SS_NOPREFIX,
-               SX+166,4+i*21,190,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
+               SX+356,4+i*21,190,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
             SendMessageW(g_hAutoStat[i],WM_SETFONT,(WPARAM)hStatFont,TRUE);
          }
          updateAutoStatsUI(false);
@@ -5331,6 +5469,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       case ID_HINT:{
          if(g_animating || g_dealing || g_deal.busy()) return 0;
          playSound("podp",g_volume);
+         if(g_hintList.empty()) g_hintCount++;                // a new hint (cycling through the ones already found is free)
          if(g_hintList.empty() && !isBestMoveReady()){
             // No cached answer yet — defer instead of blocking on a
             // synchronous search: show "Myślę" and build the list once the
@@ -5397,8 +5536,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
          g_fw.update((float)(now-g_fwLast),rc.right,rc.bottom); g_fwLast=now;
          fireworksSounds(now);
          { float el=(float)(timeGetTime()-g_fwStart)/1000.f;
-           if(el>=g_fwTotalS){
-              if(g_devFwLoop){ g_fw.start(rc.right,rc.bottom); g_fwStart=timeGetTime(); g_fwLast=timeGetTime()/1000.0; }   // developer: the show starts over
+           if(g_fw.finished() || el>=g_fwTotalS+20.f){        // nothing is launched after g_fwTotalS; the show ends with the last firework
+              if(g_devFwLoop){ g_sndQ.clear(); SoundSystem::instance().stopFw(); g_fw.start(rc.right,rc.bottom); g_fwStart=timeGetTime(); g_fwLast=timeGetTime()/1000.0; }   // developer: the show starts over
               else stopFireworks();
            } }
          invalidateGame();
@@ -5497,7 +5636,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       if(g_keys[KA_REDO].matches(vk))       { cancelSamograj(); doRedo(); }
       if(g_keys[KA_UNDO_DEAL].matches(vk))  { cancelSamograj(); doUndoDeal(); }
       if(g_keys[KA_REDO_DEAL].matches(vk))  { cancelSamograj(); doRedoDeal(); }
-      if(g_keys[KA_AUTO].matches(vk))       doAutoMove(); // single AI move — same engine Samograj uses, doesn't interrupt it
+      if(g_keys[KA_AUTO].matches(vk)){ if(!g_samogranoActive) g_hintCount++; doAutoMove(); } // single AI move — same engine Samograj uses, doesn't interrupt it (it counts as a hint)
       if(g_keys[KA_SAMOGRAJ].matches(vk)){
          toggleSamograj();
          if(g_samogranoActive) samogranoStep();
@@ -5524,6 +5663,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       return 1;}
    case WM_CTLCOLORSTATIC:{                    // the Samograj scoreboard on the toolbar: light text on the strip
       HDC hdc=(HDC)wp;
+      if((HWND)lp==g_hScore){ SetTextColor(hdc,RGB(255,222,90)); SetBkMode(hdc,TRANSPARENT); return (LRESULT)toolbarBrush(); }       // the score: gold
+      if((HWND)lp==g_hScoreCap){ SetTextColor(hdc,RGB(200,210,200)); SetBkMode(hdc,TRANSPARENT); return (LRESULT)toolbarBrush(); }
       SetTextColor(hdc,RGB(238,243,238)); SetBkMode(hdc,TRANSPARENT);
       return (LRESULT)toolbarBrush();}
    case WM_DESTROY:

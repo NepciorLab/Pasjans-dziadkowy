@@ -70,13 +70,29 @@ inline std::string jsonStr(const std::string& json,const std::string& key){
    return out;
 }
 
+// A WinHttp session that also works on Windows 7: the "automatic proxy" mode exists only from Windows 8.1 (older systems
+// refuse it, so the default proxy is used instead) and Windows 7 offers only TLS 1.0 unless asked for newer protocols
+// (GitHub needs TLS 1.2; the option is understood by Windows 7 with the update KB3140245, otherwise the request just fails).
+inline HINTERNET openSession(){
+   HINTERNET s=WinHttpOpen(L"PasjansDziadkowy-Updater/1.0",
+      WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+   if(!s) s=WinHttpOpen(L"PasjansDziadkowy-Updater/1.0",
+      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+   if(!s) return nullptr;
+   DWORD protocols=0x00000A00;                       // TLS 1.2 | TLS 1.3
+   if(!WinHttpSetOption(s,WINHTTP_OPTION_SECURE_PROTOCOLS,&protocols,sizeof(protocols))){
+      protocols=0x00000800;                          // an older system does not know TLS 1.3: TLS 1.2 only
+      WinHttpSetOption(s,WINHTTP_OPTION_SECURE_PROTOCOLS,&protocols,sizeof(protocols));
+   }
+   return s;
+}
+
 // Plain HTTPS GET (api.github.com's JSON responses are small — read fully
 // into memory). WinHttp validates the TLS certificate by default; no proxy
 // handling beyond letting Windows use its own configured system proxy.
 inline bool httpGet(const wchar_t* host,const wchar_t* path,std::string& outBody,const wchar_t* accept=nullptr){
    outBody.clear();
-   HINTERNET hSession=WinHttpOpen(L"PasjansDziadkowy-Updater/1.0",
-      WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+   HINTERNET hSession=openSession();
    if(!hSession) return false;
    HINTERNET hConnect=WinHttpConnect(hSession,host,INTERNET_DEFAULT_HTTPS_PORT,0);
    if(!hConnect){ WinHttpCloseHandle(hSession); return false; }
@@ -113,8 +129,7 @@ inline bool httpDownload(const std::wstring& url,const std::wstring& destPath){
    uc.dwSchemeLength=(DWORD)-1;
    if(!WinHttpCrackUrl(url.c_str(),(DWORD)url.size(),0,&uc)) return false;
 
-   HINTERNET hSession=WinHttpOpen(L"PasjansDziadkowy-Updater/1.0",
-      WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+   HINTERNET hSession=openSession();
    if(!hSession) return false;
    HINTERNET hConnect=WinHttpConnect(hSession,host,uc.nPort,0);
    if(!hConnect){ WinHttpCloseHandle(hSession); return false; }

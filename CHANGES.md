@@ -437,3 +437,31 @@ tryb Tylko król, seed 4): 2 wątki 1,30 -> 12 wątków 6,20 -> 3 wątki 1,91 ->
 - Numer układu, liczba ruchów i czas przeniesione z planszy na pasek przycisków, za ostatni przycisk (trzy wiersze); licznik Samograju jest dalej na prawo. Komunikaty (np. Brak możliwych ruchów) i Myślę zostają na planszy.
 
 - Nowe wartości domyślne z dev.txt: tornado 2500 ms (przyspieszanie 250, opóźnianie 500), odstęp wierszy 150 ms; fajerwerki: iskry 0,4-2,0, prędkość 0,9-1,2, życie 0,9-1,2, podział etapów 70%.
+
+# Wersja 1.1.4: Windows 7
+- Program uruchamia się na Windows 7: biblioteka C++ wołała GetSystemTimePreciseAsFileTime (jest dopiero od Windows 8), więc
+  system odmawiał startu. Własna, zastępcza funkcja wywołuje prawdziwą, jeśli istnieje, a w przeciwnym razie
+  GetSystemTimeAsFileTime (src/main.cpp); import tej funkcji zniknął z pliku .exe.
+- Sprawdzanie aktualizacji (update.h): tryb "automatic proxy" WinHttp istnieje od Windows 8.1 - starsze systemy dostają domyślne
+  proxy; włączone TLS 1.2 (i 1.3 tam, gdzie jest), bo GitHub nie przyjmuje TLS 1.0 (Windows 7 potrzebuje do tego KB3140245).
+- Znaki, których brakuje w czcionkach starszych Windows: przyciski ▶ ✕ to teraz ► ×, ↺ jest rysowane; w oknie rekordu usunięto
+  emoji, a z menu Akcje - obrazki przed pozycjami (tylko na Windows 7 i starszych; nowsze systemy nadal je mają).
+
+- Systemowe skalowanie ekranu (np. 150% na Windows 7 bez Aero): cel renderowania Direct2D ma jawnie 96 dpi (jedna jednostka = jeden piksel), a czcionki paska przycisków są liczone w pikselach, nie według dpi systemu. Wcześniej karty były powiększone, a podpisy przycisków obcięte.
+
+- Odgłosy fajerwerków (gwizd rakiety, huk) są śledzone osobno (SoundSystem::playFw/stopFw) i urywane w tej samej chwili, w której znikają fajerwerki (koniec pokazu, zatrzymanie, ponowny start w pętli dewelopera): nic nie wybrzmiewa po rozjaśnieniu tła.
+
+- Koniec fajerwerków: czas z ustawień to czas wystrzeliwania - po jego upływie nie startuje żadna rakieta, ale ostatnie dolatują i wybuchają, a pokaz kończy się, gdy zgasną iskry ostatniego fajerwerku (przyciemnienie stołu znika dopiero w ostatniej ~1,2 s tych iskier); dźwięki urywają się razem z nim.
+
+# Wersja 1.1.4: punktacja
+- Wynik partii: wygrana = 440 + 15/król + 10/kompletny kolor (K→A w kolumnie lub A→K na fundacji) + 60·karty w porządku/104 +
+  czas (110 do 10:00, +0,2/s poniżej, maks. +60; powyżej połowa co 129 s) + ruchy (110 do 120 ruchów, +1/ruch poniżej, maks. +40;
+  powyżej połowa co 25,9 ruchu) + 1,5/nierozdana karta rezerwy + 5/pusta kolumna (maks. 4) + 30 − 10/podpowiedź − kara za
+  cofnięcia (po 5 bezpłatnych 20 za każde rozpoczęte 5), razy 1+0,02·seria wygranych (maks. 1,1). Porażka lub porzucona gra =
+  króle + kolory + porządek − 1/karta w rezerwie. Wynik nie jest ujemny. Użycie Samograju zeruje punktację partii;
+  pojedynczy automatyczny ruch (klawisz A) liczy się jak podpowiedź.
+- Pasek: duży złoty licznik "PUNKTY" na prawo od układu / ruchów / czasu (w trakcie gry punkty za postęp, po wygranej wynik końcowy).
+- Po wygranej przycisk "Pokaż szczegóły wyniku" otwiera nakładkę z rozpisaniem każdej pozycji.
+- Statystyki: średni i najlepszy wynik osobno dla każdego trybu (nie liczą się partie z Samograjem, wczytane i powtórki);
+  seria wygranych jest zapisywana w pasjans.ini. Zapis gry w wersji 13 pamięta liczbę cofnięć, podpowiedzi i użycie Samograju.
+- Pomoc ma sekcję "Punktacja".
