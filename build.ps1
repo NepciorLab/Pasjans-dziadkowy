@@ -22,6 +22,6 @@ Invoke-Zig @(
    "c++","-target","x86_64-windows-gnu","-std=c++17",$Opt,"-mwindows","-Wl,--subsystem,windows","-static",
    "-o","build/$Out","src/main.cpp","build/app_res.res","build/cards_res.res",
    "-lgdiplus","-ld2d1","-ldwrite","-lwindowscodecs","-ldsound","-lwinmm","-lcomctl32","-lcomdlg32",
-   "-lole32","-lgdi32","-luser32","-lshell32","-luuid","-lwinhttp"
+   "-lole32","-lgdi32","-luser32","-lshell32","-luuid","-lwinhttp -lmfuuid"
 )
 "OK build/$Out"

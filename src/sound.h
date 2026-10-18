@@ -3,6 +3,10 @@
 #define UNICODE
 #include <windows.h>
 #include <mmsystem.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mferror.h>
 #include <dsound.h>
 #include <atomic>
 #include <map>
@@ -13,7 +17,7 @@
 
 // Sound slot keys — 1..8 are the 8 actions the player can give an own sound (Settings → Dźwięki); 0 is the whirlwind of the
 // new-game animation (a fixed sound, switched on/off with a checkbox);
-// 9..18 are the rocket whistles and the bangs of the fireworks (fixed, not shown in the settings)
+// 9..20 are the sounds of the fireworks (fixed, not shown in the settings)
 static const char* SOUND_KEYS[] = {
    "tornado",  // 0 Tornado (animacja nowej gry)
    "click",   // 1 Przełożenie karty
@@ -24,12 +28,19 @@ static const char* SOUND_KEYS[] = {
    "ponow",   // 6 Ponowienie
    "podp",    // 7 Podpowiedź
    "nono",    // 8 Brak możliwego ruchu
-   "swist1", "swist2", "swist3", "swist4", "swist5",        // 9..13   whistles of the rockets
-   "wybuch1", "wybuch2", "wybuch3", "wybuch4", "wybuch5",   // 14..18  bangs of the bursts
+   "wystrzal1", "wystrzal2", "wystrzal3",                  // 9..11   the launch shot of a rocket
+   "lot1", "lot2", "lot3", "lot4", "lot5",                  // 12..16  the whistle of its flight
+   "wybuch1", "wybuch2", "wybuch3",                         // 17..19  the burst
+   "iskrzenie",                                             // 20      the crackle of the dying sparks
+   "fwc1", "fwc2", "fwc3", "fwc4",                          // 21..24  own sounds for the phases of the fireworks (Developer settings)
 };
 static const int SOUND_UI_FIRST = 1, SOUND_UI_COUNT = 9;     // slots shown in the settings window: SOUND_UI_FIRST .. SOUND_UI_COUNT-1
-static const int SOUND_COUNT = 19;
-static const int SOUND_WHISTLE0 = 9, SOUND_BANG0 = 14, SOUND_VARIANTS = 5;
+static const int SOUND_COUNT = 25;
+static const int SOUND_FWC0 = 21, SOUND_FWC_N = 4;           // own file for a phase (launch, flight, burst, crackle): replaces its variants
+static const int SOUND_LAUNCH0 = 9,  SOUND_LAUNCH_N = 3;     // fireworks: one of these is played when a rocket appears
+static const int SOUND_FLIGHT0 = 12, SOUND_FLIGHT_N = 5;     //            when it flies up
+static const int SOUND_BOOM0   = 17, SOUND_BOOM_N   = 3;     //            when it bursts
+static const int SOUND_SPARKLE = 20;                         //            when the sparks crackle (not every firework does)
 static const wchar_t* SOUND_LABELS[] = {
    L"Tornado",
    L"Przełożenie karty",
@@ -40,7 +51,7 @@ static const wchar_t* SOUND_LABELS[] = {
    L"Ponowienie",
    L"Podpowiedź",
    L"Ruch niemożliwy",
-   L"", L"", L"", L"", L"", L"", L"", L"", L"", L"",
+   L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"",
 };
 static const wchar_t* SOUND_DEFAULTS[] = {
    L"tornado.wav",
@@ -52,8 +63,11 @@ static const wchar_t* SOUND_DEFAULTS[] = {
    L"ponow.wav",
    L"podpowiedz.wav",
    L"nono.wav",
-   L"swist1.wav", L"swist2.wav", L"swist3.wav", L"swist4.wav", L"swist5.wav",
-   L"wybuch1.wav", L"wybuch2.wav", L"wybuch3.wav", L"wybuch4.wav", L"wybuch5.wav",
+   L"wystrzal1.wav", L"wystrzal2.wav", L"wystrzal3.wav",
+   L"lot1.wav", L"lot2.wav", L"lot3.wav", L"lot4.wav", L"lot5.wav",
+   L"wybuch1.wav", L"wybuch2.wav", L"wybuch3.wav",
+   L"iskrzenie.wav",
+   L"", L"", L"", L"",
 };
 
 // WAV file header parsing
@@ -320,6 +334,7 @@ public:
       }
       m_fwDups.push_back(dup);
    }
+   bool hasBuffer(int idx) const { return idx >= 0 && idx < SOUND_COUNT && m_slots[idx].primary != nullptr; }
    void stopFw() {
       for(auto b : m_fwDups) { b->Stop(); b->Release(); }
       m_fwDups.clear();
@@ -487,9 +502,68 @@ private:
       loadBuffer(idx, std::vector<BYTE>(p, p + sz));
    }
 
+   // The slots of the fireworks accept MP3 too: it is decoded (Media Foundation, loaded only when needed) into the buffer.
+   static bool decodeToWav(const std::wstring& path, std::vector<BYTE>& wav) {
+      HMODULE mp = LoadLibraryW(L"mfplat.dll"), rd = LoadLibraryW(L"mfreadwrite.dll");
+      if(!mp || !rd) return false;
+      typedef HRESULT (WINAPI *FStart)(ULONG, DWORD);
+      typedef HRESULT (WINAPI *FType)(IMFMediaType**);
+      typedef HRESULT (WINAPI *FRead)(LPCWSTR, IMFAttributes*, IMFSourceReader**);
+      FStart start = (FStart)GetProcAddress(mp, "MFStartup");
+      FType  mkType = (FType)GetProcAddress(mp, "MFCreateMediaType");
+      FRead  mkRead = (FRead)GetProcAddress(rd, "MFCreateSourceReaderFromURL");
+      if(!start || !mkType || !mkRead) return false;
+      static bool started = false; if(!started){ if(FAILED(start(MF_VERSION, 0))) return false; started = true; }
+      IMFSourceReader* r = nullptr;
+      if(FAILED(mkRead(path.c_str(), nullptr, &r)) || !r) return false;
+      IMFMediaType* mt = nullptr; bool ok = false;
+      if(SUCCEEDED(mkType(&mt))) {
+         mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio); mt->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+         ok = SUCCEEDED(r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, mt));
+         mt->Release();
+      }
+      UINT32 ch = 0, sr = 0, bps = 0;
+      if(ok) {
+         IMFMediaType* ot = nullptr;
+         if(SUCCEEDED(r->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, &ot)) && ot) {
+            ot->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &ch); ot->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &sr); ot->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bps);
+            ot->Release();
+         }
+         ok = ch && sr && bps == 16;
+      }
+      std::vector<BYTE> pcm;
+      while(ok) {
+         DWORD flags = 0; IMFSample* smp = nullptr;
+         HRESULT hr = r->ReadSample((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, nullptr, &flags, nullptr, &smp);
+         if(FAILED(hr) || (flags & MF_SOURCE_READERF_ENDOFSTREAM)) { if(smp) smp->Release(); break; }
+         if(!smp) continue;
+         IMFMediaBuffer* mb = nullptr;
+         if(SUCCEEDED(smp->ConvertToContiguousBuffer(&mb)) && mb) {
+            BYTE* p = nullptr; DWORD len = 0;
+            if(SUCCEEDED(mb->Lock(&p, nullptr, &len))) { pcm.insert(pcm.end(), p, p + len); mb->Unlock(); }
+            mb->Release();
+         }
+         smp->Release();
+         if(pcm.size() > (size_t)sr * ch * 2 * 30) break;            // 30 s are more than any sound of the game needs
+      }
+      r->Release();
+      if(!ok || pcm.empty()) return false;
+      wav.assign(44, 0); memcpy(&wav[0], "RIFF", 4); memcpy(&wav[8], "WAVEfmt ", 8);
+      DWORD v32 = (DWORD)(36 + pcm.size()); memcpy(&wav[4], &v32, 4);
+      v32 = 16; memcpy(&wav[16], &v32, 4); WORD v16 = 1; memcpy(&wav[20], &v16, 2); v16 = (WORD)ch; memcpy(&wav[22], &v16, 2);
+      v32 = sr; memcpy(&wav[24], &v32, 4); v32 = sr * ch * 2; memcpy(&wav[28], &v32, 4); v16 = (WORD)(ch * 2); memcpy(&wav[32], &v16, 2); v16 = 16; memcpy(&wav[34], &v16, 2);
+      memcpy(&wav[36], "data", 4); v32 = (DWORD)pcm.size(); memcpy(&wav[40], &v32, 4);
+      wav.insert(wav.end(), pcm.begin(), pcm.end());
+      return true;
+   }
+
    void loadFile(int idx, const std::wstring& path) {
       if(!m_ds) return;
       releaseSlot(idx);
+      if(idx >= SOUND_FWC0 && path.size() > 4) {
+         std::wstring ext = path.substr(path.size() - 4); for(auto& c : ext) c = (wchar_t)towlower(c);
+         if(ext == L".mp3") { std::vector<BYTE> wav; if(decodeToWav(path, wav)) loadBuffer(idx, wav); return; }
+      }
 
       // Read file
       HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,

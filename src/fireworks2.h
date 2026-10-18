@@ -14,9 +14,11 @@
 
 class Fireworks2{
 public:
-   void start(int w,int h){ m_active=true; m_spawn=true; m_w=w; m_h=h; m_rockets.clear(); m_parts.clear(); m_flashes.clear(); m_events.clear(); m_time=0; m_acc=0; m_next=0.05f; }
+   void start(int w,int h){ m_schemeNow=P.scheme>0?P.scheme:(rnd()<0.5f?1:2); m_salvoOffs.clear(); m_active=true; m_spawn=true; m_salvoStarted=false; m_salvoLaunched=0; m_salvoT=0.f; m_w=w; m_h=h; m_rockets.clear(); m_parts.clear(); m_flashes.clear(); m_events.clear(); m_time=0; m_acc=0; m_next=0.05f; }
    void stop(){ m_active=false; m_rockets.clear(); m_parts.clear(); m_flashes.clear(); m_events.clear(); }
    bool active() const { return m_active; }
+   int schemeNow() const { return m_schemeNow; }    // the scheme of the show that is running (1 or 2)
+   double time() const { return m_time; }          // seconds of the show simulated so far (the sounds are scheduled on this clock)
    // Tunable from the developer settings (all 1 / the defaults = the look of the released game)
    // Every Range is drawn anew for each firework (a burst) from [lo,hi]; the single values are fixed.
    struct Range{ float lo, hi; };
@@ -25,7 +27,9 @@ public:
       Range rockets{5.f,5.f}, sparks{0.4f,2.f}, speed{0.9f,1.2f}, gravity{1.f,1.f}, life{0.9f,1.2f}, glow{0.8f,0.8f};
       float finale=0.35f;                      // chance that a burst dies out with a flash
       float totalS=20.f;                       // the whole show (set by the game); the show shrinks to one rocket towards its end
-      float split=0.7f;                        // first `split` of totalS: steady number of rockets and gap, then fewer and fewer
+      float split=0.7f;                        // scheme 1: first `split` of totalS: steady number of rockets and gap, then fewer and fewer
+      float salvoN=15.f, salvoSpan=0.2f;        // scheme 2: how many rockets the finale has and within how many seconds they are all launched (at random moments)
+      int   scheme=0;                          // 0 = drawn anew for every show; 1 = the show dwindles towards its end; 2 = steady all the time, then 15 rockets within 200 ms 3 s before the end (the last ones)
    };
    Params P;
    void stopLaunching(){ m_spawn=false; }
@@ -39,14 +43,17 @@ public:
       return r;
    }          // no new rockets; the ones in the air still burst
    size_t particles() const { return m_parts.size(); }
-   // What the ears have to know: a rocket was launched (kind 0: it flies `flight` seconds, then bursts; x = 0..1 across the
-   // window) and a burst happened (kind 1; size = how many sparks). The game plays the whistles and the bangs at those moments.
+   // What the ears have to know, at the moment each phase of a firework begins (x = 0..1 across the window):
+   //   kind 0: a rocket appears and flies up (`flight` = seconds until it bursts)
+   //   kind 1: it bursts (size = how many sparks)
+   //   kind 2: the sparks of this firework begin to crackle `flight` seconds from now (only fireworks that die out with a flash)
+   // The game plays one sound for each of them.
    struct Event{ int kind; float flight; float x; float size; };
    std::vector<Event> takeEvents(){ std::vector<Event> e; e.swap(m_events); return e; }
 
    // advances the simulation by `dt` seconds (fixed internal steps of 1/60 s)
    void update(float dt,int w,int h){
-      m_w=w; m_h=h; m_acc+=std::min(dt,0.1f);
+      m_w=w; m_h=h; m_acc+=std::min(dt,0.25f);
       while(m_acc>=STEP){ m_acc-=STEP; step(); }
    }
 
@@ -115,7 +122,8 @@ private:
    struct Rocket{ float x,y,vx,vy,ay,ty; float hx[20],hy[20]; int hn; float t,T; };
    struct Flash{ float x,y,t,maxT,r,g,b; };
    std::vector<Part> m_parts; std::vector<Rocket> m_rockets; std::vector<Flash> m_flashes; std::vector<Event> m_events;
-   bool m_active=false, m_spawn=true; int m_w=800,m_h=600,m_bw=0,m_bh=0; float m_time=0,m_acc=0,m_next=0;
+   int m_schemeNow=1; std::vector<float> m_salvoOffs;
+   bool m_active=false, m_spawn=true, m_salvoStarted=false; int m_salvoLaunched=0; float m_salvoT=0.f; int m_w=800,m_h=600,m_bw=0,m_bh=0; float m_time=0,m_acc=0,m_next=0;
    std::vector<float> m_acc3, m_b1, m_b2; std::vector<float> m_lut; int m_pal=0, m_burstNo=0; std::vector<float> m_hues;
    std::mt19937 m_rng{std::random_device{}()};
 public:
@@ -185,8 +193,8 @@ private:
       float R[6]={c,x,0,0,x,c}, G[6]={x,c,c,x,0,0}, B[6]={0,0,x,c,c,x}; r=R[i]+m; g=G[i]+m; b=B[i]+m;
    }
    float rr(const Range& r){ return r.lo+(r.hi-r.lo)*rnd(); }
-   void spawnRocket(){
-      Rocket r; r.x=m_w*(0.12f+0.76f*rnd()); r.y=(float)m_h; r.ty=m_h*(0.10f+0.38f*rnd());
+   void spawnRocket(float xfrac=-1.f){
+      Rocket r; r.x= xfrac<0.f ? m_w*(0.12f+0.76f*rnd()) : m_w*(0.08f+0.84f*xfrac); r.y=(float)m_h; r.ty=m_h*(0.10f+0.38f*rnd());
       r.T=0.85f+0.5f*rnd(); r.t=0.f; float dist=r.y-r.ty; r.vy=-2.f*dist/r.T; r.ay=-r.vy/r.T;
       r.vx=(rnd()-0.5f)*m_w*0.10f/r.T; r.hn=0; m_rockets.push_back(r);
       m_events.push_back({0,r.T,r.x/(float)std::max(1,m_w),0.f});
@@ -197,6 +205,7 @@ private:
       p.hx[0]=p.x; p.hy[0]=p.y;
    }
    void burst(float x,float y){
+      const size_t firstPart=m_parts.size();
       const float k=scale(); int type=(int)(rnd()*4.f)%4; if(m_burstNo++==0) type=0;
       if(m_hues.empty()){ m_hues={0.90f,0.50f,0.13f,0.76f,0.33f,0.02f,0.60f,0.95f,0.42f}; std::shuffle(m_hues.begin(),m_hues.end(),m_rng); }
       float hue=m_hues.back(); m_hues.pop_back(); float var=0.03f+0.12f*rnd();
@@ -239,17 +248,38 @@ private:
          p.vx*=kSpeed; p.vy*=kSpeed; p.grav*=kGrav; p.maxLife*=kLife; p.bright*=kGlow;
          m_parts.push_back(p);
       }
+      if(finale){                       // this firework dies out with a flash: the crackle starts when the first spark begins to flare
+         float first=1e9f; for(size_t i=firstPart;i<m_parts.size();i++) first=std::min(first,m_parts[i].flareAt*m_parts[i].maxLife);
+         m_events.push_back({2,first,x/(float)std::max(1,m_w),0.f});
+      }
    }
    void step(){
       m_time+=STEP;
-      if(m_active&&m_spawn&&m_time<P.totalS){ m_next-=STEP; if(m_next<=0.f){
-            // two stages: a steady number of rockets, and from `split` of the show on fewer and fewer, down to a single one at the end
-            const float T=std::max(1.f,P.totalS), s0=P.split*T;
-            const float f= m_time<=s0 ? 1.f : std::max(0.f,1.f-(m_time-s0)/std::max(0.01f,T-s0));
+      if(m_active&&m_spawn&&m_time<P.totalS){
+         m_next-=STEP;
+         const float T=std::max(1.f,P.totalS);
+         // scheme 2: 3 s before the end the finale is fired: salvoN rockets within salvoSpan seconds (first to last launch), spread
+         // over the width; they are the last ones of the show
+         const int N=std::max(1,(int)std::lround(P.salvoN));
+         if(m_schemeNow==2 && !m_salvoStarted && m_time>=std::max(0.f,T-3.f)){
+            m_salvoStarted=true; m_salvoLaunched=0; m_salvoT=0.f;
+            m_salvoOffs.clear(); for(int i=0;i<N;i++) m_salvoOffs.push_back(std::max(0.f,P.salvoSpan)*rnd());      // random moments, all within salvoSpan
+            std::sort(m_salvoOffs.begin(),m_salvoOffs.end());
+         }
+         if(m_salvoStarted && m_salvoLaunched<N){
+            int due=0; while(due<N && m_salvoOffs[(size_t)due]<=m_salvoT) due++;
+            while(m_salvoLaunched<due){ spawnRocket(std::fmod((float)m_salvoLaunched*0.61803398f+rnd()*0.05f,1.f)); m_salvoLaunched++; }
+            m_salvoT+=STEP;
+         } else if(!m_salvoStarted && m_next<=0.f){
+            // scheme 1: two stages: a steady number of rockets, and from `split` of the show on fewer and fewer, down to a single one at the end
+            // scheme 2: steady the whole time (f = 1)
+            const float s0=P.split*T;
+            const float f= m_schemeNow==2 ? 1.f : (m_time<=s0 ? 1.f : std::max(0.f,1.f-(m_time-s0)/std::max(0.01f,T-s0)));
             const float lim=std::max(1.f,std::round(rr(P.rockets)*f));
             if((float)m_rockets.size()<lim){ spawnRocket(); m_next=(0.45f+0.9f*rnd())*P.launchGap/std::max(0.25f,f); }
             else m_next=0.05f;                           // all slots busy: look again shortly
-         } }
+         }
+      }
       for(Rocket& r:m_rockets){
          r.t+=STEP; r.vy+=r.ay*STEP; r.x+=r.vx*STEP; r.y+=r.vy*STEP;
          if(r.hn<19) r.hn++; for(int i=r.hn-1;i>0;i--){ r.hx[i]=r.hx[i-1]; r.hy[i]=r.hy[i-1]; } r.hx[0]=r.x; r.hy[0]=r.y;

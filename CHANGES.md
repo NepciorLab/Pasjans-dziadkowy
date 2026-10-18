@@ -476,3 +476,25 @@ tryb Tylko król, seed 4): 2 wątki 1,30 -> 12 wątków 6,20 -> 3 wątki 1,91 ->
 - "Pokaż szczegóły wyniku" jest przyciskiem na pasku, obok punktów (widocznym po wygranej).
 
 - Wszystkie okna dialogowe gry są nakładkami w stylu gry: pytania Tak/Nie i komunikaty (zerowanie statystyk, zmiana trybu, aktualizacja, błędy zapisu i odczytu, pusta lista), Zagraj numer (pole z klawiatury), Brak ruchów, Zagraj nieudany (lista z filtrem, klawisze góra/dół/Enter, dwuklik) - każde jest modalne. Zostały tylko systemowe okna wyboru pliku (Zapisz / Wczytaj / Wybierz dźwięk) i komunikaty o błędzie przy starcie programu.
+
+# Wersja 1.1.6
+- Okna (Nowy rekord, Statystyki, Ustawienia, Pomoc, Wynik partii) nie zamykają się kliknięciem poza oknem - tylko przyciskiem (OK w oknie rekordu, Zamknij w pozostałych; X w rogu i Esc nadal działają, a okno rekordu nie ma X). Okno rekordu blokuje pasek i menu jak inne okna modalne.
+
+# Wersja 1.1.6: nowe dźwięki fajerwerków
+- Dźwięki wygenerowane z dostarczonych nagrań (tools/mp3wav.cpp dekoduje, tools/sfxgen.cpp tworzy: 32 kHz mono, bez fade-in, z fade-out):
+  1) wystrzał rakiety - 3 warianty z 1.mp3 (różna wysokość i barwa, lekkie echo na końcu),
+  2) lot w górę - 5 gwizdów po 1,5 s: 3 z 2a.mp3 (rozciągnięte bez zmiany wysokości, trzy wysokości) i 2 pojedyncze gwizdy wycięte z 2b.mp3,
+  3) eksplozja - 3 warianty z 3.mp3, 4) iskrzenie - 1 dźwięk z 4.mp3 przedłużony do 1,5 s.
+- Każda faza fajerwerku ma jeden dźwięk, odtwarzany od początku do końca w chwili, gdy faza zaczyna się w animacji: pojawienie się rakiety
+  (wystrzał i gwizd lotu, losowane z grupy), eksplozja, a dla fajerwerków gasnących z rozbłyskiem - iskrzenie (od chwili, gdy pierwsze
+  iskry zaczynają błyskać). Nic nie jest wyciszane; po końcu pokazu wszystko jest urywane (jak dotąd).
+- Zniknęły stare swist1-5.wav i wybuch4-5.wav; sloty dźwięków 9-20 (SOUND_LAUNCH0 / SOUND_FLIGHT0 / SOUND_BOOM0 / SOUND_SPARKLE).
+
+# Wersja 1.1.6: ustawienia dewelopera
+- Grupa "Deweloper" przewija się (kółko, pasek w prawym marginesie, PgUp/PgDn/strzałki/Home/End); kontrolki poza widocznym fragmentem nie reagują na klik.
+- Dźwięki fajerwerków: dla każdej z czterech faz (wystrzał, lot, eksplozja, iskrzenie) można wybrać własny plik WAV lub MP3, który zastępuje
+  wbudowane warianty tej fazy (Plik… / ► podgląd / ↺ wbudowane); ścieżki w dev.txt. MP3 jest dekodowany przez Media Foundation ładowane
+  dopiero przy użyciu (dlatego build wymaga -lmfuuid).
+- Scenariusz zakończenia fajerwerków: "Coraz mniej" (jak dotąd) albo "Salwa 15": stała liczba fajerwerków przez cały czas, a 3 s przed końcem
+  czasu wystrzeliwania 15 rakiet w losowych momentach w ciągu 200 ms (to ostatnie rakiety pokazu). "Losowe" (domyślnie) losuje scenariusz przy
+  każdym uruchomieniu; wybór zapisuje się w dev.txt (FwScheme).

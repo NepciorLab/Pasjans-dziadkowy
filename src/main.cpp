@@ -48,7 +48,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.1.5";
+static const wchar_t* APP_VERSION = L"1.1.6";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -886,16 +886,27 @@ static void devSave(){
       P.rockets.lo,P.rockets.hi,P.sparks.lo,P.sparks.hi,P.speed.lo,P.speed.hi);
    fprintf(f,"FwGravityMin=%.3f\r\nFwGravityMax=%.3f\r\nFwLifeMin=%.3f\r\nFwLifeMax=%.3f\r\nFwGlowMin=%.3f\r\nFwGlowMax=%.3f\r\n",
       P.gravity.lo,P.gravity.hi,P.life.lo,P.life.hi,P.glow.lo,P.glow.hi);
-   fprintf(f,"FwFinale=%.3f\r\nFwTotalS=%.1f\r\nFwSplit=%.3f\r\n",P.finale,g_fwTotalS,P.split);
+   fprintf(f,"FwFinale=%.3f\r\nFwTotalS=%.1f\r\nFwSplit=%.3f\r\nFwScheme=%d\r\n",P.finale,g_fwTotalS,P.split,P.scheme);
+   for(int i=0;i<SOUND_FWC_N;i++){                          // an own file for a phase of the fireworks (UTF-8)
+      const std::wstring& w=SoundSystem::instance().customPath(SOUND_FWC0+i);
+      char u[1200]={}; if(!w.empty()) WideCharToMultiByte(CP_UTF8,0,w.c_str(),-1,u,(int)sizeof(u)-1,nullptr,nullptr);
+      fprintf(f,"FwSound%d=%s\r\n",i,u);
+   }
    fclose(f);
 }
 static void devLoad(){
    FILE* f=nullptr; _wfopen_s(&f,exeDirFile(L"dev.txt").c_str(),L"rb");
    if(!f) return;
-   char line[128];
-   while(fgets(line,128,f)){
+   char line[1300];
+   while(fgets(line,(int)sizeof(line),f)){
       char* eq=strchr(line,'='); if(!eq) continue; *eq=0; const char* k=line; double v=atof(eq+1);
       Fireworks2::Params& P=g_fw.P;
+      if(!strncmp(k,"FwSound",7) && k[7]>='0' && k[7]<'0'+SOUND_FWC_N){          // an own sound file of a phase
+         char* val=eq+1; for(char* e=val+strlen(val);e>val&&(e[-1]=='\r'||e[-1]=='\n');) *--e=0;
+         wchar_t w[MAX_PATH]={}; if(*val) MultiByteToWideChar(CP_UTF8,0,val,-1,w,MAX_PATH);
+         if(w[0]) SoundSystem::instance().setCustomPath(SOUND_FWC0+(k[7]-'0'),w);
+         continue;
+      }
       if(!strcmp(k,"TornadoMs")) g_dev.tornadoMs=(int)v;
       else if(!strcmp(k,"AccelMs")) g_dev.accelMs=(int)v;
       else if(!strcmp(k,"DecelMs")) g_dev.decelMs=(int)v;
@@ -914,6 +925,7 @@ static void devLoad(){
       else if(!strcmp(k,"FwLifeMin")) P.life.lo=(float)v;       else if(!strcmp(k,"FwLifeMax")) P.life.hi=(float)v;
       else if(!strcmp(k,"FwGlowMin")) P.glow.lo=(float)v;       else if(!strcmp(k,"FwGlowMax")) P.glow.hi=(float)v;
       else if(!strcmp(k,"FwSplit")) P.split=(float)v;
+      else if(!strcmp(k,"FwScheme")) P.scheme=(int)v;
       else if(!strcmp(k,"FwFinale")) P.finale=(float)v;
       else if(!strcmp(k,"FwTotalS")) g_fwTotalS=(float)v;
    }
@@ -922,6 +934,7 @@ static void devLoad(){
    g_dev.decelMs=std::max(0,std::min(10000,g_dev.decelMs)); g_dev.rowGapMs=std::max(0,std::min(3000,g_dev.rowGapMs));
    g_fwTotalS=std::max(5.f,std::min(60.f,g_fwTotalS));
    g_fw.P.split=std::max(0.f,std::min(1.f,g_fw.P.split));
+   if(g_fw.P.scheme<0||g_fw.P.scheme>2) g_fw.P.scheme=0;
    for(Fireworks2::Range* r:{&g_fw.P.rockets,&g_fw.P.sparks,&g_fw.P.speed,&g_fw.P.gravity,&g_fw.P.life,&g_fw.P.glow}) if(r->lo>r->hi) std::swap(r->lo,r->hi);
 }
 
@@ -1701,17 +1714,22 @@ static void discardD2DRT(){
 // burst bangs (one of five bangs), panned to where it is.
 struct SndAt{ double at; int idx; float vol, pan; };
 static std::vector<SndAt> g_sndQ;
-static const double WHISTLE_LEN[SOUND_VARIANTS]={0.86,0.96,1.07,1.23,1.39};   // seconds (res/sounds/swist1..5.wav)
+// One sound for every phase of every firework, started at the very moment the phase begins in the animation and
+// played to its end (they fade out by themselves): a new rocket - one of 3 launch shots and one of 5 whistles of the
+// flight, the burst - one of 3 explosions, and (only fireworks that die out with a flash) the crackle of the sparks.
 static void fireworksSounds(double now){
    static std::mt19937 rng{std::random_device{}()};
    for(const Fireworks2::Event& e:g_fw.takeEvents()){
       const float pan=(e.x-0.5f)*1.6f;
+      // a file chosen for a phase in the developer settings replaces the built-in variants of that phase
+      auto pick=[&](int phase,int base,int n)->int{ const int c=SOUND_FWC0+phase; return SoundSystem::instance().hasBuffer(c)? c : base+(int)(rng()%n); };
       if(e.kind==0){
-         int cand[SOUND_VARIANTS], n=0; for(int i=0;i<SOUND_VARIANTS;i++) if(WHISTLE_LEN[i]<=e.flight+0.03) cand[n++]=i;
-         const int v= n>0 ? cand[rng()%n] : 0;
-         g_sndQ.push_back({now+std::max(0.0,e.flight-WHISTLE_LEN[v]),SOUND_WHISTLE0+v,0.55f,pan});
+         g_sndQ.push_back({now,pick(0,SOUND_LAUNCH0,SOUND_LAUNCH_N),0.80f,pan});
+         g_sndQ.push_back({now,pick(1,SOUND_FLIGHT0,SOUND_FLIGHT_N),0.60f,pan});
+      } else if(e.kind==1){
+         g_sndQ.push_back({now,pick(2,SOUND_BOOM0,SOUND_BOOM_N),0.75f+0.25f*std::min(1.f,e.size/850.f),pan});
       } else {
-         g_sndQ.push_back({now,SOUND_BANG0+(int)(rng()%SOUND_VARIANTS),0.62f+0.38f*std::min(1.f,e.size/850.f),pan});
+         g_sndQ.push_back({now+e.flight,pick(3,SOUND_SPARKLE,1),0.65f,pan});
       }
    }
    if(!g_fw.active()) g_sndQ.clear();
@@ -1719,8 +1737,7 @@ static void fireworksSounds(double now){
       if(now>=g_sndQ[i].at){ SoundSystem::instance().playFw(g_sndQ[i].idx,g_sndQ[i].vol*g_volume,g_sndQ[i].pan); g_sndQ.erase(g_sndQ.begin()+i); }
       else i++;
    }
-}
-static void stopFireworks(){
+}static void stopFireworks(){
    g_fw.stop(); g_sndQ.clear(); SoundSystem::instance().stopFw(); KillTimer(g_hwnd,TIMER_FW);
 }
 // Lays the fireworks image over the table (alpha 0: the light is added to what is behind it).
@@ -5327,7 +5344,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       return 0;}
 
    case WM_COMMAND:
-      if(ovSolver()) return 0;     // a Solver window is open (modal): the toolbar and the menu are off
+      if(ovSolver()||g_ov==OV_RECORD) return 0;     // a modal window is open (Solver, questions, the record window): the toolbar and the menu are off
       // Restore keyboard focus to main window whenever a control sends WM_COMMAND
       // (buttons steal focus when clicked — this ensures shortcuts keep working)
       SetFocus(hwnd);

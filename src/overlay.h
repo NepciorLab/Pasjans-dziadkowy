@@ -15,7 +15,8 @@ struct OvHit{ float x,y,w,h; int kind,a; };
 enum { OH_CLOSE=1, OH_GROUP, OH_BG, OH_FREE, OH_HILITE, OH_DEPTH, OH_ANIM, OH_UPDATES, OH_VOL, OH_SBROWSE, OH_SPLAY, OH_SMUTE,
        OH_SDEF, OH_KEY, OH_KEYCLR, OH_KEYDEF, OH_STATRESET,
        OH_SVP_ROW, OH_SVP_ALL, OH_SVP_NONE, OH_SVP_OK, OH_SVP_CANCEL, OH_SVP_ADD, OH_SVP_MODE, OH_SV_SLIDER, OH_SV_NEXT, OH_SV_THR,
-       OH_SVR_STOP, OH_SVA_YES, OH_SVA_NO, OH_SVX_OK, OH_NEWDEAL, OH_TORNADO, OH_DEVFIELD, OH_DEVSL, OH_DEVBTN, OH_DEVRESET, OH_RECOK, OH_MSGBTN, OH_PFROW, OH_PFOK, OH_PFCANCEL };
+       OH_SVR_STOP, OH_SVA_YES, OH_SVA_NO, OH_SVX_OK, OH_NEWDEAL, OH_TORNADO, OH_DEVFIELD, OH_DEVSL, OH_DEVBTN, OH_DEVRESET, OH_RECOK, OH_MSGBTN, OH_PFROW, OH_PFOK, OH_PFCANCEL,
+       OH_DEVSCN, OH_DEVSBROWSE, OH_DEVSPLAY, OH_DEVSDEF };
 
 static int   g_ov=OV_NONE;                       // which overlay is open
 static std::vector<OvHit> g_ovHits;
@@ -35,6 +36,9 @@ static float g_devSlX[10]={}, g_devSlW[10]={1,1,1,1,1,1,1,1,1,1};
 static int   g_devCaret=0, g_devSelA=-1;      // the caret of the field being typed into and the other end of the selection (-1 none)
 static bool  g_devDragSel=false;
 static bool  g_ovDragWin=false; static float g_ovGrabX=0, g_ovGrabY=0, g_setDx=0, g_setDy=0;   // the Settings window can be moved by its title bar
+static float g_devScroll=0, g_devContentH=0, g_devViewH=0, g_devTrackX=0, g_devTrackY=0, g_devTrackH=0, g_devGrabDy=0;   // the Developer group scrolls
+static bool  g_devDragThumb=false;
+static bool  g_hitClip=false; static float g_hitClipY0=0, g_hitClipY1=0;     // while set, only the part of a control inside [Y0,Y1] can be clicked
 static bool  g_ovSwallowUp=false;     // the button-up of a click the overlay consumed (even one that closed it) must not reach the table
 
 static bool ovActive(){ return g_ov!=OV_NONE; }
@@ -87,7 +91,10 @@ static void ovWrap(const std::wstring& s,float x,float y,float w,float h,float p
    if(br){ g_d2dRT->DrawText(s.c_str(),(UINT32)s.size(),f,D2D1::RectF(x,y,x+w,y+h),br); br->Release(); }
    f->Release();
 }
-static void ovHit(float x,float y,float w,float h,int kind,int a=0){ g_ovHits.push_back({x,y,w,h,kind,a}); }
+static void ovHit(float x,float y,float w,float h,int kind,int a=0){
+   if(g_hitClip){ const float b=y+h; if(b<=g_hitClipY0||y>=g_hitClipY1) return; const float ny=std::max(y,g_hitClipY0), nb=std::min(b,g_hitClipY1); y=ny; h=nb-ny; }
+   g_ovHits.push_back({x,y,w,h,kind,a});
+}
 static std::wstring ovFileBase(const std::wstring& p){ size_t k=p.find_last_of(L"\\/"); return k==std::wstring::npos?p:p.substr(k+1); }
 
 // Panel colours (blue; Garibaldka's are green)
@@ -154,7 +161,7 @@ static void ovOpen(int which){ if(g_ov==which){ ovClose(); return; } if(which==O
 static void ovClose(){
    if(g_ov==OV_NONE) return;
    devCommit(); devStopLoops();
-   if(g_ovDragWin||g_ovDragSl>=0||g_devDragSel){ g_ovDragWin=false; g_ovDragSl=-1; g_devDragSel=false; ReleaseCapture(); }
+   if(g_ovDragWin||g_ovDragSl>=0||g_devDragSel||g_devDragThumb){ g_ovDragWin=false; g_ovDragSl=-1; g_devDragSel=false; g_devDragThumb=false; ReleaseCapture(); }
    g_ov=OV_NONE; g_ovCapture=-1;
    if(g_ovDragVol||g_ovDragAnim||g_ovDragThumb){ g_ovDragVol=g_ovDragAnim=g_ovDragThumb=false; ReleaseCapture(); }
    SoundSystem::instance().fadeOutAll(200);
@@ -253,8 +260,17 @@ static void devFocusField(int i){
    if(g_devFocus!=i){ devCommit(); g_devFocus=i; g_devBuf=std::to_wstring(*devField(i)); g_devCaret=(int)g_devBuf.size(); g_devSelA=0; }   // the whole number is selected
 }
 static void devReset(){
-   g_dev=DevParams(); g_fw.P=Fireworks2::Params(); g_fwTotalS=20.f; devSave();
+   g_dev=DevParams(); g_fw.P=Fireworks2::Params(); g_fwTotalS=20.f;
+   for(int i=0;i<SOUND_FWC_N;i++) SoundSystem::instance().setCustomPath(SOUND_FWC0+i,L"");
+   devSave();
 }
+// the geometry of the scroll bar of the Developer group (set while it is drawn)
+static void devThumb(float& ty,float& th){
+   const float maxS=std::max(1.f,g_devContentH-g_devViewH);
+   th=std::max(30.f,g_devTrackH*g_devViewH/std::max(g_devViewH,g_devContentH));
+   ty=g_devTrackY+(g_devTrackH-th)*(g_devScroll/maxS);
+}
+static void devClampScroll(){ g_devScroll=std::max(0.f,std::min(g_devScroll,std::max(0.f,g_devContentH-g_devViewH))); }
 static void ovSetDevSlider(float mx){
    int i=g_ovDragSl; if(i<0||i>=DEV_SL_N) return;
    DevSlider s=devSl(i);
@@ -285,6 +301,7 @@ static void settingsOverlayDraw(){
       ovText(OV_GROUPS[i],nx+14,y,nw-20,44,16,1,1,1,1.f,act,DWRITE_TEXT_ALIGNMENT_LEADING);
       ovHit(nx,y,nw,44,OH_GROUP,i);
    }
+   ovButton(nx,py+ph-24-40,nw,40,L"Zamknij",OH_CLOSE,0,true,true,15);
    ovRect(nx+nw+14,ny,1.2f,ph-92-24,0,1,1,1,0.18f);
    const float cx=nx+nw+30, cw=px+pw-28-cx; float y=ny;
    ovHeading(OV_GROUPS[g_ovGroup],cx,y,cw); y+=48;
@@ -368,6 +385,11 @@ static void settingsOverlayDraw(){
       break;}
    case 4:{                                                                         // Developer
       ovButton(cx+cw-150,ny-4,150,30,L"Domyślne",OH_DEVRESET,0,false,true,13.f);
+      // everything below scrolls inside the window of the group
+      const float vy0=y, vy1=py+ph-24; g_devViewH=vy1-vy0; devClampScroll();
+      g_d2dRT->PushAxisAlignedClip(D2D1::RectF(cx-8,vy0,cx+cw+8,vy1),D2D1_ANTIALIAS_MODE_ALIASED);
+      g_hitClip=true; g_hitClipY0=vy0; g_hitClipY1=vy1;
+      y=vy0-g_devScroll; const float contentTop=y;
       const wchar_t* fl[4]={L"Tornado – czas całej animacji [ms]",L"Przyspieszanie na początku [ms]",L"Opóźnianie na końcu [ms]",L"Odstęp między wierszami rozdania [ms]"};
       const bool caretOn=(GetTickCount()/530)%2==0;
       for(int i=0;i<4;i++,y+=32){
@@ -387,6 +409,14 @@ static void settingsOverlayDraw(){
         const bool on[4]={g_devRowLoop,false,false,g_devFwLoop}; const float bw=(cw-24.f)/4.f;
         for(int i=0;i<4;i++) ovButton(cx+i*(bw+8.f),y,bw,38,bl[i],OH_DEVBTN,i,on[i],true,12.5f); }
       y+=46;
+      // how the fireworks end: the scheme of every show is drawn, or fixed here
+      ovText(L"Zakończenie pokazu fajerwerków",cx,y,cw,22,13.5f,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_LEADING); y+=26;
+      { const wchar_t* sl[3]={L"Losowe",L"Coraz mniej",L"Salwa 15 na końcu"}; const float bw=(cw-16.f)/3.f;
+        for(int i=0;i<3;i++) ovButton(cx+i*(bw+8.f),y,bw,34,sl[i],OH_DEVSCN,i,g_fw.P.scheme==i,true,13.f); }
+      y+=40;
+      if(g_fw.active()) ovNote(std::wstring(L"Trwający pokaz: ")+(g_fw.schemeNow()==2?L"stała liczba, salwa 15 na 3 s przed końcem":L"coraz mniej fajerwerków"),cx,y,cw,20);
+      else ovNote(L"„Losowe” losuje jeden ze scenariuszy przy każdym uruchomieniu fajerwerków.",cx,y,cw,20);
+      y+=30;
       ovText(L"Fajerwerki  (dwa punkty: zakres, z którego gra losuje wartość dla każdego ognia)",cx,y,cw,22,13.5f,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_LEADING); y+=26;
       for(int i=0;i<DEV_SL_N;i++,y+=25){
          DevSlider s=devSl(i);
@@ -400,6 +430,31 @@ static void settingsOverlayDraw(){
          if(s.hi) ovKnob(g_devSlX[i]+g_devSlW[i]*u1,y+12);
          ovHit(g_devSlX[i]-10,y,g_devSlW[i]+20,24,OH_DEVSL,i);
          ovText(devSlText(s),cx+cw-88,y,88,24,13.f,1,1,1,1.f,true,DWRITE_TEXT_ALIGNMENT_TRAILING);
+      }
+      y+=10;
+      // an own sound file (WAV or MP3) for each phase of a firework: it replaces the built-in variants of that phase
+      ovText(L"Dźwięki fajerwerków  (własny plik WAV lub MP3 zastępuje warianty danej fazy)",cx,y,cw,22,13.5f,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_LEADING); y+=28;
+      { const wchar_t* pn[4]={L"1. Wystrzał (rakieta się pojawia)",L"2. Lot w górę",L"3. Eksplozja",L"4. Iskrzenie"}; const int nVar[4]={SOUND_LAUNCH_N,SOUND_FLIGHT_N,SOUND_BOOM_N,1};
+        for(int i=0;i<SOUND_FWC_N;i++,y+=38){
+           const std::wstring& cp=SoundSystem::instance().customPath(SOUND_FWC0+i); const bool own=!cp.empty()&&SoundSystem::instance().hasBuffer(SOUND_FWC0+i);
+           ovText(pn[i],cx,y,200,32,13.5f,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+           const std::wstring cur= !cp.empty() ? (own?ovFileBase(cp):ovFileBase(cp)+L" (nie wczytano)") : std::wstring(L"wbudowane (")+std::to_wstring(nVar[i])+(nVar[i]==1?L" dźwięk)":L" warianty)");
+           ovRect(cx+204,y+2,cw-204-130,28,6,0,0,0,0.30f);
+           ovText(cur,cx+212,y+2,cw-204-130-16,28,13.f,1,1,1,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
+           const float bx=cx+cw-122;
+           ovButton(bx,y+1,50,30,L"Plik…",OH_DEVSBROWSE,i,false,true,12.5f);
+           ovButton(bx+54,y+1,32,30,L"►",OH_DEVSPLAY,i,false,true,15.f);
+           ovButton(bx+90,y+1,32,30,L"↺",OH_DEVSDEF,i,false,!cp.empty(),13.f);
+        } }
+      y+=6;
+      g_hitClip=false; g_d2dRT->PopAxisAlignedClip();
+      g_devContentH=y-contentTop; devClampScroll();
+      // the scroll bar (in the right margin of the window)
+      g_devTrackX=px+pw-24; g_devTrackY=vy0; g_devTrackH=vy1-vy0;
+      if(g_devContentH>g_devViewH+1.f){
+         float ty,th; devThumb(ty,th);
+         ovRect(g_devTrackX,g_devTrackY,8,g_devTrackH,4,1,1,1,0.10f);
+         ovRect(g_devTrackX,ty,8,th,4,1.f,0.86f,0.30f,g_devDragThumb?0.95f:0.70f);
       }
       break;}   case 3:{                                                                         // Keys
       ovNote(L"Kliknij pole skrótu i naciśnij klawisz (z Shiftem, jeśli ma go wymagać). Każda akcja ma dwa skróty; × czyści skrót.",cx,y-4,cw,40); y+=38;
@@ -458,6 +513,7 @@ static void scoreOverlayDraw(){
    ovText(std::to_wstring(s.total),x0+w-220,y,220,48,34,1.f,0.86f,0.30f,1.f,true,DWRITE_TEXT_ALIGNMENT_TRAILING);
    if(s.samo) ovText(L"Samograj grał w tej partii – punktacja unieważniona.",x0,y+54,w,26,14,1.f,0.55f,0.55f,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
    else ovNote(L"Pozycje są zaokrąglane do całych punktów; suma jest liczona z dokładnych wartości.",x0,y+54,w,22);
+   ovButton(px+pw-28-150,py+ph-60,150,40,L"Zamknij",OH_CLOSE,0,true,true,15);
 }
 
 // ============================================================================
@@ -466,7 +522,7 @@ static void scoreOverlayDraw(){
 static void recordOverlayDraw(){
    const int n=(int)g_recLines.size();
    const float pw=std::min(600.f,g_ovW-30.f), ph=std::min(g_ovH-30.f,200.f+62.f*n), px=std::floor((g_ovW-pw)/2.f), py=std::floor((g_ovH-ph)/2.f);
-   ovPanel(px,py,pw,ph,n>1?L"Nowe rekordy!":L"Nowy rekord!",g_recMode?L"Tryb: dowolna karta":L"Tryb: tylko król");
+   ovPanel(px,py,pw,ph,n>1?L"Nowe rekordy!":L"Nowy rekord!",g_recMode?L"Tryb: dowolna karta":L"Tryb: tylko król",false);
    const float x0=px+32, w=pw-64; float y=py+96;
    for(const RecLine& r:g_recLines){
       ovText(r.name,x0,y,w-200,32,18,LIT_R,LIT_G,LIT_B,1.f,false,DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -527,6 +583,25 @@ static void settingsOverlayClick(const OvHit& h,float mx){
                 g_ovDragKnob=(std::fabs(mx-x1)<std::fabs(mx-x0)||(mx>x1))?1:0; if(mx<x0) g_ovDragKnob=0; }
       SetCapture(g_gameHwnd); ovSetDevSlider(mx); break;}
    case OH_DEVRESET: devReset(); break;
+   case OH_DEVSCN: g_fw.P.scheme=h.a; devSave(); break;
+   case OH_DEVSBROWSE:{
+      wchar_t path[MAX_PATH]={};
+      OPENFILENAMEW ofn={}; ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=g_hwnd;
+      ofn.lpstrFilter=L"Pliki dźwiękowe (*.wav;*.mp3)\0*.wav;*.mp3\0WAV (*.wav)\0*.wav\0MP3 (*.mp3)\0*.mp3\0Wszystkie\0*.*\0";
+      ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH; ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST;
+      const wchar_t* ttl[4]={L"Dźwięk wystrzału rakiety",L"Dźwięk lotu rakiety",L"Dźwięk eksplozji",L"Dźwięk iskrzenia"}; ofn.lpstrTitle=ttl[h.a&3];
+      if(GetOpenFileNameW(&ofn)){
+         SoundSystem::instance().setCustomPath(SOUND_FWC0+h.a,path);
+         if(SoundSystem::instance().hasBuffer(SOUND_FWC0+h.a)) SoundSystem::instance().playFw(SOUND_FWC0+h.a,g_volume,0.f);
+         devSave();
+      }
+      break;}
+   case OH_DEVSPLAY:{                      // a sample of the phase: the own file, or one of the built-in variants
+      static const int base[4]={SOUND_LAUNCH0,SOUND_FLIGHT0,SOUND_BOOM0,SOUND_SPARKLE}, nv[4]={SOUND_LAUNCH_N,SOUND_FLIGHT_N,SOUND_BOOM_N,1};
+      const int c=SOUND_FWC0+h.a, slot=SoundSystem::instance().hasBuffer(c)? c : base[h.a&3]+(int)(GetTickCount()%(DWORD)nv[h.a&3]);
+      SoundSystem::instance().stopFw(); SoundSystem::instance().playFw(slot,g_volume,0.f);
+      break;}
+   case OH_DEVSDEF: SoundSystem::instance().setCustomPath(SOUND_FWC0+h.a,L""); devSave(); break;
    case OH_DEVBTN:
       switch(h.a){ case 0: devRunRow(); break; case 1: devRunDealAll(); break; case 2: devRunTornado(); break; default: devRunFireworks(); break; }
       break;
@@ -594,6 +669,7 @@ static void statsOverlayDraw(){
    y+=8;
    ovNote(L"Do statystyk wchodzą tylko partie rozegrane do końca w trybie, w którym zostały rozpoczęte. Gry wczytane z pliku, powtórki i odtwarzanie rozwiązań nie są liczone.",x0,y,w,48);
    ovButton(x0,py+ph-60,190,36,L"Wyzeruj statystyki",OH_STATRESET,0);
+   ovButton(x0+w-150,py+ph-60,150,36,L"Zamknij",OH_CLOSE,0,true,true,15);
 }
 static void statsReset(){
    if(styledBox(g_hwnd,L"Wyzerować wszystkie statystyki i rekordy? Tego nie można cofnąć.",L"Statystyki",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES) return;
@@ -663,7 +739,7 @@ static std::vector<HelpBlock> g_helpBlocks;
 static void helpRelease(){ for(auto& b:g_helpBlocks) if(b.lay) b.lay->Release(); g_helpBlocks.clear(); }
 static void helpGeom(float& px,float& py,float& pw,float& ph,float& vx,float& vy,float& vw,float& vh){
    pw=std::min(840.f,g_ovW-30.f); ph=g_ovH-30.f; px=std::floor((g_ovW-pw)/2.f); py=15.f;
-   vx=px+28.f; vy=py+82.f; vw=pw-28.f-40.f; vh=ph-82.f-24.f;
+   vx=px+28.f; vy=py+82.f; vw=pw-28.f-40.f; vh=ph-82.f-24.f-56.f;
 }
 static void helpBuild(float width){
    helpRelease(); float y=0;
@@ -720,6 +796,7 @@ static void helpOverlayDraw(){
    }
    g_d2dRT->PopAxisAlignedClip();
    for(auto* b:{bBody,bGold,bDim,bRule}) if(b) b->Release();
+   ovButton(px+pw-28-150,py+ph-24-40,150,40,L"Zamknij",OH_CLOSE,0,true,true,15);
    if(g_ovContentH>vh+1){
       float sx=px+pw-30, ty,th; helpThumb(vy,vh,ty,th);
       ovRect(sx,vy,8,vh,4,1,1,1,0.10f);
@@ -792,13 +869,23 @@ static void ovMouseDown(float mx,float my){
    if(g_ov==OV_SETTINGS && mx>=px && mx<=px+pw && my>=py && my<=py+76){        // the title bar: the window can be moved
       g_ovDragWin=true; g_ovGrabX=mx-px; g_ovGrabY=my-py; SetCapture(g_gameHwnd); return;
    }
-   if(g_ov==OV_SETTINGS && g_ovGroup==4) return;                              // the developer group stays open (it is a window to work with)
-   if(mx<px||mx>px+pw||my<py||my>py+ph){ ovClose(); return; }
+   if(g_ov==OV_SETTINGS && g_ovGroup==4 && g_devContentH>g_devViewH+1.f && mx>=g_devTrackX-8 && mx<=g_devTrackX+16 && my>=g_devTrackY && my<=g_devTrackY+g_devTrackH){
+      float ty,th; devThumb(ty,th);
+      if(my>=ty&&my<=ty+th){ g_devDragThumb=true; g_devGrabDy=my-ty; SetCapture(g_gameHwnd); }
+      else { g_devScroll+=(my<ty?-1.f:1.f)*g_devViewH*0.9f; devClampScroll(); }
+      invalidateGame(); return;
+   }
+   if(mx<px||mx>px+pw||my<py||my>py+ph) return;                               // a click outside does not close a window: only its buttons (or Esc) do
    if(g_ov==OV_HELP) helpMouseDown(mx,my);
 }
 static void ovMouseMove(float mx,float my){
    if(ovSolver()){ solverOverlayMove(mx,my); return; }
    if(g_ovDragSl>=0){ ovSetDevSlider(mx); return; }
+   if(g_devDragThumb){
+      float ty,th; devThumb(ty,th); const float track=g_devTrackH-th;
+      if(track>=1.f){ g_devScroll=((my-g_devGrabDy-g_devTrackY)/track)*(g_devContentH-g_devViewH); devClampScroll(); invalidateGame(); }
+      return;
+   }
    if(g_devDragSel){ g_devCaret=devPosAt(mx-g_devFieldX[std::max(0,g_devFocus)]); invalidateGame(); return; }
    if(g_ovDragWin){
       float px,py,pw,ph,bx,by; settingsRect(px,py,pw,ph,&bx,&by);
@@ -810,6 +897,7 @@ static void ovMouseUp(){
    g_ovSwallowUp=false;
    if(g_ovDragSv||g_svDragThumb){ solverOverlayUp(); return; }
    if(g_ovDragSl>=0){ g_ovDragSl=-1; ReleaseCapture(); devSave(); invalidateGame(); }
+   if(g_devDragThumb){ g_devDragThumb=false; ReleaseCapture(); invalidateGame(); }
    if(g_devDragSel){ g_devDragSel=false; ReleaseCapture(); if(g_devSelA==g_devCaret) g_devSelA=-1; invalidateGame(); }
    if(g_ovDragWin){ g_ovDragWin=false; ReleaseCapture(); invalidateGame(); }
    if(g_ovDragVol){ g_ovDragVol=false; ReleaseCapture(); saveSettings(); playSound("click",g_volume); invalidateGame(); }
@@ -818,6 +906,7 @@ static void ovMouseUp(){
 }
 static void ovWheel(int delta){
    if(ovSolver()){ solverOverlayWheel(delta); return; }
+   if(g_ov==OV_SETTINGS && g_ovGroup==4){ g_devScroll-=(float)delta/120.f*60.f; devClampScroll(); invalidateGame(); return; }
    if(g_ov!=OV_HELP) return;
    float px,py,pw,ph,vx,vy,vw,vh; helpGeom(px,py,pw,ph,vx,vy,vw,vh);
    g_ovScroll-=(float)delta/120.f*60.f; helpClamp(vh); invalidateGame();
@@ -855,6 +944,18 @@ static void ovKey(WPARAM k){
       g_ovCapture=-1; saveSettings(); invalidateGame(); return;
    }
    if(k==VK_ESCAPE||((g_ov==OV_RECORD||g_ov==OV_SCORE)&&k==VK_RETURN)){ ovClose(); return; }
+   if(g_ov==OV_SETTINGS && g_ovGroup==4){                                    // the Developer group scrolls with the keyboard too
+      switch(k){
+      case VK_UP:    g_devScroll-=46; break;
+      case VK_DOWN:  g_devScroll+=46; break;
+      case VK_PRIOR: g_devScroll-=g_devViewH*0.9f; break;
+      case VK_NEXT:  g_devScroll+=g_devViewH*0.9f; break;
+      case VK_HOME:  g_devScroll=0; break;
+      case VK_END:   g_devScroll=1e9f; break;
+      default: break;
+      }
+      devClampScroll(); invalidateGame(); return;
+   }
    if(g_ov==OV_HELP){
       float px,py,pw,ph,vx,vy,vw,vh; helpGeom(px,py,pw,ph,vx,vy,vw,vh);
       switch(k){
