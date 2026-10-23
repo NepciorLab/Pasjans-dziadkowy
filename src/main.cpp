@@ -48,7 +48,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.1.6";
+static const wchar_t* APP_VERSION = L"1.1.7";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -87,6 +87,7 @@ static const DWORD CARD_ANIM_PAUSE_MS   = 500;  // hint: pause at dest before va
 // of the duration). Steps compound multiplicatively, so -2/+2 are a further
 // 50% on top of -1/+1, not simply double the single-step change.
 static int   g_animSpeedStep = 0;
+static bool  g_dropFrames   = false;  // Settings -> Grafika: green frames where a grabbed card can be put (off by default)
 static bool  g_newDealAnim  = true;   // Settings -> Grafika: the animation of a new game (gathering the old cards, dealing the new ones)
 static bool  g_tornadoSound = true;   // Settings -> Dźwięki: the whirlwind sound during that animation
 // Settings -> Deweloper (only when Developer.PMa lies next to the game; saved in dev.txt)
@@ -957,6 +958,7 @@ static void saveSettings(){
    WritePrivateProfileStringW(L"Settings",L"AnimSpeedStep",buf,ini.c_str());
    WritePrivateProfileStringW(L"Settings",L"CheckUpdatesOnStart",g_checkUpdatesOnStart?L"1":L"0",ini.c_str());
    WritePrivateProfileStringW(L"Settings",L"NewDealAnim",g_newDealAnim?L"1":L"0",ini.c_str());
+   WritePrivateProfileStringW(L"Settings",L"DropFrames",g_dropFrames?L"1":L"0",ini.c_str());
    WritePrivateProfileStringW(L"Settings",L"TornadoSound",g_tornadoSound?L"1":L"0",ini.c_str());
    // Save move label position (only if user has manually placed it)
    if(g_moveLabelCustom){
@@ -1008,6 +1010,7 @@ static void loadSettings(){
    g_checkUpdatesOnStart=(GetPrivateProfileIntW(L"Settings",L"CheckUpdatesOnStart",1,ini.c_str())!=0);
    g_devMode=devFileExists(); if(g_devMode) devLoad();
    g_newDealAnim=(GetPrivateProfileIntW(L"Settings",L"NewDealAnim",1,ini.c_str())!=0);
+   g_dropFrames=(GetPrivateProfileIntW(L"Settings",L"DropFrames",0,ini.c_str())!=0);
    g_tornadoSound=(GetPrivateProfileIntW(L"Settings",L"TornadoSound",1,ini.c_str())!=0);
    // Load move label position
    wchar_t posBuf[64]={};
@@ -2008,7 +2011,7 @@ static void drawScene(){
    if(g_dealing){const PopIn* cur=g_deal.current();if(cur){int cx=g_layout.colPos(cur->col).x,cy=colCardY(cur->col,cur->cardIdx);float sc=cur->scale(),cw=(float)g_layout.cardW*sc,ch=(float)g_layout.cardH*sc;ID2D1Bitmap* bmp=GetCardD2D(cur->card.imgKey(),g_d2dRT);if(bmp)g_d2dRT->DrawBitmap(bmp,D2D1::RectF((float)cx+(g_layout.cardW-cw)/2.f,(float)cy+(g_layout.cardH-ch)/2.f-OY,(float)cx+(g_layout.cardW+cw)/2.f,(float)cy+(g_layout.cardH+ch)/2.f-OY));}}
    if(g_drag.active&&!g_drag.cards.empty()){int bx=g_drag.mx-g_drag.offX,by=g_drag.my-g_drag.offY;float dov=(g_drag.fromCol>=0)?g_colDispOv[g_drag.fromCol]:g_colDispOv[0];for(int i=0;i<(int)g_drag.cards.size();i++)g_renderer.drawCard((float)bx,(float)by+i*dov-OY,g_drag.cards[i],true,false);}
    // Places a grabbed card/sequence can be put on: a green frame where it would land (as in Garibaldka)
-   if(g_drag.active&&g_drag.moved&&!g_drag.cards.empty()){
+   if(g_dropFrames&&g_drag.active&&g_drag.moved&&!g_drag.cards.empty()){
       auto ring=[&](float x,float y){
          float r=(float)g_layout.cornerR+3.f; ID2D1SolidColorBrush* br=nullptr;
          g_d2dRT->CreateSolidColorBrush(D2D1::ColorF(0.45f,1.f,0.6f,0.9f),&br);

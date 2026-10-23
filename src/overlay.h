@@ -16,7 +16,7 @@ enum { OH_CLOSE=1, OH_GROUP, OH_BG, OH_FREE, OH_HILITE, OH_DEPTH, OH_ANIM, OH_UP
        OH_SDEF, OH_KEY, OH_KEYCLR, OH_KEYDEF, OH_STATRESET,
        OH_SVP_ROW, OH_SVP_ALL, OH_SVP_NONE, OH_SVP_OK, OH_SVP_CANCEL, OH_SVP_ADD, OH_SVP_MODE, OH_SV_SLIDER, OH_SV_NEXT, OH_SV_THR,
        OH_SVR_STOP, OH_SVA_YES, OH_SVA_NO, OH_SVX_OK, OH_NEWDEAL, OH_TORNADO, OH_DEVFIELD, OH_DEVSL, OH_DEVBTN, OH_DEVRESET, OH_RECOK, OH_MSGBTN, OH_PFROW, OH_PFOK, OH_PFCANCEL,
-       OH_DEVSCN, OH_DEVSBROWSE, OH_DEVSPLAY, OH_DEVSDEF };
+       OH_DEVSCN, OH_DEVSBROWSE, OH_DEVSPLAY, OH_DEVSDEF, OH_DROPFR };
 
 static int   g_ov=OV_NONE;                       // which overlay is open
 static std::vector<OvHit> g_ovHits;
@@ -356,7 +356,9 @@ static void settingsOverlayDraw(){
       ovHit(g_ovAnimX-24,y-4,g_ovAnimW+48,48,OH_ANIM);
       y+=66;
       ovCheck(cx,y,cw,L"Animacja nowego rozdania",g_newDealAnim,OH_NEWDEAL); y+=34;
-      ovNote(L"Odznaczenie pomija animację nowej gry: rozdanie od razu leży na stole.",cx+32,y,cw-32,22);
+      ovNote(L"Odznaczenie pomija animację nowej gry: rozdanie od razu leży na stole.",cx+32,y,cw-32,22); y+=40;
+      ovCheck(cx,y,cw,L"Ramki miejsc, w które można przenieść przesuwaną kartę",g_dropFrames,OH_DROPFR); y+=34;
+      ovNote(L"Zielone ramki pokazują, gdzie można położyć chwyconą kartę lub sekwencję.",cx+32,y,cw-32,22);
       break;}
    case 2:{                                                                         // Sounds
       ovLabel(L"Głośność",cx,y,100,30);
@@ -568,6 +570,7 @@ static void settingsOverlayClick(const OvHit& h,float mx){
    case OH_ANIM:  g_ovDragAnim=true; SetCapture(g_gameHwnd); ovSetAnim(mx); break;
    case OH_UPDATES: g_checkUpdatesOnStart=!g_checkUpdatesOnStart; saveSettings(); break;
    case OH_NEWDEAL: g_newDealAnim=!g_newDealAnim; saveSettings(); break;
+   case OH_DROPFR:  g_dropFrames=!g_dropFrames; saveSettings(); break;
    case OH_DEVFIELD:{
       static DWORD lastT=0; static int lastF=-1;
       const DWORD now=GetTickCount();

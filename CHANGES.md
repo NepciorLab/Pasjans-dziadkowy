@@ -498,3 +498,6 @@ tryb Tylko król, seed 4): 2 wątki 1,30 -> 12 wątków 6,20 -> 3 wątki 1,91 ->
 - Scenariusz zakończenia fajerwerków: "Coraz mniej" (jak dotąd) albo "Salwa 15": stała liczba fajerwerków przez cały czas, a 3 s przed końcem
   czasu wystrzeliwania 15 rakiet w losowych momentach w ciągu 200 ms (to ostatnie rakiety pokazu). "Losowe" (domyślnie) losuje scenariusz przy
   każdym uruchomieniu; wybór zapisuje się w dev.txt (FwScheme).
+
+# Wersja 1.1.7
+- Ustawienia -> Grafika: pole wyboru "Ramki miejsc, w które można przenieść przesuwaną kartę" (domyślnie wyłączone; zapis w pasjans.ini jako DropFrames). Zielone ramki pojawiają się podczas przeciągania karty tylko po jego włączeniu.
