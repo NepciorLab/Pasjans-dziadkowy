@@ -660,6 +660,8 @@ static void statsOverlayDraw(){
      r.name=L"Śr. czas (przegrane)";     for(int m=0;m<2;m++) r.v[m]=avgTime(g_statsTimeSum[m][0],g_statsGames[m]-g_statsWins[m]); rows.push_back(r);
      r.name=L"Rekord: najmniej ruchów";  for(int m=0;m<2;m++) r.v[m]=g_statsRecordMoves[m]<0?L"–":std::to_wstring(g_statsRecordMoves[m]); r.rule=true; rows.push_back(r); r.rule=false;
      r.name=L"Rekord: najkrótszy czas";  for(int m=0;m<2;m++) r.v[m]=g_statsRecordTime[m]<0?L"–":fmtTime(g_statsRecordTime[m]); rows.push_back(r);
+     r.name=L"Najdłuższa partia (czas)"; for(int m=0;m<2;m++) r.v[m]=g_statsLongTime[m]<0?L"–":fmtTime(g_statsLongTime[m]); rows.push_back(r);
+     r.name=L"Najwięcej ruchów w partii"; for(int m=0;m<2;m++) r.v[m]=g_statsLongMoves[m]<0?L"–":std::to_wstring(g_statsLongMoves[m]); rows.push_back(r);
      r.name=L"Średni wynik (punkty)";    for(int m=0;m<2;m++) r.v[m]=g_statsScoreN[m]>0?std::to_wstring((int)((double)g_statsScoreSum[m]/g_statsScoreN[m]+0.5)):L"–"; r.rule=true; rows.push_back(r); r.rule=false;
      r.name=L"Najlepszy wynik (punkty)"; for(int m=0;m<2;m++) r.v[m]=g_statsScoreBest[m]<0?L"–":std::to_wstring(g_statsScoreBest[m]); rows.push_back(r); }
    const float rh=std::min(34.f,(ph-92-38-6-140)/(float)rows.size());
@@ -681,6 +683,7 @@ static void statsReset(){
       g_statsMoveSum[m][0]=g_statsMoveSum[m][1]=0;
       g_statsTimeSum[m][0]=g_statsTimeSum[m][1]=0;
       g_statsRecordMoves[m]=-1; g_statsRecordTime[m]=-1;
+      g_statsLongMoves[m]=-1; g_statsLongTime[m]=-1;
       g_statsScoreSum[m]=0; g_statsScoreN[m]=0; g_statsScoreBest[m]=-1; g_statsStreak[m]=0;
    }
    g_gameStarted=false; g_moveCount=0; g_gameSeconds=0;

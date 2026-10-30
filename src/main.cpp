@@ -48,7 +48,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.1.7";
+static const wchar_t* APP_VERSION = L"1.1.8";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -71,6 +71,7 @@ static const int  ID_NEW=201,ID_HINT=202,ID_FS=203,ID_UNDO=204,ID_REDO=205;
 static const int  ID_SAMOGRAJ=213;
 static const int  ID_SOLVER  =240;
 static const int  ID_SCOREBTN =241;      // "Pokaż szczegóły wyniku", on the toolbar next to the score
+static const int  ID_FREEZE  =242;       // the snowflake: remembers the table (black), the next press goes back to it (white)
 
 // ============================================================================
 // Card flight animation
@@ -470,8 +471,12 @@ static int g_statsTimeSum[2][2]  = {{0,0},{0,0}};
 // -1 = no record yet
 static int g_statsRecordMoves[2] = {-1,-1};
 static int g_statsRecordTime[2]  = {-1,-1};
+// Extremes [mode] over all counted games (won or lost): the longest game by time (seconds) and the one with the most moves; -1 = none yet
+static int g_statsLongTime[2]    = {-1,-1};
+static int g_statsLongMoves[2]   = {-1,-1};
 // Current game timer
 static DWORD g_gameStartTick = 0;   // GetTickCount() at game start
+static bool  g_clockRunning = false;// the clock of the game: zero from a new game until the first card is moved or the reserve dealt
 static bool  g_timerPaused = false; // true while the game window is inactive
 static DWORD g_pauseStartTick = 0;  // GetTickCount() when the pause began
 static int   g_gameSeconds   = 0;   // elapsed seconds this game
@@ -496,6 +501,12 @@ static int  g_outcomeMode = 0;       // mode captured at the moment win/no-moves
 static int  g_outcomeMoveCount = 0;  // move count captured at that same moment
 static int  g_outcomeSeconds = 0;    // elapsed seconds captured at that same moment
 static long long g_currentGameNumber = -1; // seed of the current deal (-1 = none yet)
+// The "freeze" button: the table (and its undo/redo history) as it was when the snowflake was pressed. Only in memory, and only
+// for the deal on the table: a new game, a replay of the deal and loading a game forget it.
+static bool g_frozen = false;
+struct FrozenState{ Snapshot board; std::deque<Snapshot> undo, redo; };
+static FrozenState g_frozenState;
+static void freezeClear();
 
 // Auto-move anti-loop: track recent auto-moves to detect cycles
 static const int AUTO_HISTORY_SIZE = 20; // "porównuj do dwudziestego ruchu wstecz"
@@ -641,7 +652,7 @@ static void pushAutoHistory(int key){
 }
 static void saveStats();  // forward declaration
 void newGame(bool sameDeal=false, long long gameNumber=-1, bool skipCredit=false, bool silent=false); // forward declaration
-void newGameRetry();      // forward declaration — replays the same deal, excluded from stats
+void newGameRetry();      // forward declaration — replays the same deal; neither the abandoned attempt nor the replay reach the stats
 
 // Free column mode: false = King only, true = any card
 static bool g_freeColMode = false;
@@ -1170,6 +1181,11 @@ static void creditScore(int m,int score,bool won,bool samo){
    if(score>g_statsScoreBest[m]) g_statsScoreBest[m]=score;
    g_statsStreak[m]= won ? g_statsStreak[m]+1 : 0;
 }
+// the longest game and the game with the most moves, among all the games that are counted
+static void creditExtremes(int m,int moves,int seconds){
+   if(seconds>g_statsLongTime[m]) g_statsLongTime[m]=seconds;
+   if(moves>g_statsLongMoves[m])  g_statsLongMoves[m]=moves;
+}
 // Write game data to an already-open FILE* (shared by auto-save and manual save)
 static void writeGameToFile(FILE* f){
    const char magic[]="PASJ";
@@ -1293,6 +1309,7 @@ static bool readGameFromFile(FILE* f){
    } else {
       g_currentGameNumber=-1; // unknown for older saves
    }
+   freezeClear();
    if(ver>=5){
       DWORD secs=0;
       if(fread(&secs,4,1,f)==1) g_gameSeconds=(int)secs;
@@ -1334,6 +1351,7 @@ static bool readGameFromFile(FILE* f){
       g_game.redoStack.clear();
    }
    // ver 1/2: freeColMode not stored — leave current setting unchanged
+   g_clockRunning=(g_gameSeconds>0 || !g_game.undoStack.empty());          // a game that was played goes on with its clock
    g_undoCount=0; g_hintCount=0; g_samoUsed=false; g_outcomeScore=-1; g_winInfoValid=false;
    if(ver>=13){
       WORD uc=0,hc=0; BYTE su=0; int os=-1;
@@ -1403,6 +1421,7 @@ static void creditOutcome(const PendingOutcomeSnapshot& s){
          g_statsRecordMoves[m]=s.outcomeMoveCount;
       if(g_statsRecordTime[m]<0 || s.outcomeSeconds<g_statsRecordTime[m])
          g_statsRecordTime[m]=s.outcomeSeconds;
+      creditExtremes(m,s.outcomeMoveCount,s.outcomeSeconds);
       creditScore(m,s.outcomeScore,true,s.samoUsed);
       saveStats();
       appendWonNumber(s.gameNumber,m);
@@ -1411,6 +1430,7 @@ static void creditOutcome(const PendingOutcomeSnapshot& s){
       g_statsGames[m]++;
       g_statsMoveSum[m][0]+=s.outcomeMoveCount;
       g_statsTimeSum[m][0]+=s.outcomeSeconds;
+      creditExtremes(m,s.outcomeMoveCount,s.outcomeSeconds);
       creditScore(m,s.outcomeScore,false,s.samoUsed);
       saveStats();
    } else if(s.moveCount>0){
@@ -1418,6 +1438,7 @@ static void creditOutcome(const PendingOutcomeSnapshot& s){
       g_statsGames[m]++;
       g_statsMoveSum[m][0]+=s.moveCount;
       g_statsTimeSum[m][0]+=s.gameSeconds;
+      creditExtremes(m,s.moveCount,s.gameSeconds);
       creditScore(m,s.abandonScore,false,s.samoUsed);
       saveStats();
    }
@@ -2294,6 +2315,8 @@ static void saveUserSolvedFile(){
 // State changed
 // ============================================================================
 void onStateChanged(){
+   // the clock starts with the first move (a card moved or the reserve dealt — every move leaves an undo snapshot)
+   if(!g_clockRunning && !g_game.undoStack.empty()){ g_clockRunning=true; g_gameStartTick=timeGetTime(); g_gameSeconds=0; }
    g_hintActive=false;
    g_hintBlinking=false;
    g_gameStarted=true;
@@ -2324,6 +2347,10 @@ void onStateChanged(){
          g_outcomeMode=m; g_outcomeMoveCount=g_moveCount; g_outcomeSeconds=g_gameSeconds;
          g_winInfo=computeScore(true,g_outcomeSeconds,g_outcomeMoveCount,m,false); g_winInfoValid=true;
          g_outcomeScore=g_winInfo.total;
+         // The win is only credited to the statistics when the next game starts, and until then it lives in the game file:
+         // write that file now, so that the win survives a crash, a kill or a Windows shutdown (the file is otherwise only
+         // written when the window is closed normally). Not during the Samograj marathon, which wins one deal after another.
+         if(!g_samogranoMarathon) saveGameState();
          bool newMoves=false, newTime=false, newScore=false;
          if(!g_statsExcluded){
             newScore = (!g_samoUsed && g_outcomeScore>g_statsScoreBest[m]);
@@ -2427,6 +2454,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
             g_statsRecordMoves[m]=g_outcomeMoveCount;
          if(g_statsRecordTime[m]<0 || g_outcomeSeconds<g_statsRecordTime[m])
             g_statsRecordTime[m]=g_outcomeSeconds;
+         creditExtremes(m,g_outcomeMoveCount,g_outcomeSeconds);
          creditScore(m,g_outcomeScore>=0?g_outcomeScore:computeScore(true,g_outcomeSeconds,g_outcomeMoveCount,m,false).total,true,g_samoUsed);
          saveStats();
          appendWonNumber(g_currentGameNumber,m);
@@ -2435,6 +2463,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
          g_statsGames[m]++;
          g_statsMoveSum[m][0]+=g_outcomeMoveCount;
          g_statsTimeSum[m][0]+=g_outcomeSeconds;
+         creditExtremes(m,g_outcomeMoveCount,g_outcomeSeconds);
          creditScore(m,g_outcomeScore>=0?g_outcomeScore:computeScore(false,g_outcomeSeconds,g_outcomeMoveCount,m,true).total,false,g_samoUsed);
          saveStats();
       } else if(g_moveCount>0){
@@ -2448,6 +2477,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
          g_statsGames[m]++;
          g_statsMoveSum[m][0]+=g_moveCount;
          g_statsTimeSum[m][0]+=g_gameSeconds;
+         creditExtremes(m,g_moveCount,g_gameSeconds);
          creditScore(m,computeScore(false,g_gameSeconds,g_moveCount,m,true).total,false,g_samoUsed);
          saveStats();
       }
@@ -2455,7 +2485,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
    }
 
    deleteSaveFile();
-   g_gameStartTick=timeGetTime(); g_gameSeconds=0; g_congratsMsg.clear();
+   g_gameStartTick=timeGetTime(); g_gameSeconds=0; g_clockRunning=false; g_congratsMsg.clear();
    g_moveCount=0; g_undoCount=0; g_hintCount=0; g_samoUsed=false; g_outcomeScore=-1; g_winInfoValid=false;
    g_gameStarted=false;
    g_winCounted=false;
@@ -2465,6 +2495,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
    g_noMovesDialogShown=false;
    g_statsExcluded=sameDeal; // "try again" replays are not counted as a separate game
    clearAutoHistory();
+   freezeClear();
    SoundSystem::instance().fadeOutAll(); // fade out win sound if playing
    stopFireworks();
    KillTimer(g_hwnd,TIMER_DEAL);
@@ -2509,12 +2540,14 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
    invalidateGame();
    if(g_ngPhase==0){                // no animation: the deal lies on the table at once
       g_dealing=false;
-      g_gameStartTick=timeGetTime(); g_gameSeconds=0;
+      g_gameSeconds=0;                  // (the clock is still stopped: it starts with the first move)
       onStateChanged();
    }
 }
 
-void newGameRetry(){ newGame(true); }
+// "Spróbuj jeszcze raz" after a lost game: the lost attempt is neither a game nor a loss in the statistics (skipCredit), and the
+// replay itself is excluded as well (sameDeal).
+void newGameRetry(){ newGame(true,-1,true); }
 
 // Menu: "Zacznij od poczatku te gre" - back to the initial deal, counters and
 // timer reset, current attempt NOT credited to the statistics. The restarted
@@ -2842,7 +2875,7 @@ static void ngTick(){
       g_ngPhase=0; g_dealing=false;
       if(g_ngPreview) g_ngPreview=false;                // developer preview: nothing in the game changes
       else{
-         g_gameStartTick=timeGetTime(); g_gameSeconds=0;   // the clock starts when the cards are on the table
+         g_gameSeconds=0;                       // the clock is stopped at zero until the first move
          onStateChanged();
       }
       invalidateGame();
@@ -3486,6 +3519,8 @@ static void saveStats(){
    wr(L"ScoreNKing",g_statsScoreN[0]); wr(L"ScoreNFree",g_statsScoreN[1]);
    wr(L"ScoreBestKing",g_statsScoreBest[0]); wr(L"ScoreBestFree",g_statsScoreBest[1]);
    wr(L"StreakKing",g_statsStreak[0]); wr(L"StreakFree",g_statsStreak[1]);
+   wr(L"LongTimeKing",g_statsLongTime[0]); wr(L"LongTimeFree",g_statsLongTime[1]);
+   wr(L"LongMovesKing",g_statsLongMoves[0]); wr(L"LongMovesFree",g_statsLongMoves[1]);
 }
 
 static void loadStats(){
@@ -3512,6 +3547,8 @@ static void loadStats(){
    g_statsScoreN[0]=rd(L"ScoreNKing"); g_statsScoreN[1]=rd(L"ScoreNFree");
    g_statsScoreBest[0]=rd(L"ScoreBestKing",-1); g_statsScoreBest[1]=rd(L"ScoreBestFree",-1);
    g_statsStreak[0]=rd(L"StreakKing"); g_statsStreak[1]=rd(L"StreakFree");
+   g_statsLongTime[0]=rd(L"LongTimeKing",-1); g_statsLongTime[1]=rd(L"LongTimeFree",-1);
+   g_statsLongMoves[0]=rd(L"LongMovesKing",-1); g_statsLongMoves[1]=rd(L"LongMovesFree",-1);
    for(int m=0;m<2;m++){
       if(g_statsScoreSum[m]<0||g_statsScoreN[m]<=0){ g_statsScoreSum[m]=0; g_statsScoreN[m]=0; }
       if(g_statsStreak[m]<0) g_statsStreak[m]=0;
@@ -3657,10 +3694,17 @@ AutoMoveOutcome doAutoMove(){
       // candidate the way a naive retry loop would.
       std::vector<RankedMove> ranked = getRankedMovesFast();
       int chosen = -1;
-      for(size_t i=0;i<ranked.size();i++){
-         const MoveHint& cand = ranked[i].move;
-         if(cand.fromIdx==-1){ chosen=(int)i; break; } // reserve deal — always fine, no reversal concept applies
-         if(isFreshMove(cand)){ chosen=(int)i; break; }
+      // Taking a card back from a foundation (negative score) is the last resort: it is tried only when
+      // no other candidate is acceptable (a replay showed a 3 fetched back just to be put there again).
+      // Free-column mode only: in king-only mode a 300-deal A/B showed it costs wins (68 -> 57), since
+      // fetching a card back from a foundation is often what unblocks a column there.
+      for(int pass=0;pass<2 && chosen<0;pass++){
+         for(size_t i=0;i<ranked.size();i++){
+            const MoveHint& cand = ranked[i].move;
+            if(pass==0 && g_freeColMode && cand.fromType==LOC_FOUNDATION && ranked[i].score<0) continue;
+            if(cand.fromIdx==-1){ chosen=(int)i; break; } // reserve deal — always fine, no reversal concept applies
+            if(isFreshMove(cand)){ chosen=(int)i; break; }
+         }
       }
 
       if(chosen>=0){
@@ -4003,12 +4047,13 @@ static HBRUSH toolbarBrush(){
    return br;
 }
 static int g_hoverBtn=0;     // control id of the toolbar button under the mouse (0 = none)
-static HWND g_hBtnCap[8]={};  // the captions under the toolbar buttons
+static HWND g_hBtnCap[9]={};  // the captions under the toolbar buttons (index 6 = the freeze button)
 static void toolbarRefresh(){
    if(!g_hwnd) return;
    RECT rc; GetClientRect(g_hwnd,&rc); rc.bottom=Layout::TOOLBAR_H;
    InvalidateRect(g_hwnd,&rc,TRUE);
    for(int i=0;i<BTN_ICON_COUNT;i++){ HWND b=GetDlgItem(g_hwnd,BTN_ICON_IDS[i]); if(b) InvalidateRect(b,nullptr,FALSE); }
+   if(HWND b=GetDlgItem(g_hwnd,ID_FREEZE)) InvalidateRect(b,nullptr,FALSE);
    for(HWND c:g_hBtnCap) if(c) InvalidateRect(c,nullptr,TRUE);
    for(HWND c:g_hStat) if(c) InvalidateRect(c,nullptr,TRUE);
    if(g_hScoreBtn) InvalidateRect(g_hScoreBtn,nullptr,FALSE);
@@ -4061,11 +4106,33 @@ static void drawIconButton(DRAWITEMSTRUCT* dis){
    GraphicsPath path;
    path.AddArc(x,y,2*r,2*r,180,90); path.AddArc(x+w-2*r,y,2*r,2*r,270,90);
    path.AddArc(x+w-2*r,y+h-2*r,2*r,2*r,0,90); path.AddArc(x,y+h-2*r,2*r,2*r,90,90); path.CloseFigure();
-   const float fa= !enabled?0.05f : (pressed||active)?0.30f : hover?0.28f : 0.14f;
+   const bool freezeBtn=((int)dis->CtlID==ID_FREEZE);
+   const float fa= !enabled?0.05f : (pressed||active||(freezeBtn&&g_frozen))?0.30f : hover?0.28f : 0.14f;
    SolidBrush fill(Color((BYTE)(fa*255.f),255,255,255)); g.FillPath(&fill,&path);
    if(active){ Pen pen(Color(242,255,220,77),2.f); g.DrawPath(&pen,&path); }
    else      { Pen pen(Color((BYTE)((enabled?0.38f:0.12f)*255.f),255,255,255),1.f); g.DrawPath(&pen,&path); }
    // Icon — kept square and centred even though the button itself is wider than it is tall.
+   if(freezeBtn){                      // the snowflake is drawn, not a picture: black = nothing remembered, white = the table is frozen
+      const float off=pressed?1.f:0.f, R=std::min(w,h)/2.f-6.f, cx=rc.left+(rc.right-rc.left)/2.f+off, cy=rc.top+(rc.bottom-rc.top)/2.f+off;
+      const float PI=3.14159265f, a0=-PI/2;
+      auto flake=[&](Pen& pen){
+         pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
+         for(int k=0;k<6;k++){
+            const float a=a0+k*PI/3, ux=cosf(a), uy=sinf(a);
+            g.DrawLine(&pen,cx,cy,cx+ux*R,cy+uy*R);
+            const float fr[2]={0.52f,0.78f}, fl[2]={0.34f,0.22f};
+            for(int b=0;b<2;b++){
+               const float px=cx+ux*R*fr[b], py=cy+uy*R*fr[b];
+               for(int sgn=-1;sgn<=1;sgn+=2){
+                  const float ba=a+sgn*PI/3;
+                  g.DrawLine(&pen,px,py,px+cosf(ba)*R*fl[b],py+sinf(ba)*R*fl[b]);
+               }
+            }
+         }
+      };
+      BYTE ga=(BYTE)(enabled?255:110);
+      Pen pen(g_frozen?Color(ga,255,255,255):Color(ga,0,0,0),3.0f); flake(pen);
+   } else
    if(idx>=0 && g_btnIcons[idx]){
       int off=pressed?1:0;
       int sz=(int)std::min(w,h)-8;
@@ -4074,6 +4141,56 @@ static void drawIconButton(DRAWITEMSTRUCT* dis){
       ia.SetColorMatrix(&cm);
       g.DrawImage(g_btnIcons[idx],Rect(ix,iy,sz,sz),0,0,(INT)g_btnIcons[idx]->GetWidth(),(INT)g_btnIcons[idx]->GetHeight(),UnitPixel,&ia);
    }
+}
+
+// ── The freeze button (snowflake): the first press remembers the table, the next one goes back to it.
+static void freezeUpdateUI(){
+   if(!g_hwnd) return;
+   if(HWND b=GetDlgItem(g_hwnd,ID_FREEZE)) InvalidateRect(b,nullptr,FALSE);
+   if(g_hBtnCap[6]) SetWindowTextW(g_hBtnCap[6],g_frozen?L"Wróć":L"Zamroź");
+}
+static void freezeClear(){
+   g_frozen=false; g_frozenState=FrozenState();
+   freezeUpdateUI();
+}
+static void doFreeze(){
+   if(g_dealing || g_animating) return;
+   auto boardOf=[&](Snapshot& s){
+      for(int i=0;i<NUM_COLS;i++)  s.cols[i]=g_game.cols[i];
+      for(int i=0;i<NUM_FOUND;i++) s.found[i]=g_game.found[i];
+      s.reserve=g_game.reserve;
+   };
+   if(!g_frozen){
+      FrozenState s; boardOf(s.board); s.undo=g_game.undoStack; s.redo=g_game.redoStack;
+      g_frozenState=std::move(s); g_frozen=true;
+      g_status=L"Zamrożono";
+      freezeUpdateUI(); invalidateGame();
+      return;
+   }
+   Snapshot before; boardOf(before);
+   bool same=(before.reserve==g_frozenState.board.reserve);
+   for(int i=0;same&&i<NUM_COLS;i++)  same=(before.cols[i]==g_frozenState.board.cols[i]);
+   for(int i=0;same&&i<NUM_FOUND;i++) same=(before.found[i]==g_frozenState.board.found[i]);
+   for(int i=0;i<NUM_COLS;i++)  g_game.cols[i]=g_frozenState.board.cols[i];
+   for(int i=0;i<NUM_FOUND;i++) g_game.found[i]=g_frozenState.board.found[i];
+   g_game.reserve=g_frozenState.board.reserve;
+   g_game.undoStack=g_frozenState.undo; g_game.redoStack=g_frozenState.redo;
+   g_frozen=false; g_frozenState=FrozenState();
+   if(!same){                                    // going back is an undo, as far as the move counter and the score are concerned
+      if(!g_winCounted) g_moveCount++;
+      g_undoCount++;
+   }
+   KillTimer(g_hwnd,TIMER_NOMOVES);
+   stopFireworks();
+   g_won=g_noMoves=false; g_status=L"Przywrócono";
+   g_hintActive=false; g_hintBlinking=false; g_hintList.clear(); g_hintIndex=0;
+   invalidateBestMoveCache();
+   clearAutoHistory();                           // same reasoning as in doUndo()
+   if(!same) playSound("cofnij",g_volume);
+   recalcLayout(); markDirty(); invalidateGame();
+   Snapshot after; boardOf(after);
+   animateStateDiff(before,after);
+   freezeUpdateUI();
 }
 
 // ============================================================================
@@ -5239,7 +5356,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       const int BX_SOLV =BX_SAMO +BTN_SPACING;
       const int BX_UNDO =BX_SOLV +BTN_SPACING;
       const int BX_REDO =BX_UNDO +BTN_SPACING;
-      const int BX_STATS=BX_REDO +BTN_SPACING;
+      const int BX_FREEZE=BX_REDO+BTN_SPACING;
+      const int BX_STATS=BX_FREEZE+BTN_SPACING;
       const int BX_SETT =BX_STATS+BTN_SPACING;
       auto mkIconBtn=[&](int id,int x,const wchar_t* tip)->HWND{
          HWND h=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
@@ -5262,6 +5380,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       HWND hBSolv =mkIconBtn(ID_SOLVER,  BX_SOLV, L"Solver");
       HWND hBUndo =mkIconBtn(ID_UNDO,    BX_UNDO, L"Cofnij (←)");
       HWND hBRedo =mkIconBtn(ID_REDO,    BX_REDO, L"Ponów (→)");
+      HWND hBFreeze=mkIconBtn(ID_FREEZE, BX_FREEZE,L"Zamroź");
       HWND hBStats=mkIconBtn(ID_STATS,   BX_STATS,L"Statystyki (S)");
       HWND hBSett =mkIconBtn(ID_SETTINGS,BX_SETT, L"Ustawienia");
       addTip(hBNew,   L"Nowa gra (F2)");
@@ -5270,17 +5389,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       addTip(hBSolv,  L"Solver – szukanie rozwiązań rozdań z LostNumbers.csv");
       addTip(hBUndo,  L"Cofnij (←)");
       addTip(hBRedo,  L"Ponów (→)");
+      addTip(hBFreeze,L"Zamroź stan stołu – drugie naciśnięcie wraca do zapamiętanego miejsca");
       addTip(hBStats, L"Statystyki (S)");
       addTip(hBSett,  L"Ustawienia");
 
       // Hover highlight comes from a small subclass; the caption of each button is a small label under it.
-      for(HWND b:{hBNew,hBHint,hBSamo,hBSolv,hBUndo,hBRedo,hBStats,hBSett}) SetWindowSubclass(b,BtnHoverProc,1,0);
+      for(HWND b:{hBNew,hBHint,hBSamo,hBSolv,hBUndo,hBRedo,hBFreeze,hBStats,hBSett}) SetWindowSubclass(b,BtnHoverProc,1,0);
       {
          HFONT hCapFont=CreateFontW(-MulDiv(9,96,72),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,
             DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
-         const int xs[8]={BX_NEW,BX_HINT,BX_SAMO,BX_SOLV,BX_UNDO,BX_REDO,BX_STATS,BX_SETT};
-         const wchar_t* caps[8]={L"Nowa gra",L"Podpowiedź",L"Samograj",L"Solver",L"Cofnij",L"Ponów",L"Statystyki",L"Ustawienia"};
-         for(int i=0;i<8;i++){
+         const int xs[9]={BX_NEW,BX_HINT,BX_SAMO,BX_SOLV,BX_UNDO,BX_REDO,BX_FREEZE,BX_STATS,BX_SETT};
+         const wchar_t* caps[9]={L"Nowa gra",L"Podpowiedź",L"Samograj",L"Solver",L"Cofnij",L"Ponów",L"Zamroź",L"Statystyki",L"Ustawienia"};
+         for(int i=0;i<9;i++){
             g_hBtnCap[i]=CreateWindowW(L"STATIC",caps[i],WS_CHILD|WS_VISIBLE|SS_CENTER|SS_NOPREFIX,
                xs[i]-BTN_GAP/2,BTN_Y+BTN_H+3,BTN_W+BTN_GAP,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
             SendMessageW(g_hBtnCap[i],WM_SETFONT,(WPARAM)hCapFont,TRUE);
@@ -5364,6 +5484,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       case ID_PLAY_LOST: showPlayFailedDialog(hwnd); return 0;
       case ID_UNDO: doUndo();   return 0;
       case ID_REDO: doRedo();   return 0;
+      case ID_FREEZE: doFreeze(); return 0;
       case ID_FS:   toggleFS(); return 0;
       case ID_HELP:     showHelp(hwnd);     return 0;
       case ID_SETTINGS: showSettings(hwnd); return 0;
@@ -5481,7 +5602,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             markDirty(); invalidateGame();
          }
       } else if(wp==TIMER_SECOND){
-         if(g_gameStartTick>0 && !g_won && !g_noMoves && !g_timerPaused)
+         if(g_clockRunning && g_gameStartTick>0 && !g_won && !g_noMoves && !g_timerPaused)
             g_gameSeconds=(int)((timeGetTime()-g_gameStartTick)/1000);
          invalidateGame();
          if(g_gameHwnd) UpdateWindow(g_gameHwnd);

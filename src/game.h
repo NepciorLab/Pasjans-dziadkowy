@@ -1165,6 +1165,26 @@ static int revealBonus(const GameState& g, int fc, int ci){
 // flipped loss->win against 8 win->loss.
 static const int SC_KING_PILE_COMPLETED = 0;
 
+// Rule 18's exception: after card `c` (the tail of column fc) is moved to another column, can a card of the next
+// lower rank and the other colour be put on it at once, with a gain (it uncovers a card that is not sitting
+// correctly, or it empties its column)? Then the move is worth making even though `c` could go to a foundation.
+// An Ace never qualifies: it goes straight to a foundation.
+static bool hopHasPayoff(const GameState& g, int fc, const Card& c){
+   if((int)c.rank<=(int)Ace) return false;
+   for(int x=0;x<NUM_COLS;x++){
+      if(x==fc) continue;
+      const auto& col=g.cols[x];
+      for(int j=(int)col.size()-1;j>=0;j--){
+         if(j<(int)col.size()-1 && !g.validSeqFrom(x,j)) break;       // the run ends here
+         const Card& d=col[j];
+         if((int)d.rank==(int)c.rank-1 && d.isRed()!=c.isRed()){
+            if(j==0 || !g.alreadySittingCorrectly(x,j)) return true;
+         }
+      }
+   }
+   return false;
+}
+
 // The full 15-rule scoring table for a single discrete move `mv` made from
 // board `before`. Deliberately computed WITHOUT materializing the resulting
 // board: every rule here (including the empty-column delta behind rules
@@ -1286,7 +1306,21 @@ static int scoreMove(const GameState& before, const MoveHint& mv,
       int fc=mv.fromIdx, ci=mv.fromCard, tc=mv.toIdx;
       bool destWasEmpty = before.cols[tc].empty();
       if(!destWasEmpty) score += (kingOnlyMode?30:20); // rule 8: joining 2 cards into a sequence
-      if(ci>0) score += revealBonus(before, fc, ci); // rules 6/9/10/16
+      // Rule 18 (user-requested after a replay where A-spades hopped onto a 2 of hearts and only then
+      // went to the foundation): a lone tail card that could go straight to a foundation gets no
+      // reveal bonus for being moved to another column, and pays -100 (unless another card can then
+      // be put on it with a gain, see hopHasPayoff; an Ace always pays). Otherwise the card
+      // collected the reveal bonus twice (once for the hop, once for the foundation move).
+      // 300-deal A/B, free mode: hops without a payoff 444 -> 70, wins 207 -> 199. Free-column mode only: in
+      // king-only mode the same change cost 9 of 68 wins (paired: 7 deals gained, 16 lost).
+      bool foundationReadyHop=false;
+      if(!kingOnlyMode && ci==(int)before.cols[fc].size()-1){
+         const Card& hc=before.cols[fc][ci]; int hf=before.bestFoundSlot(hc);
+         foundationReadyHop=(hf>=0 && before.canDropOnFound(hc,hf));
+         if(foundationReadyHop && hopHasPayoff(before,fc,hc)) foundationReadyHop=false;   // the next move uses the card: no penalty
+      }
+      if(foundationReadyHop) score -= 100;
+      else if(ci>0) score += revealBonus(before, fc, ci); // rules 6/9/10/16
       // Rule 13 (was -30 for splitting a sequence) was removed: splitting a
       // sequence between two columns is now a hard legality question, not a
       // scoring one — see sequenceSplitAllowed(), which allCandidateMoves()

@@ -62,6 +62,7 @@ Legenda: **[K]** = inna wartość w trybie "Tylko król", **[D]** = inna/nieobec
 | Cel nie był pusty — złączenie w sekwens (reguła 8) | **[D] +20** / **[K] +30** |
 | Cel był pusty | brak własnego bonusu tutaj (patrz reguła 3) |
 | Jeśli ruch odsłania kartę pod spodem | + bonus odsłonięcia, patrz niżej |
+| **[D]** Reguła 18: przenoszona jest samotna karta z końca kolumny, która mogłaby pójść od razu na stos | **−100** i **bez** bonusu odsłonięcia (inaczej as „odwiedzał” inną kolumnę tylko po to, by zebrać bonus odsłonięcia dwa razy: za przeniesienie i za wejście na stos). Wyjątek: gdy po przeniesieniu da się na tę kartę od razu położyć inną z zyskiem (odsłania kartę, która nie leżała poprawnie, albo opróżnia kolumnę) — wtedy zwykła ocena, bez kary. As nie ma wyjątku. **[K]**: reguła nie działa (test 300 rozdań: −9 z 68 wygranych) |
 
 ### Bonus odsłonięcia karty (reguły 6 / 9 / 10 / 16 — tylko gdy ruch faktycznie coś odsłania w kolumnie źródłowej)
 Sumują się wszystkie poniższe:
@@ -137,6 +138,7 @@ To działa NA ŻYWO, dodatkowo ponad wszystko powyższe, i jest jedynym mechaniz
 - **Historia 20 ostatnich prawdziwych ruchów** (`AUTO_HISTORY_SIZE=20`) — odrzuca kandydata identycznego z jednym z 20 ostatnich LUB jego dokładnym odwróceniem.
 - **Historia 20 ostatnich stanów planszy** (`BOARD_HISTORY_SIZE=20`) — dodatkowo odrzuca kandydata, którego WYNIKOWA plansza powtarza którykolwiek z 20 ostatnich stanów (łapie dłuższe cykle, których sam poprzedni punkt nie widzi).
 - **Licznik "brak postępu na stosach"** (`FOUNDATION_STALL_LIMIT=50`) — jeśli przez 50 kolejnych prawdziwych ruchów łączna liczba kart na stosach nie pobiła swojego dotychczasowego maksimum, automat się zatrzymuje (Samograj bez końca: zamiast stać, ogłasza to rozdanie przegranym i rozdaje kolejne — patrz dalej).
+- **Zabranie karty ze stosu to ostateczność [D]**: kandydat „stos → kolumna” z ujemną oceną ruchu jest brany pod uwagę dopiero w drugim przejściu, gdy w pierwszym nie znaleziono żadnego dozwolonego ruchu ani rozdania (test 300 rozdań: zabrań ze stosu 731 → 249 razem z regułą 18, wygrane 207 → 199). **[K]**: bez tej zmiany (kosztowała 11 z 68 wygranych — tam zabranie karty ze stosu często odblokowuje kolumnę).
 - **Ostatnia deska ratunku**: gdy WSZYSTKIE ranked kandydaci odrzuceni powyższymi regułami, zaakceptuj dowolnego kandydata (poza rozdaniem — to zawsze bezpieczne), którego wynikowa plansza nie powtarza żadnego z 20 ostatnich stanów — nawet jeśli sam ruch jest "świeżym" odwróceniem czegoś starszego niż 20 ruchów.
 - **Samograj bez końca (Shift+1)**: gdy silnik faktycznie nie ma nic do zagrania (powyższe wyczerpane), ale gra nadal widzi jakiś legalny ruch — rozdanie liczy się jako przegrane i od razu rozdawane jest kolejne, zamiast zatrzymywać całą serię. Rozdanie bez ani jednego wykonanego ruchu nadal zatrzymuje serię (ochrona przed nieskończoną pętlą "od razu utknięte").
 
