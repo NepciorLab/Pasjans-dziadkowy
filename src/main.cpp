@@ -48,7 +48,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.1.9";
+static const wchar_t* APP_VERSION = L"1.1.10";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -497,7 +497,8 @@ static bool g_winCounted = false; // win already recorded for this game
 
 static bool g_noMovesReached = false; // genuine no-moves loss already recorded for this game
 static bool g_noMovesDialogShown = false; // "no moves" dialog already shown once this deal
-static bool g_statsExcluded = false; // true for "try again" replays — don't count in stats
+static bool g_statsExcluded = false; // true for practice games (loaded from a file, deals picked from lists, ...) — don't count in stats
+static bool g_statsWinOnly  = false; // with g_statsExcluded: ... except a win (a lost deal from "Zagraj nieudany" counts when it is won)
 static int  g_outcomeMode = 0;       // mode captured at the moment win/no-moves was reached
 static int  g_outcomeMoveCount = 0;  // move count captured at that same moment
 static int  g_outcomeSeconds = 0;    // elapsed seconds captured at that same moment
@@ -1214,7 +1215,7 @@ static void writeGameToFile(FILE* f){
    fwrite(&noMovesReached,1,1,f);
    BYTE noMovesDialogShown=(BYTE)(g_noMovesDialogShown?1:0);
    fwrite(&noMovesDialogShown,1,1,f);
-   BYTE statsExcluded=(BYTE)(g_statsExcluded?1:0);
+   BYTE statsExcluded=(BYTE)(g_statsExcluded?(g_statsWinOnly?2:1):0);      // 2 = excluded, except a win (older versions read any non-zero value as "excluded")
    fwrite(&statsExcluded,1,1,f);
    BYTE outcomeMode=(BYTE)g_outcomeMode;
    fwrite(&outcomeMode,1,1,f);
@@ -1288,9 +1289,9 @@ static bool readGameFromFile(FILE* f){
    }
    if(ver>=9){
       BYTE se=0;
-      if(fread(&se,1,1,f)==1) g_statsExcluded=(se!=0);
+      if(fread(&se,1,1,f)==1){ g_statsExcluded=(se!=0); g_statsWinOnly=(se==2); }
    } else {
-      g_statsExcluded=false;
+      g_statsExcluded=false; g_statsWinOnly=false;
    }
    if(ver>=10){
       BYTE om=0; if(fread(&om,1,1,f)==1) g_outcomeMode=om;
@@ -1394,7 +1395,7 @@ static void saveGameAs(HWND hwnd){
 // them via readGameFromFile() before it knows whether it even has a valid
 // file, so it captures this snapshot first and credits it afterward instead.
 struct PendingOutcomeSnapshot {
-   bool statsExcluded, winCounted, noMovesReached;
+   bool statsExcluded, statsWinOnly, winCounted, noMovesReached;
    int  moveCount, outcomeMode, outcomeMoveCount, outcomeSeconds, gameSeconds;
    bool freeColMode;
    long long gameNumber;
@@ -1402,7 +1403,7 @@ struct PendingOutcomeSnapshot {
 };
 
 static PendingOutcomeSnapshot capturePendingOutcome(){
-   return { g_statsExcluded, g_winCounted, g_noMovesReached,
+   return { g_statsExcluded, g_statsWinOnly, g_winCounted, g_noMovesReached,
             g_moveCount, g_outcomeMode, g_outcomeMoveCount, g_outcomeSeconds, g_gameSeconds,
             g_freeColMode, g_currentGameNumber,
             g_outcomeScore, computeScore(false,g_gameSeconds,g_moveCount,(int)g_freeColMode,true).total, g_samoUsed };
@@ -1413,7 +1414,7 @@ static PendingOutcomeSnapshot capturePendingOutcome(){
 // apply it to the deal that was actually on screen before the load, using a
 // snapshot taken before the load overwrote the live globals.
 static void creditOutcome(const PendingOutcomeSnapshot& s){
-   if(s.statsExcluded) return;
+   if(s.statsExcluded && !(s.statsWinOnly && s.winCounted)) return;
    if(s.winCounted){
       int m=s.outcomeMode;
       g_statsGames[m]++;
@@ -1500,7 +1501,7 @@ static void loadGameFrom(HWND hwnd){
    // A game loaded from a file is practice/review, not a fresh attempt —
    // never counted towards statistics. This rides along in the save file
    // (see writeGameToFile), so it survives closing and reopening the app.
-   g_statsExcluded=true;
+   g_statsExcluded=true; g_statsWinOnly=false;
    // Apply loaded state
    g_cardAnims.clear(); g_animating=false; g_previewAnimating=false;
    g_hideCol=-1; g_hideFromIdx=-1; g_hideDstCol=-1; g_hideDstFromIdx=-1; g_hideDstFound=-1; for(int _ci=0;_ci<NUM_COLS;_ci++) g_hideDealCol[_ci]=-1;
@@ -2358,7 +2359,7 @@ void onStateChanged(){
          // written when the window is closed normally). Not during the Samograj marathon, which wins one deal after another.
          if(!g_samogranoMarathon) saveGameState();
          bool newMoves=false, newTime=false, newScore=false;
-         if(!g_statsExcluded){
+         if(!g_statsExcluded || g_statsWinOnly){
             newScore = (!g_samoUsed && g_outcomeScore>g_statsScoreBest[m]);
             // Preview whether this would be a new record, for the
             // congratulations message below — the actual record values
@@ -2449,7 +2450,17 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
    // persisted, and are exactly what's needed here anyway.
    // skipCredit: "Zacznij od poczatku te gre" - the attempt being thrown away is
    // never counted, whatever state it is in.
-   if(!g_statsExcluded && !skipCredit){
+   //
+   // A replay of the same deal ("Zacznij od poczatku", "Sprobuj jeszcze raz") is the same game going on, not a new one:
+   //  - the attempt that is thrown away is not counted (skipCredit), EXCEPT a win that was already recorded: that win is
+   //    credited now (it must not get lost), and then the replay of this won deal is practice (excluded);
+   //  - otherwise the replay is counted like any other game, so winning it after any number of restarts counts as a win.
+   // (It used to exclude every replay, so a deal won after a restart was never counted at all.)
+   const bool keepExcluded = sameDeal && (g_statsExcluded || g_winCounted);
+   const bool keepWinOnly  = sameDeal && g_statsExcluded && g_statsWinOnly && !g_winCounted;     // a lost deal replayed: still only a win counts
+   // a "win only" game (a lost deal from "Zagraj nieudany") is counted when it is won, and only then
+   const bool counts = !g_statsExcluded || (g_statsWinOnly && g_winCounted);
+   if(counts && (!skipCredit || g_winCounted)){
       if(g_winCounted){
          int m=g_outcomeMode;
          g_statsGames[m]++;
@@ -2464,6 +2475,8 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
          creditScore(m,g_outcomeScore>=0?g_outcomeScore:computeScore(true,g_outcomeSeconds,g_outcomeMoveCount,m,false).total,true,g_samoUsed);
          saveStats();
          appendWonNumber(g_currentGameNumber,m);
+      } else if(skipCredit){
+         // the attempt is thrown away (restart / try again): not counted
       } else if(g_noMovesReached){
          int m=g_outcomeMode;
          g_statsGames[m]++;
@@ -2499,7 +2512,7 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
    g_autoDealStuck=false;
    g_noMovesReached=false;
    g_noMovesDialogShown=false;
-   g_statsExcluded=sameDeal; // "try again" replays are not counted as a separate game
+   g_statsExcluded=keepExcluded; g_statsWinOnly=keepWinOnly;   // a replay counts, unless it replays a deal that is already counted or was practice anyway
    clearAutoHistory();
    freezeClear();
    SoundSystem::instance().fadeOutAll(); // fade out win sound if playing
@@ -2551,13 +2564,13 @@ void newGame(bool sameDeal, long long gameNumber, bool skipCredit, bool silent){
    }
 }
 
-// "Spróbuj jeszcze raz" after a lost game: the lost attempt is neither a game nor a loss in the statistics (skipCredit), and the
-// replay itself is excluded as well (sameDeal).
+// "Spróbuj jeszcze raz" after a lost game: the lost attempt is neither a game nor a loss in the statistics (skipCredit); the replay
+// is counted as the game going on (see newGame).
 void newGameRetry(){ newGame(true,-1,true); }
 
 // Menu: "Zacznij od poczatku te gre" - back to the initial deal, counters and
-// timer reset, current attempt NOT credited to the statistics. The restarted
-// attempt is a replay, so it is excluded from statistics (same as "try again").
+// timer reset, current attempt NOT credited to the statistics (a recorded win is credited,
+// see newGame). The restarted attempt counts as the game going on (same as "try again").
 void restartCurrentGame(){
    if(g_game.initialDeal.cols[0].empty()){
       // Saves older than v9 don't remember the initial deal.
@@ -5250,9 +5263,9 @@ static void showPlayFailedDialog(HWND hwnd){
    if(g_pfs.ok){
       g_freeColMode=(g_pfs.mode!=0);
       newGame(false,g_pfs.chosen);
-      // Replaying an already-lost deal is practice/review, not a fresh attempt —
-      // never counted towards statistics (mirrors "Zagraj wygrywający").
-      g_statsExcluded=true;
+      // Replaying an already-lost deal is not a fresh attempt, so losing it again (or giving it up) is not
+      // counted — but winning it is: it counts as a win.
+      g_statsExcluded=true; g_statsWinOnly=true;
    }
 }
 // ============================================================================

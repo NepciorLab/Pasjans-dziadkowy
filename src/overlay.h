@@ -672,7 +672,7 @@ static void statsOverlayDraw(){
       y+=rh;
    }
    y+=8;
-   ovNote(L"Do statystyk wchodzą tylko partie rozegrane do końca w trybie, w którym zostały rozpoczęte. Gry wczytane z pliku, powtórki i odtwarzanie rozwiązań nie są liczone.",x0,y,w,48);
+   ovNote(L"Do statystyk wchodzą tylko partie rozegrane do końca w trybie, w którym zostały rozpoczęte. Gry wczytane z pliku, układy „Zagraj wygrywający” i odtwarzanie rozwiązań nie są liczone; z układu „Zagraj nieudany” liczy się tylko wygrana. Ponowne podejście do tego samego układu („Zacznij od początku”, „Spróbuj jeszcze raz”) to ciągle ta sama partia.",x0,y,w,48);
    ovButton(x0,py+ph-60,190,36,L"Wyzeruj statystyki",OH_STATRESET,0);
    ovButton(x0+w-150,py+ph-60,150,36,L"Zamknij",OH_CLOSE,0,true,true,15);
 }
