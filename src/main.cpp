@@ -48,7 +48,7 @@ using namespace Gdiplus;
 
 // Bump this (and tag the matching GitHub release vMAJOR.MINOR.PATCH) on every
 // release meant to reach users through the updater — see update.h.
-static const wchar_t* APP_VERSION = L"1.1.8";
+static const wchar_t* APP_VERSION = L"1.1.9";
 
 // Define GameState static member
 bool* GameState::s_freeColMode = nullptr;
@@ -71,7 +71,8 @@ static const int  ID_NEW=201,ID_HINT=202,ID_FS=203,ID_UNDO=204,ID_REDO=205;
 static const int  ID_SAMOGRAJ=213;
 static const int  ID_SOLVER  =240;
 static const int  ID_SCOREBTN =241;      // "Pokaż szczegóły wyniku", on the toolbar next to the score
-static const int  ID_FREEZE  =242;       // the snowflake: remembers the table (black), the next press goes back to it (white)
+static const int  ID_FREEZE  =242;       // the black snowflake: remembers the table (the last freeze is the one that is kept)
+static const int  ID_THAW    =243;       // the white snowflake: goes back to the remembered table (grey while nothing is remembered)
 
 // ============================================================================
 // Card flight animation
@@ -501,8 +502,9 @@ static int  g_outcomeMode = 0;       // mode captured at the moment win/no-moves
 static int  g_outcomeMoveCount = 0;  // move count captured at that same moment
 static int  g_outcomeSeconds = 0;    // elapsed seconds captured at that same moment
 static long long g_currentGameNumber = -1; // seed of the current deal (-1 = none yet)
-// The "freeze" button: the table (and its undo/redo history) as it was when the snowflake was pressed. Only in memory, and only
-// for the deal on the table: a new game, a replay of the deal and loading a game forget it.
+// The "freeze" buttons: the table (and its undo/redo history) as it was when the black snowflake was last pressed; the white one
+// goes back to it, as often as wanted. Only in memory, and only for the deal on the table: a new game, a replay of the deal and
+// loading a game forget it.
 static bool g_frozen = false;
 struct FrozenState{ Snapshot board; std::deque<Snapshot> undo, redo; };
 static FrozenState g_frozenState;
@@ -1363,7 +1365,8 @@ static bool readGameFromFile(FILE* f){
 // Show Save As dialog and save game to chosen file
 static void saveGameAs(HWND hwnd){
    std::wstring dir=getLastSaveDir();
-   wchar_t filePath[MAX_PATH]=L"pasjans.dat";
+   wchar_t filePath[MAX_PATH]={};
+   wcscpy_s(filePath,(L"Gra"+(g_currentGameNumber>=0?std::to_wstring(g_currentGameNumber):std::wstring())).c_str());   // "Gra<deal number>"
    OPENFILENAMEW ofn={};
    ofn.lStructSize    =sizeof(ofn);
    ofn.hwndOwner      =hwnd;
@@ -2316,7 +2319,10 @@ static void saveUserSolvedFile(){
 // ============================================================================
 void onStateChanged(){
    // the clock starts with the first move (a card moved or the reserve dealt — every move leaves an undo snapshot)
-   if(!g_clockRunning && !g_game.undoStack.empty()){ g_clockRunning=true; g_gameStartTick=timeGetTime(); g_gameSeconds=0; }
+   if(!g_clockRunning && !g_game.undoStack.empty()){
+      g_clockRunning=true; g_gameStartTick=timeGetTime(); g_gameSeconds=0;
+      if(g_timerPaused) g_pauseStartTick=g_gameStartTick;      // a first move made while the window is inactive: the pause counts from here, not from before the clock started
+   }
    g_hintActive=false;
    g_hintBlinking=false;
    g_gameStarted=true;
@@ -4047,13 +4053,14 @@ static HBRUSH toolbarBrush(){
    return br;
 }
 static int g_hoverBtn=0;     // control id of the toolbar button under the mouse (0 = none)
-static HWND g_hBtnCap[9]={};  // the captions under the toolbar buttons (index 6 = the freeze button)
+static HWND g_hBtnCap[10]={}; // the captions under the toolbar buttons
 static void toolbarRefresh(){
    if(!g_hwnd) return;
    RECT rc; GetClientRect(g_hwnd,&rc); rc.bottom=Layout::TOOLBAR_H;
    InvalidateRect(g_hwnd,&rc,TRUE);
    for(int i=0;i<BTN_ICON_COUNT;i++){ HWND b=GetDlgItem(g_hwnd,BTN_ICON_IDS[i]); if(b) InvalidateRect(b,nullptr,FALSE); }
    if(HWND b=GetDlgItem(g_hwnd,ID_FREEZE)) InvalidateRect(b,nullptr,FALSE);
+   if(HWND b=GetDlgItem(g_hwnd,ID_THAW))   InvalidateRect(b,nullptr,FALSE);
    for(HWND c:g_hBtnCap) if(c) InvalidateRect(c,nullptr,TRUE);
    for(HWND c:g_hStat) if(c) InvalidateRect(c,nullptr,TRUE);
    if(g_hScoreBtn) InvalidateRect(g_hScoreBtn,nullptr,FALSE);
@@ -4106,13 +4113,14 @@ static void drawIconButton(DRAWITEMSTRUCT* dis){
    GraphicsPath path;
    path.AddArc(x,y,2*r,2*r,180,90); path.AddArc(x+w-2*r,y,2*r,2*r,270,90);
    path.AddArc(x+w-2*r,y+h-2*r,2*r,2*r,0,90); path.AddArc(x,y+h-2*r,2*r,2*r,90,90); path.CloseFigure();
-   const bool freezeBtn=((int)dis->CtlID==ID_FREEZE);
-   const float fa= !enabled?0.05f : (pressed||active||(freezeBtn&&g_frozen))?0.30f : hover?0.28f : 0.14f;
+   const bool freezeBtn=((int)dis->CtlID==ID_FREEZE), thawBtn=((int)dis->CtlID==ID_THAW);
+   if(thawBtn && !g_frozen) enabled=false;                 // nothing remembered: the white snowflake is grey and does nothing
+   const float fa= !enabled?0.05f : (pressed||active)?0.30f : hover?0.28f : 0.14f;
    SolidBrush fill(Color((BYTE)(fa*255.f),255,255,255)); g.FillPath(&fill,&path);
    if(active){ Pen pen(Color(242,255,220,77),2.f); g.DrawPath(&pen,&path); }
    else      { Pen pen(Color((BYTE)((enabled?0.38f:0.12f)*255.f),255,255,255),1.f); g.DrawPath(&pen,&path); }
    // Icon — kept square and centred even though the button itself is wider than it is tall.
-   if(freezeBtn){                      // the snowflake is drawn, not a picture: black = nothing remembered, white = the table is frozen
+   if(freezeBtn||thawBtn){             // the snowflake is drawn, not a picture: black = freeze, white (grey: nothing to go back to) = thaw
       const float off=pressed?1.f:0.f, R=std::min(w,h)/2.f-6.f, cx=rc.left+(rc.right-rc.left)/2.f+off, cy=rc.top+(rc.bottom-rc.top)/2.f+off;
       const float PI=3.14159265f, a0=-PI/2;
       auto flake=[&](Pen& pen){
@@ -4130,8 +4138,7 @@ static void drawIconButton(DRAWITEMSTRUCT* dis){
             }
          }
       };
-      BYTE ga=(BYTE)(enabled?255:110);
-      Pen pen(g_frozen?Color(ga,255,255,255):Color(ga,0,0,0),3.0f); flake(pen);
+      Pen pen(freezeBtn?Color(255,0,0,0):enabled?Color(255,255,255,255):Color(255,120,120,120),3.0f); flake(pen);
    } else
    if(idx>=0 && g_btnIcons[idx]){
       int off=pressed?1:0;
@@ -4146,28 +4153,29 @@ static void drawIconButton(DRAWITEMSTRUCT* dis){
 // ── The freeze button (snowflake): the first press remembers the table, the next one goes back to it.
 static void freezeUpdateUI(){
    if(!g_hwnd) return;
-   if(HWND b=GetDlgItem(g_hwnd,ID_FREEZE)) InvalidateRect(b,nullptr,FALSE);
-   if(g_hBtnCap[6]) SetWindowTextW(g_hBtnCap[6],g_frozen?L"Wróć":L"Zamroź");
+   if(HWND b=GetDlgItem(g_hwnd,ID_THAW)) InvalidateRect(b,nullptr,FALSE);      // grey or white, depending on whether a table is remembered
 }
 static void freezeClear(){
    g_frozen=false; g_frozenState=FrozenState();
    freezeUpdateUI();
 }
+static void boardOfGame(Snapshot& s){
+   for(int i=0;i<NUM_COLS;i++)  s.cols[i]=g_game.cols[i];
+   for(int i=0;i<NUM_FOUND;i++) s.found[i]=g_game.found[i];
+   s.reserve=g_game.reserve;
+}
+// the black snowflake: remember the table as it is now (a new freeze replaces the previous one)
 static void doFreeze(){
    if(g_dealing || g_animating) return;
-   auto boardOf=[&](Snapshot& s){
-      for(int i=0;i<NUM_COLS;i++)  s.cols[i]=g_game.cols[i];
-      for(int i=0;i<NUM_FOUND;i++) s.found[i]=g_game.found[i];
-      s.reserve=g_game.reserve;
-   };
-   if(!g_frozen){
-      FrozenState s; boardOf(s.board); s.undo=g_game.undoStack; s.redo=g_game.redoStack;
-      g_frozenState=std::move(s); g_frozen=true;
-      g_status=L"Zamrożono";
-      freezeUpdateUI(); invalidateGame();
-      return;
-   }
-   Snapshot before; boardOf(before);
+   FrozenState s; boardOfGame(s.board); s.undo=g_game.undoStack; s.redo=g_game.redoStack;
+   g_frozenState=std::move(s); g_frozen=true;
+   g_status=L"Zamrożono";
+   freezeUpdateUI(); invalidateGame();
+}
+// the white snowflake: go back to the remembered table; it stays remembered, so this can be done again and again
+static void doThaw(){
+   if(g_dealing || g_animating || !g_frozen) return;
+   Snapshot before; boardOfGame(before);
    bool same=(before.reserve==g_frozenState.board.reserve);
    for(int i=0;same&&i<NUM_COLS;i++)  same=(before.cols[i]==g_frozenState.board.cols[i]);
    for(int i=0;same&&i<NUM_FOUND;i++) same=(before.found[i]==g_frozenState.board.found[i]);
@@ -4175,7 +4183,6 @@ static void doFreeze(){
    for(int i=0;i<NUM_FOUND;i++) g_game.found[i]=g_frozenState.board.found[i];
    g_game.reserve=g_frozenState.board.reserve;
    g_game.undoStack=g_frozenState.undo; g_game.redoStack=g_frozenState.redo;
-   g_frozen=false; g_frozenState=FrozenState();
    if(!same){                                    // going back is an undo, as far as the move counter and the score are concerned
       if(!g_winCounted) g_moveCount++;
       g_undoCount++;
@@ -4188,9 +4195,8 @@ static void doFreeze(){
    clearAutoHistory();                           // same reasoning as in doUndo()
    if(!same) playSound("cofnij",g_volume);
    recalcLayout(); markDirty(); invalidateGame();
-   Snapshot after; boardOf(after);
+   Snapshot after; boardOfGame(after);
    animateStateDiff(before,after);
-   freezeUpdateUI();
 }
 
 // ============================================================================
@@ -5357,7 +5363,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       const int BX_UNDO =BX_SOLV +BTN_SPACING;
       const int BX_REDO =BX_UNDO +BTN_SPACING;
       const int BX_FREEZE=BX_REDO+BTN_SPACING;
-      const int BX_STATS=BX_FREEZE+BTN_SPACING;
+      const int BX_THAW =BX_FREEZE+BTN_SPACING;
+      const int BX_STATS=BX_THAW +BTN_SPACING;
       const int BX_SETT =BX_STATS+BTN_SPACING;
       auto mkIconBtn=[&](int id,int x,const wchar_t* tip)->HWND{
          HWND h=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
@@ -5381,6 +5388,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       HWND hBUndo =mkIconBtn(ID_UNDO,    BX_UNDO, L"Cofnij (←)");
       HWND hBRedo =mkIconBtn(ID_REDO,    BX_REDO, L"Ponów (→)");
       HWND hBFreeze=mkIconBtn(ID_FREEZE, BX_FREEZE,L"Zamroź");
+      HWND hBThaw  =mkIconBtn(ID_THAW,   BX_THAW,  L"Przywróć");
       HWND hBStats=mkIconBtn(ID_STATS,   BX_STATS,L"Statystyki (S)");
       HWND hBSett =mkIconBtn(ID_SETTINGS,BX_SETT, L"Ustawienia");
       addTip(hBNew,   L"Nowa gra (F2)");
@@ -5389,18 +5397,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       addTip(hBSolv,  L"Solver – szukanie rozwiązań rozdań z LostNumbers.csv");
       addTip(hBUndo,  L"Cofnij (←)");
       addTip(hBRedo,  L"Ponów (→)");
-      addTip(hBFreeze,L"Zamroź stan stołu – drugie naciśnięcie wraca do zapamiętanego miejsca");
+      addTip(hBFreeze,L"Zamroź – zapamiętaj stan stołu (zapamiętany jest tylko ostatni)");
+      addTip(hBThaw,  L"Przywróć zamrożony stan stołu (można wielokrotnie)");
       addTip(hBStats, L"Statystyki (S)");
       addTip(hBSett,  L"Ustawienia");
 
       // Hover highlight comes from a small subclass; the caption of each button is a small label under it.
-      for(HWND b:{hBNew,hBHint,hBSamo,hBSolv,hBUndo,hBRedo,hBFreeze,hBStats,hBSett}) SetWindowSubclass(b,BtnHoverProc,1,0);
+      for(HWND b:{hBNew,hBHint,hBSamo,hBSolv,hBUndo,hBRedo,hBFreeze,hBThaw,hBStats,hBSett}) SetWindowSubclass(b,BtnHoverProc,1,0);
       {
          HFONT hCapFont=CreateFontW(-MulDiv(9,96,72),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,
             DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Segoe UI");
-         const int xs[9]={BX_NEW,BX_HINT,BX_SAMO,BX_SOLV,BX_UNDO,BX_REDO,BX_FREEZE,BX_STATS,BX_SETT};
-         const wchar_t* caps[9]={L"Nowa gra",L"Podpowiedź",L"Samograj",L"Solver",L"Cofnij",L"Ponów",L"Zamroź",L"Statystyki",L"Ustawienia"};
-         for(int i=0;i<9;i++){
+         const int xs[10]={BX_NEW,BX_HINT,BX_SAMO,BX_SOLV,BX_UNDO,BX_REDO,BX_FREEZE,BX_THAW,BX_STATS,BX_SETT};
+         const wchar_t* caps[10]={L"Nowa gra",L"Podpowiedź",L"Samograj",L"Solver",L"Cofnij",L"Ponów",L"Zamroź",L"Przywróć",L"Statystyki",L"Ustawienia"};
+         for(int i=0;i<10;i++){
             g_hBtnCap[i]=CreateWindowW(L"STATIC",caps[i],WS_CHILD|WS_VISIBLE|SS_CENTER|SS_NOPREFIX,
                xs[i]-BTN_GAP/2,BTN_Y+BTN_H+3,BTN_W+BTN_GAP,20,hwnd,nullptr,((CREATESTRUCT*)lp)->hInstance,nullptr);
             SendMessageW(g_hBtnCap[i],WM_SETFONT,(WPARAM)hCapFont,TRUE);
@@ -5485,6 +5494,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
       case ID_UNDO: doUndo();   return 0;
       case ID_REDO: doRedo();   return 0;
       case ID_FREEZE: doFreeze(); return 0;
+      case ID_THAW:   doThaw();   return 0;
       case ID_FS:   toggleFS(); return 0;
       case ID_HELP:     showHelp(hwnd);     return 0;
       case ID_SETTINGS: showSettings(hwnd); return 0;
@@ -5603,7 +5613,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
          }
       } else if(wp==TIMER_SECOND){
          if(g_clockRunning && g_gameStartTick>0 && !g_won && !g_noMoves && !g_timerPaused)
-            g_gameSeconds=(int)((timeGetTime()-g_gameStartTick)/1000);
+            g_gameSeconds=std::max(0,(int)(timeGetTime()-g_gameStartTick)/1000);      // (signed difference: never a huge time, whatever the pauses did to the start)
          invalidateGame();
          if(g_gameHwnd) UpdateWindow(g_gameHwnd);
       } else if(wp==TIMER_PULSE){
